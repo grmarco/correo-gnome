@@ -393,8 +393,17 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "correo-app"
 version = "0.1.0"
 dependencies = [
+ "correo-auth",
+ "correo-contacts",
+ "correo-core",
+ "correo-imap",
+ "correo-smtp",
+ "correo-store",
+ "correo-sync",
+ "correo-threads",
  "gtk4",
  "libadwaita",
+ "tokio",
 ]
 
 [[package]]

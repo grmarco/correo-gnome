@@ -7,3 +7,12 @@ license.workspace = true
 [dependencies]
 adw = { version = "0.9.2", package = "libadwaita", features = ["v1_6"] }
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
+correo-core.workspace = true
+correo-store = { path = "../correo-store" }
+correo-imap = { path = "../correo-imap" }
+correo-smtp = { path = "../correo-smtp" }
+correo-auth = { path = "../correo-auth" }
+correo-contacts = { path = "../correo-contacts" }
+correo-threads = { path = "../correo-threads" }
+correo-sync = { path = "../correo-sync" }
+tokio.workspace = true
