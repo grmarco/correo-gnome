@@ -53,6 +53,35 @@ impl MicrosoftContacts {
     }
 }
 
+/// Recorre todas las páginas de un listado de la People API.
+async fn fetch_google_pages(
+    http: &reqwest::Client,
+    token: &str,
+    url: &str,
+    params: &[(&str, &str)],
+) -> Result<Vec<Contact>> {
+    let mut out = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut pages = Pagination::default();
+    loop {
+        pages.count_page()?;
+        let mut query = params.to_vec();
+        if let Some(t) = page_token.as_deref() {
+            query.push(("pageToken", t));
+        }
+        let mut page: GooglePage = get_json(http, token, url, &query).await?;
+        let next = next_token(page_token.as_deref(), page.next_page_token.take());
+        out.extend(page.into_contacts());
+        match next {
+            Some(t) if pages.seen_before(&t) => {
+                return Err(Error::Protocol("paginación de contactos repetida".into()));
+            }
+            Some(t) => page_token = Some(t),
+            None => return Ok(out),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ContactSource for GoogleContacts {
     async fn sync(&self) -> Result<Vec<Contact>> {
@@ -61,40 +90,33 @@ impl ContactSource for GoogleContacts {
         let base = self.base_url.trim_end_matches('/');
         let mut out = Vec::new();
 
-        let sources = [
-            (
-                format!("{base}/v1/people/me/connections"),
-                vec![
+        // Contactos propios: scope `contacts.readonly`. Un fallo aquí es un fallo de la sincronización.
+        out.extend(
+            fetch_google_pages(
+                &http,
+                &token.0,
+                &format!("{base}/v1/people/me/connections"),
+                &[
                     ("personFields", "names,emailAddresses"),
                     ("pageSize", "1000"),
                 ],
-            ),
-            (
-                format!("{base}/v1/otherContacts"),
-                vec![("readMask", "names,emailAddresses"), ("pageSize", "1000")],
-            ),
-        ];
+            )
+            .await?,
+        );
 
-        for (url, params) in sources {
-            let mut page_token: Option<String> = None;
-            let mut pages = Pagination::default();
-            loop {
-                pages.count_page()?;
-                let mut query = params.clone();
-                if let Some(t) = page_token.as_deref() {
-                    query.push(("pageToken", t));
-                }
-                let mut page: GooglePage = get_json(&http, &token.0, &url, &query).await?;
-                let next = next_token(page_token.as_deref(), page.next_page_token.take());
-                out.extend(page.into_contacts());
-                match next {
-                    Some(t) if pages.seen_before(&t) => {
-                        return Err(Error::Protocol("paginación de contactos repetida".into()));
-                    }
-                    Some(t) => page_token = Some(t),
-                    None => break,
-                }
-            }
+        // «Otros contactos» (gente a la que has escrito) necesita el scope adicional
+        // `contacts.other.readonly`. Si la app no lo tiene, se sigue sin ellos.
+        match fetch_google_pages(
+            &http,
+            &token.0,
+            &format!("{base}/v1/otherContacts"),
+            &[("readMask", "names,emailAddresses"), ("pageSize", "1000")],
+        )
+        .await
+        {
+            Ok(others) => out.extend(others),
+            Err(Error::Auth(e)) => return Err(Error::Auth(e)),
+            Err(e) => eprintln!("correo-contacts: «otros contactos» no disponibles: {e}"),
         }
 
         Ok(dedupe(out))
@@ -649,6 +671,28 @@ mod tests {
         assert!(find(&contacts, "luis@example.com").is_some());
         assert!(find(&contacts, "marta@example.com").is_some());
         assert!(contacts.iter().all(|c| c.source == "google"));
+    }
+
+    #[tokio::test]
+    async fn google_sync_keeps_contacts_when_other_contacts_scope_is_missing() {
+        let base = fake_server(|_, target| {
+            if target.starts_with("/v1/people/me/connections") {
+                (200, GOOGLE_CONNECTIONS_PAGE_2.to_owned())
+            } else {
+                (
+                    403,
+                    r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED"}}"#
+                        .to_owned(),
+                )
+            }
+        })
+        .await;
+        let source = GoogleContacts {
+            base_url: base,
+            ..GoogleContacts::new(1, good_token())
+        };
+        let contacts = source.sync().await.unwrap();
+        assert!(find(&contacts, "luis@example.com").is_some());
     }
 
     #[tokio::test]

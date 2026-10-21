@@ -132,9 +132,10 @@ impl OAuthClient {
         redirect_uri: &str,
         code_verifier: &str,
     ) -> Result<TokenSet> {
-        // Microsoft exige `scope` también al canjear el código (AADSTS70011); Google no lo
-        // necesita, así que solo se envía a los proveedores con scopes por recurso.
-        let scope = self.provider.scopes.join(" ");
+        // Microsoft exige `scope` también al canjear el código (AADSTS70011) y solo admite los
+        // de UN recurso (el de correo; el de Graph se pide después con el refresh token).
+        // Google no lo necesita, así que solo se envía a los proveedores con scopes por recurso.
+        let scope = self.provider.mail_scopes.join(" ");
         let mut params = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -418,7 +419,10 @@ mod tests {
             let has_scope = form.iter().any(|(k, _)| k == "scope");
             assert_eq!(has_scope, expect_scope, "microsoft={microsoft}");
             if expect_scope {
-                assert!(param(&form, "scope").contains("IMAP.AccessAsUser.All"));
+                let scope = param(&form, "scope");
+                assert!(scope.contains("IMAP.AccessAsUser.All"));
+                // Un solo recurso: Graph (Contacts/User) no puede ir en el mismo canje.
+                assert!(!scope.contains("Contacts.Read") && !scope.contains("graph.microsoft.com"));
             }
         }
     }
