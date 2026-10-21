@@ -85,13 +85,16 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
         Rc::new(move |msg: String| toasts.add_toast(adw::Toast::new(&msg)))
     };
 
+    // La ventana activa hay que leerla antes de crear la nueva: al asociarla a la aplicación,
+    // `active_window()` puede devolver la propia ventana recién creada.
+    let parent = app.active_window();
     let window = adw::Window::builder()
         .application(app)
         .title(title_text)
         .default_width(680)
         .default_height(640)
         .build();
-    if let Some(parent) = app.active_window() {
+    if let Some(parent) = parent {
         window.set_transient_for(Some(&parent));
     }
 

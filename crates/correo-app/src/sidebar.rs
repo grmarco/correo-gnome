@@ -432,7 +432,11 @@ impl Sidebar {
                 }
                 let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
                 if let Some(Some(target)) = targets.get(index).copied() {
-                    on_select(target);
+                    // Elegir destino reconstruye la barra (y esta fila deja de tener raíz).
+                    // Si se hiciera aquí, GTK seguiría procesando el clic o el movimiento de
+                    // foco sobre una fila ya desmontada (`gtk_root_get_focus`: GTK_IS_ROOT).
+                    let on_select = Rc::clone(&on_select);
+                    gtk::glib::idle_add_local_once(move || on_select(target));
                 }
             });
         }
