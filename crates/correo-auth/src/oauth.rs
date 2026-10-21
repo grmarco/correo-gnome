@@ -132,13 +132,19 @@ impl OAuthClient {
         redirect_uri: &str,
         code_verifier: &str,
     ) -> Result<TokenSet> {
-        self.post_token(&[
+        // Microsoft exige `scope` también al canjear el código (AADSTS70011); Google no lo
+        // necesita, así que solo se envía a los proveedores con scopes por recurso.
+        let scope = self.provider.scopes.join(" ");
+        let mut params = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", code_verifier),
-        ])
-        .await
+        ];
+        if !self.provider.mail_scopes.is_empty() {
+            params.push(("scope", &scope));
+        }
+        self.post_token(&params).await
     }
 
     /// Obtiene un access token nuevo a partir de un refresh token.
@@ -385,6 +391,36 @@ mod tests {
         // El verificador enviado debe corresponder al challenge de la URL de autorización.
         assert_eq!(s256_challenge(param(&form, "code_verifier")), challenge);
         assert!(form.iter().all(|(k, _)| k != "client_secret"));
+    }
+
+    #[tokio::test]
+    async fn microsoft_code_exchange_includes_scope_and_google_does_not() {
+        for (microsoft, expect_scope) in [(true, true), (false, false)] {
+            let server = FakeServer::start(vec![(200, token_json("a", Some("r"), 3600))]).await;
+            let mut provider = if microsoft {
+                OAuthProvider::microsoft("cid")
+            } else {
+                OAuthProvider::google("cid")
+            };
+            provider.token_url = server.url.clone();
+            let client = OAuthClient::new(provider).unwrap();
+            let request = client.begin_authorization().await.unwrap();
+            let redirect = request.redirect_uri().to_owned();
+            let state = request.state().to_owned();
+            let _ = raw_get(&format!("{redirect}?code=c&state={state}")).await;
+            request.finish().await.unwrap();
+            let body = server.requests()[0]
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap()
+                .to_owned();
+            let form = query_of(&format!("http://x/?{body}"));
+            let has_scope = form.iter().any(|(k, _)| k == "scope");
+            assert_eq!(has_scope, expect_scope, "microsoft={microsoft}");
+            if expect_scope {
+                assert!(param(&form, "scope").contains("IMAP.AccessAsUser.All"));
+            }
+        }
     }
 
     #[tokio::test]
