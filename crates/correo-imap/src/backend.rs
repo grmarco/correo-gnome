@@ -7,8 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::{Fetch, Name};
 use async_trait::async_trait;
 use correo_core::{
@@ -28,6 +29,18 @@ use crate::parse::{
 pub const GMAIL_HOST: &str = "imap.gmail.com";
 pub const OUTLOOK_HOST: &str = "outlook.office365.com";
 pub const IMAPS_PORT: u16 = 993;
+
+/// Duración máxima de una espera IDLE; los servidores suelen cortarla hacia los 29 min.
+pub const IDLE_MAX: Duration = Duration::from_secs(25 * 60);
+
+/// Resultado de una espera IDLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEvent {
+    /// El servidor anunció cambios en la carpeta (EXISTS, EXPUNGE, FETCH...).
+    NewData,
+    /// Expiró `max` sin cambios (o el servidor envió un keepalive hasta el límite).
+    Timeout,
+}
 
 /// Tamaño de página al recorrer la caché.
 const CACHE_PAGE: usize = 500;
@@ -129,6 +142,40 @@ impl ImapBackend {
             }
             other => other,
         }
+    }
+
+    /// Espera IDLE sobre `mailbox` en una conexión propia (IDLE bloquea la sesión
+    /// de operaciones). Devuelve al haber cambios o al expirar `max`. La
+    /// conexión se descarta al terminar; el planificador decide cuándo reiniciar.
+    ///
+    /// Si el servidor no anuncia IDLE devuelve `Error::Protocol("sin IDLE")`.
+    pub async fn idle_inbox(&self, mailbox: &Mailbox, max: Duration) -> Result<IdleEvent> {
+        let mut conn = self.connect().await?;
+        if !conn.caps.idle {
+            return Err(Error::Protocol("sin IDLE".into()));
+        }
+        conn.session
+            .select(&mailbox.path)
+            .await
+            .map_err(map_imap_error)?;
+
+        let mut handle = conn.session.idle();
+        handle.init().await.map_err(map_imap_error)?;
+
+        let outcome = {
+            let (wait, _stop) = handle.wait_with_timeout(max);
+            tokio::time::timeout(max, wait).await
+        };
+        let event = match outcome {
+            Err(_elapsed) => IdleEvent::Timeout,
+            Ok(Ok(IdleResponse::NewData(_))) => IdleEvent::NewData,
+            Ok(Ok(IdleResponse::Timeout | IdleResponse::ManualInterrupt)) => IdleEvent::Timeout,
+            Ok(Err(e)) => return Err(map_imap_error(e)),
+        };
+
+        // DONE para cerrar limpio; acotado en el tiempo por si el servidor no contesta.
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.done()).await;
+        Ok(event)
     }
 
     /// Cabeceras cacheadas de una carpeta, paginando.
@@ -508,4 +555,23 @@ async fn mark_deleted_and_expunge(conn: &mut Conn, uid_str: &str) -> Result<()> 
             .map_err(map_imap_error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    /// Compilación: la espera IDLE debe poder lanzarse con `tokio::spawn`.
+    #[allow(dead_code)]
+    fn idle_future_is_send<'a>(
+        backend: &'a ImapBackend,
+        mailbox: &'a Mailbox,
+    ) -> impl Future<Output = Result<IdleEvent>> + Send + 'a {
+        backend.idle_inbox(mailbox, IDLE_MAX)
+    }
+
+    #[test]
+    fn idle_max_is_25_minutes() {
+        assert_eq!(IDLE_MAX, Duration::from_secs(25 * 60));
+    }
 }

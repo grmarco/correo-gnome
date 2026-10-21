@@ -6,4 +6,4 @@ mod backend;
 mod conn;
 mod parse;
 
-pub use backend::{GMAIL_HOST, IMAPS_PORT, ImapBackend, OUTLOOK_HOST};
+pub use backend::{GMAIL_HOST, IDLE_MAX, IMAPS_PORT, IdleEvent, ImapBackend, OUTLOOK_HOST};

@@ -20,6 +20,7 @@ pub struct Caps {
     pub mov: bool,
     pub uidplus: bool,
     pub gmail_labels: bool,
+    pub idle: bool,
 }
 
 /// Sesión IMAP autenticada con sus capacidades.
@@ -66,6 +67,7 @@ pub async fn connect(host: &str, port: u16, email: &str, access_token: &str) -> 
             mov: c.has_str("MOVE"),
             uidplus: c.has_str("UIDPLUS"),
             gmail_labels: c.has_str("X-GM-EXT-1"),
+            idle: c.has_str("IDLE"),
         }
     };
     Ok(Conn { session, caps })

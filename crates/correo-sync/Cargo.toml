@@ -1,0 +1,10 @@
+[package]
+name = "correo-sync"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+correo-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
