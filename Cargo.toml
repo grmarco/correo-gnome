@@ -12,3 +12,9 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 async-trait = "0.1"
+
+[profile.release]
+# Binario pequeño y de bajo consumo: LTO fino, una unidad de generación de código y sin símbolos.
+lto = "thin"
+codegen-units = 1
+strip = true

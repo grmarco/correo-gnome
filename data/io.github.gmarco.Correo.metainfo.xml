@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gmarco.Correo</id>
+  <name>Correo</name>
+  <summary>Cliente de correo electrónico nativo para GNOME</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.gmarco">
+    <name>Guillermo Marco Remón</name>
+  </developer>
+  <description>
+    <p>
+      Correo es un cliente de correo electrónico pensado para integrarse con GNOME.
+      Conecta tus cuentas de Gmail, Outlook.com y Microsoft 365 mediante IMAP y SMTP
+      con inicio de sesión OAuth2, sin guardar contraseñas en claro.
+    </p>
+    <p>Funciones principales:</p>
+    <ul>
+      <li>Lectura de correo por carpetas y etiquetas, con vista de hilos.</li>
+      <li>Búsqueda local rápida en las cabeceras y los cuerpos ya descargados.</li>
+      <li>Redacción con formato básico, adjuntos y autocompletado de contactos.</li>
+      <li>Responder, responder a todos y reenviar con cita del mensaje original.</li>
+      <li>Bandeja unificada para todas las cuentas.</li>
+      <li>Notificaciones de escritorio para mensajes nuevos, con acciones para abrir, marcar como leído o archivar.</li>
+      <li>Imágenes remotas bloqueadas por defecto para proteger tu privacidad.</li>
+    </ul>
+    <p>
+      Pensado para consumir pocos recursos: sincroniza solo las cabeceras recientes,
+      descarga los cuerpos y adjuntos bajo demanda y respeta el ahorro de energía y las redes de pago.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.gmarco.Correo.desktop</launchable>
+  <icon type="stock">io.github.gmarco.Correo</icon>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+  <keywords>
+    <keyword>correo</keyword>
+    <keyword>email</keyword>
+    <keyword>mail</keyword>
+    <keyword>imap</keyword>
+    <keyword>smtp</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>correo-app</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-10-21" type="development">
+      <description>
+        <p>Primera versión de desarrollo: lectura, redacción, cuentas OAuth2, búsqueda, notificaciones y empaquetado.</p>
+      </description>
+    </release>
+  </releases>
+  <url type="homepage">https://github.com/gmarco/correo</url>
+  <url type="bugtracker">https://github.com/gmarco/correo/issues</url>
+</component>

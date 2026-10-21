@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Correo
+GenericName=Cliente de correo electrónico
+Comment=Lee y envía correo electrónico con tus cuentas de Gmail, Outlook y Microsoft 365
+Exec=correo-app %u
+Icon=io.github.gmarco.Correo
+Terminal=false
+Categories=Network;Email;GNOME;GTK;
+Keywords=correo;email;mail;imap;smtp;gmail;outlook;
+MimeType=x-scheme-handler/mailto;
+StartupNotify=true
+DBusActivatable=false
+StartupWMClass=io.github.gmarco.Correo

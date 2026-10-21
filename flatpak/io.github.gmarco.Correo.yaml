@@ -1,0 +1,46 @@
+# Manifiesto Flatpak de Correo.
+# Build local:  flatpak-builder --user --install --force-clean build-dir io.github.gmarco.Correo.yaml
+# Antes, generar flatpak/cargo-sources.json (ver docs/PACKAGING.md).
+app-id: io.github.gmarco.Correo
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: correo-app
+
+finish-args:
+  # Red (IMAP, SMTP, OAuth2, People/Graph) y ventana con Wayland o X11 de respaldo.
+  # dri: render por GPU; sin él GTK cae a software y gasta más CPU.
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Tokens OAuth2 en el Secret Service (GNOME Keyring).
+  - --talk-name=org.freedesktop.secrets
+  # Notificaciones de escritorio.
+  - --talk-name=org.freedesktop.Notifications
+  # Energía: estado de batería (UPower) y suspensión/reanudación (logind).
+  - --talk-name=org.freedesktop.UPower
+  - --system-talk-name=org.freedesktop.login1
+  # Guardar adjuntos en Descargas. Sin acceso al resto del home.
+  - --filesystem=xdg-download
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/correo/cargo
+
+modules:
+  - name: correo
+    buildsystem: simple
+    build-commands:
+      - make build CARGO='cargo --offline'
+      - make install PREFIX=/app
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - target
+      - cargo-sources.json
