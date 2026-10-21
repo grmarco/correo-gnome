@@ -388,6 +388,18 @@ impl Store {
     }
 
     /// Borra un mensaje por uid. Si no existe, no hace nada.
+    /// Id interno de (carpeta, uid), o `None` si el mensaje no está cacheado.
+    pub fn message_id(&self, mailbox_id: MailboxId, uid: u32) -> Result<Option<MessageId>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                params![mailbox_id, uid],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(se)
+    }
+
     pub fn delete_uid(&self, mailbox_id: MailboxId, uid: u32) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(se)?;
         fts_remove_where(

@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Cliente IMAP para correo: autenticación XOAUTH2 sobre TLS, listado de
+//! carpetas, sincronización de cabeceras por ventana de días y acciones
+//! (leído, mover, borrar), todo volcado a la caché de `correo-store`.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod backend;
+mod conn;
+mod parse;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use backend::{GMAIL_HOST, IMAPS_PORT, ImapBackend, OUTLOOK_HOST};

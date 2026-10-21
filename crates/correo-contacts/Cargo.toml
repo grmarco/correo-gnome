@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+correo-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+correo-store = { path = "../correo-store" }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
