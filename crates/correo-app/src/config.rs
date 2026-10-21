@@ -1,0 +1,156 @@
+//! Configuración de la aplicación: `~/.config/correo/config.toml` más variables de entorno.
+//!
+//! Precedencia de los client IDs: variable de entorno > fichero > ausente.
+
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// Días de cabeceras a sincronizar por defecto.
+pub const DEFAULT_SYNC_DAYS: u32 = 14;
+pub const ENV_GOOGLE_CLIENT_ID: &str = "CORREO_GOOGLE_CLIENT_ID";
+pub const ENV_MICROSOFT_CLIENT_ID: &str = "CORREO_MICROSOFT_CLIENT_ID";
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Config {
+    /// Días de cabeceras a sincronizar al crear una cuenta.
+    pub sync_days: u32,
+    /// Modo residente: la app sigue activa (con notificaciones) sin ventanas abiertas.
+    pub run_in_background: bool,
+    pub google: ProviderConfig,
+    pub microsoft: ProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub client_id: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            sync_days: DEFAULT_SYNC_DAYS,
+            run_in_background: false,
+            google: ProviderConfig::default(),
+            microsoft: ProviderConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    /// Analiza el contenido TOML. Los campos ausentes toman su valor por defecto.
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    /// Aplica las variables de entorno sobre los valores del fichero. `var` es el
+    /// lector de entorno (inyectable en tests). Un valor vacío se ignora.
+    pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) {
+        if let Some(id) = var(ENV_GOOGLE_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
+            self.google.client_id = Some(id.trim().to_owned());
+        }
+        if let Some(id) = var(ENV_MICROSOFT_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
+            self.microsoft.client_id = Some(id.trim().to_owned());
+        }
+    }
+
+    /// Client ID de Google, si está configurado y no está vacío.
+    pub fn google_client_id(&self) -> Option<&str> {
+        non_empty(self.google.client_id.as_deref())
+    }
+
+    /// Client ID de Microsoft, si está configurado y no está vacío.
+    pub fn microsoft_client_id(&self) -> Option<&str> {
+        non_empty(self.microsoft.client_id.as_deref())
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// Ruta del fichero de configuración (`$XDG_CONFIG_HOME/correo/config.toml`).
+pub fn config_path() -> PathBuf {
+    gtk::glib::user_config_dir()
+        .join("correo")
+        .join("config.toml")
+}
+
+/// Carga el fichero (si no existe, valores por defecto) y aplica el entorno.
+pub fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut config = match std::fs::read_to_string(path) {
+        Ok(text) => Config::parse(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => return Err(Box::new(e)),
+    };
+    config.apply_env(|name| std::env::var(name).ok());
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_when_file_is_empty() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.sync_days, 14);
+        assert!(!config.run_in_background);
+        assert_eq!(config.google_client_id(), None);
+        assert_eq!(config.microsoft_client_id(), None);
+    }
+
+    #[test]
+    fn parses_client_ids_and_overrides() {
+        let config = Config::parse(
+            r#"
+            sync_days = 30
+            run_in_background = true
+
+            [google]
+            client_id = "g-123.apps.googleusercontent.com"
+
+            [microsoft]
+            client_id = "  "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.sync_days, 30);
+        assert!(config.run_in_background);
+        assert_eq!(
+            config.google_client_id(),
+            Some("g-123.apps.googleusercontent.com")
+        );
+        assert_eq!(
+            config.microsoft_client_id(),
+            None,
+            "blanco equivale a ausente"
+        );
+    }
+
+    #[test]
+    fn env_overrides_file_values() {
+        let mut config = Config::parse("[google]\nclient_id = \"from-file\"\n").unwrap();
+        config.apply_env(|name| match name {
+            ENV_GOOGLE_CLIENT_ID => Some(" from-env ".into()),
+            ENV_MICROSOFT_CLIENT_ID => Some(String::new()),
+            _ => None,
+        });
+        assert_eq!(config.google_client_id(), Some("from-env"));
+        assert_eq!(config.microsoft_client_id(), None);
+    }
+
+    #[test]
+    fn env_sets_microsoft_when_file_has_nothing() {
+        let mut config = Config::default();
+        config.apply_env(|name| (name == ENV_MICROSOFT_CLIENT_ID).then(|| "ms-id".to_owned()));
+        assert_eq!(config.microsoft_client_id(), Some("ms-id"));
+    }
+
+    #[test]
+    fn rejects_invalid_toml() {
+        assert!(Config::parse("sync_days = [").is_err());
+    }
+}

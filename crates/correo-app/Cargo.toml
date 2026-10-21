@@ -11,8 +11,15 @@ correo-core.workspace = true
 correo-store = { path = "../correo-store" }
 correo-imap = { path = "../correo-imap" }
 correo-smtp = { path = "../correo-smtp" }
-correo-auth = { path = "../correo-auth" }
+correo-auth = { path = "../correo-auth", features = ["libsecret"] }
 correo-contacts = { path = "../correo-contacts" }
 correo-threads = { path = "../correo-threads" }
 correo-sync = { path = "../correo-sync" }
 tokio.workspace = true
+gio = { version = "0.22", features = ["v2_70"] }
+serde.workspace = true
+async-trait.workspace = true
+serde_json = "1"
+toml = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+ammonia = "4.2.4"
