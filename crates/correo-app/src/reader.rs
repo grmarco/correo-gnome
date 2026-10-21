@@ -4,6 +4,12 @@
 
 #[path = "reader_html.rs"]
 mod reader_html;
+#[cfg(feature = "webkit")]
+#[path = "reader_web.rs"]
+mod reader_web;
+#[cfg(any(feature = "webkit", test))]
+#[path = "reader_web_policy.rs"]
+mod reader_web_policy;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -19,6 +25,10 @@ use crate::ui_types::ComposeMode;
 use reader_html::{count_images, html_to_segments, plain_to_segments, Segment, Style};
 
 type ComposeFn = Box<dyn Fn(ComposeMode)>;
+
+const BANNER_NORMAL: &str = "Imágenes bloqueadas para proteger tu privacidad";
+#[cfg(feature = "webkit")]
+const ORIGINAL_LABEL: &str = "Ver original";
 
 /// Mensaje mostrado actualmente.
 #[derive(Clone, Default)]
@@ -66,6 +76,12 @@ struct Inner {
     stack: gtk::Stack,
     text_view: gtk::TextView,
     error_page: adw::StatusPage,
+    /// Alterna entre el texto y la vista original (solo con la feature `webkit`).
+    #[cfg(feature = "webkit")]
+    original: gtk::Button,
+    /// Vista original existente; `None` salvo mientras está visible.
+    #[cfg(feature = "webkit")]
+    web: RefCell<Option<reader_web::OriginalView>>,
 }
 
 pub struct MessageView {
@@ -130,6 +146,17 @@ impl MessageView {
         ] {
             actions.append(b);
         }
+        #[cfg(feature = "webkit")]
+        let original = action_button(
+            ORIGINAL_LABEL,
+            "web-browser-symbolic",
+            "Ver el HTML original en una vista aislada (sin scripts ni red)",
+        );
+        #[cfg(feature = "webkit")]
+        {
+            original.set_visible(false);
+            actions.append(&original);
+        }
         let actions_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Never)
@@ -138,7 +165,7 @@ impl MessageView {
             .build();
         root.append(&actions_scroll);
 
-        let banner = adw::Banner::new("Imágenes bloqueadas para proteger tu privacidad");
+        let banner = adw::Banner::new(BANNER_NORMAL);
         banner.set_revealed(false);
         root.append(&banner);
 
@@ -228,7 +255,27 @@ impl MessageView {
             stack,
             text_view,
             error_page,
+            #[cfg(feature = "webkit")]
+            original: original.clone(),
+            #[cfg(feature = "webkit")]
+            web: RefCell::new(None),
         });
+
+        #[cfg(feature = "webkit")]
+        {
+            let weak = Rc::downgrade(&inner);
+            original.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    toggle_original(&inner);
+                }
+            });
+            let weak = Rc::downgrade(&inner);
+            inner.banner.connect_button_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    allow_remote_images(&inner);
+                }
+            });
+        }
 
         connect_compose_button(&inner, &reply, ComposeMode::Reply);
         connect_compose_button(&inner, &reply_all, ComposeMode::ReplyAll);
@@ -367,6 +414,7 @@ fn connect_link_clicks(inner: &Rc<Inner>) {
 fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: MessageHeader) {
     let gen = inner.generation.get() + 1;
     inner.generation.set(gen);
+    destroy_original(inner);
 
     set_header_labels(inner, &header);
     set_actions_enabled(inner, true, false);
@@ -542,6 +590,7 @@ fn run_action(inner: &Rc<Inner>, action: Action) {
 
 fn clear_view(inner: &Rc<Inner>) {
     inner.generation.set(inner.generation.get() + 1);
+    destroy_original(inner);
     *inner.current.borrow_mut() = Current::default();
     inner.links.borrow_mut().clear();
     inner.subject.set_text("");
@@ -632,9 +681,87 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     *inner.links.borrow_mut() = links;
     inner.text_view.set_buffer(Some(&buffer));
     inner.stack.set_visible_child_name("content");
+    #[cfg(feature = "webkit")]
+    inner
+        .original
+        .set_visible(body.html.as_deref().is_some_and(|h| !h.trim().is_empty()));
 
     populate_attachments(inner, body);
 }
+
+/// Pulsa «Ver original»: crea la vista bajo demanda y carga el HTML sin sanear.
+/// Si ya existe, vuelve al texto y la destruye para liberar memoria.
+#[cfg(feature = "webkit")]
+fn toggle_original(inner: &Rc<Inner>) {
+    if inner.web.borrow().is_some() {
+        destroy_original(inner);
+        inner.stack.set_visible_child_name("content");
+        return;
+    }
+    let html = inner
+        .current
+        .borrow()
+        .body
+        .as_ref()
+        .and_then(|b| b.html.clone())
+        .filter(|h| !h.trim().is_empty());
+    let Some(html) = html else { return };
+    match reader_web::OriginalView::new(html.clone()) {
+        Ok(view) => {
+            inner.stack.add_named(view.widget(), Some("original"));
+            view.load();
+            inner.stack.set_visible_child_name("original");
+            inner.original.set_label("Volver al texto");
+            inner
+                .banner
+                .set_title("Imágenes remotas bloqueadas en la vista original");
+            inner
+                .banner
+                .set_button_label(Some("Cargar imágenes remotas"));
+            inner
+                .banner
+                .set_revealed(reader_html::count_images(&html) > 0);
+            *inner.web.borrow_mut() = Some(view);
+        }
+        Err(e) => alert(&inner.root, "No se pudo abrir la vista original", &e),
+    }
+}
+
+/// El usuario acepta imágenes remotas: solo se relaja la carga de imágenes https.
+#[cfg(feature = "webkit")]
+fn allow_remote_images(inner: &Inner) {
+    if let Some(view) = inner.web.borrow().as_ref() {
+        view.allow_images();
+    }
+    inner.banner.set_revealed(false);
+}
+
+/// Destruye la vista original (si existe) y restaura el banner del modo texto.
+#[cfg(feature = "webkit")]
+fn destroy_original(inner: &Inner) {
+    let Some(view) = inner.web.borrow_mut().take() else {
+        return;
+    };
+    if inner.stack.visible_child_name().as_deref() == Some("original") {
+        inner.stack.set_visible_child_name("content");
+    }
+    inner.stack.remove(view.widget());
+    drop(view);
+    inner.original.set_label(ORIGINAL_LABEL);
+    inner.banner.set_title(BANNER_NORMAL);
+    inner.banner.set_button_label(None);
+    let remote = inner
+        .current
+        .borrow()
+        .body
+        .as_ref()
+        .and_then(|b| b.html.as_deref())
+        .map_or(0, reader_html::count_images);
+    inner.banner.set_revealed(remote > 0);
+}
+
+#[cfg(not(feature = "webkit"))]
+fn destroy_original(_inner: &Inner) {}
 
 fn clear_attachments(inner: &Inner) {
     while let Some(child) = inner.attachments.first_child() {
