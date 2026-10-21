@@ -362,6 +362,18 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(se)
     }
 
+    /// Cabecera por id interno.
+    pub fn get_header(&self, id: MessageId) -> Result<Option<MessageHeader>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {HEADER_COLS} FROM messages WHERE id = ?1"),
+                params![id],
+                header_from_row,
+            )
+            .optional()
+            .map_err(se)
+    }
+
     /// Actualiza los flags de un mensaje identificado por (mailbox_id, uid).
     pub fn set_flags(&self, mailbox_id: MailboxId, uid: u32, flags: &Flags) -> Result<()> {
         let changed = self
@@ -1056,6 +1068,17 @@ mod tests {
         let subjects: Vec<_> = page2.iter().map(|h| h.subject.as_str()).collect();
         assert_eq!(subjects, ["m3", "m2"]);
         assert!(s.list_headers(mb, 10, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_header_by_id() {
+        let s = store();
+        let acc = new_account(&s, "g@example.com");
+        let mb = new_mailbox(&s, acc, "INBOX");
+        s.upsert_headers(mb, &[header(mb, 3, "Uno", 1)]).unwrap();
+        let id = s.message_id(mb, 3).unwrap().unwrap();
+        assert_eq!(s.get_header(id).unwrap().unwrap().subject, "Uno");
+        assert!(s.get_header(id + 99).unwrap().is_none());
     }
 
     #[test]
