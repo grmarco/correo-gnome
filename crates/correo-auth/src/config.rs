@@ -13,6 +13,9 @@ pub struct OAuthProvider {
     pub authorization_url: String,
     pub token_url: String,
     pub scopes: Vec<String>,
+    /// Scopes del refresco por audiencia. Vacío = el token es válido para todo (Google).
+    pub mail_scopes: Vec<String>,
+    pub directory_scopes: Vec<String>,
     pub client_id: String,
     /// Opcional: solo si la aplicación registrada es confidencial.
     pub client_secret: Option<String>,
@@ -33,6 +36,8 @@ impl OAuthProvider {
                 "https://www.googleapis.com/auth/contacts.readonly".into(),
                 "https://www.googleapis.com/auth/userinfo.email".into(),
             ],
+            mail_scopes: Vec::new(),
+            directory_scopes: Vec::new(),
             client_id: client_id.into(),
             client_secret: None,
             extra_authorization_params: vec![
@@ -54,6 +59,16 @@ impl OAuthProvider {
                 "offline_access".into(),
                 "Contacts.Read".into(),
                 "User.Read".into(),
+            ],
+            mail_scopes: vec![
+                "https://outlook.office.com/IMAP.AccessAsUser.All".into(),
+                "https://outlook.office.com/SMTP.Send".into(),
+                "offline_access".into(),
+            ],
+            directory_scopes: vec![
+                "https://graph.microsoft.com/Contacts.Read".into(),
+                "https://graph.microsoft.com/User.Read".into(),
+                "offline_access".into(),
             ],
             client_id: client_id.into(),
             client_secret: None,

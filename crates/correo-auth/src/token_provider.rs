@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use correo_core::{AccessToken, AccountId, Error, Result, TokenProvider};
+use correo_core::{AccessToken, AccountId, Error, Result, TokenAudience, TokenProvider};
 
 use crate::oauth::{OAuthClient, TokenSet};
 use crate::store::TokenStore;
@@ -34,11 +34,12 @@ impl CachedToken {
 
 /// Un slot por cuenta. Su mutex async serializa los refrescos concurrentes de esa cuenta.
 type Slot = Arc<tokio::sync::Mutex<Option<CachedToken>>>;
+type SlotKey = (AccountId, TokenAudience);
 
 pub struct OAuthTokenProvider {
     client: OAuthClient,
     store: Arc<dyn TokenStore>,
-    slots: Mutex<HashMap<AccountId, Slot>>,
+    slots: Mutex<HashMap<SlotKey, Slot>>,
 }
 
 impl fmt::Debug for OAuthTokenProvider {
@@ -66,7 +67,8 @@ impl OAuthTokenProvider {
             )
         })?;
         self.store.save_refresh_token(account, refresh).await?;
-        let slot = self.slot(account);
+        // El token inicial solo vale para el primer recurso de los scopes (el del correo).
+        let slot = self.slot(account, TokenAudience::Mail);
         *slot.lock().await = Some(CachedToken::from_tokens(tokens));
         Ok(())
     }
@@ -74,21 +76,19 @@ impl OAuthTokenProvider {
     /// Olvida una cuenta: borra el refresh token y la caché en memoria.
     pub async fn remove_account(&self, account: AccountId) -> Result<()> {
         self.store.delete_refresh_token(account).await?;
-        let slot = self.slot(account);
-        *slot.lock().await = None;
+        for audience in [TokenAudience::Mail, TokenAudience::Directory] {
+            *self.slot(account, audience).lock().await = None;
+        }
         Ok(())
     }
 
-    fn slot(&self, account: AccountId) -> Slot {
+    fn slot(&self, account: AccountId, audience: TokenAudience) -> Slot {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-        Arc::clone(slots.entry(account).or_default())
+        Arc::clone(slots.entry((account, audience)).or_default())
     }
-}
 
-#[async_trait::async_trait]
-impl TokenProvider for OAuthTokenProvider {
-    async fn access_token(&self, account: AccountId) -> Result<AccessToken> {
-        let slot = self.slot(account);
+    async fn token_for(&self, account: AccountId, audience: TokenAudience) -> Result<AccessToken> {
+        let slot = self.slot(account, audience);
         // Mantener el lock durante el refresco: las demás peticiones de la cuenta esperan y
         // reutilizan el token nuevo en lugar de refrescar de nuevo.
         let mut cached = slot.lock().await;
@@ -105,7 +105,16 @@ impl TokenProvider for OAuthTokenProvider {
                     "no hay credenciales guardadas para la cuenta {account}"
                 ))
             })?;
-        let tokens = self.client.refresh(&refresh_token).await?;
+        let provider = self.client.provider();
+        let scopes = match audience {
+            TokenAudience::Mail => &provider.mail_scopes,
+            TokenAudience::Directory => &provider.directory_scopes,
+        };
+        let tokens = if scopes.is_empty() {
+            self.client.refresh(&refresh_token).await?
+        } else {
+            self.client.refresh_scoped(&refresh_token, scopes).await?
+        };
         if let Some(rotated) = tokens.refresh_token.as_deref()
             && rotated != refresh_token
         {
@@ -116,6 +125,21 @@ impl TokenProvider for OAuthTokenProvider {
         let access = fresh.access.clone();
         *cached = Some(fresh);
         Ok(AccessToken(access))
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenProvider for OAuthTokenProvider {
+    async fn access_token(&self, account: AccountId) -> Result<AccessToken> {
+        self.token_for(account, TokenAudience::Mail).await
+    }
+
+    async fn access_token_for(
+        &self,
+        account: AccountId,
+        audience: TokenAudience,
+    ) -> Result<AccessToken> {
+        self.token_for(account, audience).await
     }
 }
 
@@ -286,5 +310,35 @@ mod tests {
             provider.access_token(ACCOUNT).await,
             Err(Error::Auth(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn microsoft_requests_one_resource_per_audience() {
+        let server = FakeServer::start(vec![
+            (200, token_json("mail-token", None, 3600)),
+            (200, token_json("graph-token", None, 3600)),
+        ])
+        .await;
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save_refresh_token(ACCOUNT, "rt").await.unwrap();
+        let mut config = OAuthProvider::microsoft("cid");
+        config.token_url = server.url.clone();
+        let provider = OAuthTokenProvider::new(OAuthClient::new(config).unwrap(), store);
+
+        let mail = provider.access_token(ACCOUNT).await.unwrap();
+        let graph = provider
+            .access_token_for(ACCOUNT, TokenAudience::Directory)
+            .await
+            .unwrap();
+        assert_eq!(
+            (mail.0.as_str(), graph.0.as_str()),
+            ("mail-token", "graph-token")
+        );
+
+        let requests = server.requests();
+        assert!(requests[0].contains("outlook.office.com"));
+        assert!(!requests[0].contains("graph.microsoft.com"));
+        assert!(requests[1].contains("graph.microsoft.com"));
+        assert!(!requests[1].contains("outlook.office.com"));
     }
 }

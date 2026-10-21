@@ -97,7 +97,10 @@ impl ContactSource for GoogleContacts {
 #[async_trait::async_trait]
 impl ContactSource for MicrosoftContacts {
     async fn sync(&self) -> Result<Vec<Contact>> {
-        let token = self.tokens.access_token(self.account_id).await?;
+        let token = self
+            .tokens
+            .access_token_for(self.account_id, correo_core::TokenAudience::Directory)
+            .await?;
         let http = http_client()?;
         let base = self.base_url.trim_end_matches('/');
         let mut out = Vec::new();

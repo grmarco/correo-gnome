@@ -140,10 +140,27 @@ pub struct Draft {
 #[derive(Debug, Clone)]
 pub struct AccessToken(pub String);
 
+/// Recurso para el que se pide el token. En Microsoft un token solo vale para un recurso:
+/// el correo (IMAP/SMTP) y Graph (contactos, perfil) necesitan tokens distintos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenAudience {
+    Mail,
+    Directory,
+}
+
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
-    /// Devuelve un token válido, refrescándolo si hace falta.
+    /// Devuelve un token válido para el correo, refrescándolo si hace falta.
     async fn access_token(&self, account: AccountId) -> Result<AccessToken>;
+
+    /// Token para otro recurso del mismo proveedor. Por defecto es el mismo token.
+    async fn access_token_for(
+        &self,
+        account: AccountId,
+        _audience: TokenAudience,
+    ) -> Result<AccessToken> {
+        self.access_token(account).await
+    }
 }
 
 #[async_trait::async_trait]

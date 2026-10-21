@@ -150,6 +150,17 @@ impl OAuthClient {
         .await
     }
 
+    /// Como `refresh`, pero pidiendo un conjunto concreto de scopes (un único recurso).
+    pub async fn refresh_scoped(&self, refresh_token: &str, scopes: &[String]) -> Result<TokenSet> {
+        let scope = scopes.join(" ");
+        self.post_token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", &scope),
+        ])
+        .await
+    }
+
     async fn post_token(&self, params: &[(&str, &str)]) -> Result<TokenSet> {
         let mut form: Vec<(&str, &str)> = params.to_vec();
         form.push(("client_id", &self.provider.client_id));
