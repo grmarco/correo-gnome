@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gdk, glib, pango};
@@ -66,11 +66,14 @@ impl Editor {
             last_cursor: Cell::new(-1),
         });
 
+        // Los widgets (propiedad de `Inner`) y sus señales no retienen `Inner` con un
+        // `Rc`: sería un ciclo. Las señales usan `Weak`; `Editor` es quien posee `Inner`.
         // Texto escrito con un formato pendiente: se aplica a lo insertado.
         let buf = view.buffer();
         {
-            let inner = inner.clone();
+            let weak = Rc::downgrade(&inner);
             buf.connect_changed(move |buf| {
+                let Some(inner) = weak.upgrade() else { return };
                 let cursor = buf.cursor_position();
                 let last = inner.last_cursor.get();
                 if last >= 0 && cursor > last && !inner.pending.borrow().is_empty() {
@@ -87,15 +90,22 @@ impl Editor {
         // Mover el cursor con el ratón o el teclado cancela los formatos pendientes.
         let click = gtk::GestureClick::new();
         {
-            let inner = inner.clone();
-            click.connect_pressed(move |_, _, _, _| inner.clear_pending());
+            let weak = Rc::downgrade(&inner);
+            click.connect_pressed(move |_, _, _, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.clear_pending();
+                }
+            });
         }
         view.add_controller(click);
 
         let keys = gtk::EventControllerKey::new();
         {
-            let inner = inner.clone();
+            let weak = Rc::downgrade(&inner);
             keys.connect_key_pressed(move |_, keyval, _, state| {
+                let Some(inner) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
                 if state.contains(gdk::ModifierType::CONTROL_MASK) {
                     let handled = match keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
                         Some('b') => inner.toggle_inline(Inline::Bold),
@@ -339,51 +349,56 @@ fn toolbar(inner: &Rc<Inner>) -> gtk::Box {
     bar.set_margin_bottom(4);
     bar.add_css_class("toolbar");
 
-    let i = inner.clone();
-    tool_button(
-        &bar,
-        "format-text-bold-symbolic",
-        "Negrita (Ctrl+B)",
+    // Los botones usan `Weak` por la misma razón que las señales del editor.
+    let weak = Rc::downgrade(inner);
+    tool_button(&bar, "format-text-bold-symbolic", "Negrita (Ctrl+B)", {
+        let weak = weak.clone();
         move || {
-            i.toggle_inline(Inline::Bold);
-        },
-    );
-    let i = inner.clone();
-    tool_button(
-        &bar,
-        "format-text-italic-symbolic",
-        "Cursiva (Ctrl+I)",
+            with_inner(&weak, |i| {
+                i.toggle_inline(Inline::Bold);
+            })
+        }
+    });
+    tool_button(&bar, "format-text-italic-symbolic", "Cursiva (Ctrl+I)", {
+        let weak = weak.clone();
         move || {
-            i.toggle_inline(Inline::Italic);
-        },
-    );
-    let i = inner.clone();
+            with_inner(&weak, |i| {
+                i.toggle_inline(Inline::Italic);
+            })
+        }
+    });
     tool_button(
         &bar,
         "format-text-underline-symbolic",
         "Subrayado (Ctrl+U)",
-        move || {
-            i.toggle_inline(Inline::Underline);
+        {
+            let weak = weak.clone();
+            move || {
+                with_inner(&weak, |i| {
+                    i.toggle_inline(Inline::Underline);
+                })
+            }
         },
     );
-    let i = inner.clone();
-    tool_button(
-        &bar,
-        "view-list-bullet-symbolic",
-        "Lista con viñetas",
-        move || {
-            i.toggle_bullets();
-        },
-    );
-    let i = inner.clone();
-    tool_button(&bar, "format-indent-more-symbolic", "Cita", move || {
-        i.toggle_quote();
+    tool_button(&bar, "view-list-bullet-symbolic", "Lista con viñetas", {
+        let weak = weak.clone();
+        move || with_inner(&weak, |i| i.toggle_bullets())
     });
-    let i = inner.clone();
+    tool_button(&bar, "format-indent-more-symbolic", "Cita", {
+        let weak = weak.clone();
+        move || with_inner(&weak, |i| i.toggle_quote())
+    });
     tool_button(&bar, "insert-link-symbolic", "Enlace (Ctrl+K)", move || {
-        i.insert_link();
+        with_inner(&weak, |i| i.insert_link())
     });
     bar
+}
+
+/// Ejecuta `f` si el editor sigue vivo.
+fn with_inner(weak: &Weak<Inner>, f: impl FnOnce(&Rc<Inner>)) {
+    if let Some(inner) = weak.upgrade() {
+        f(&inner);
+    }
 }
 
 fn tool_button(bar: &gtk::Box, icon: &str, tip: &str, action: impl Fn() + 'static) {

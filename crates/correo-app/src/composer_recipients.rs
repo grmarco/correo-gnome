@@ -2,7 +2,7 @@
 //! sugerencias de contactos (SQLite local, consultada en el hilo principal).
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
@@ -39,6 +39,11 @@ struct Inner {
 #[derive(Clone)]
 pub struct RecipientField {
     inner: Rc<Inner>,
+}
+
+/// Recupera el campo mientras siga vivo (para los manejadores de señal con `Weak`).
+fn upgrade(weak: &Weak<Inner>) -> Option<RecipientField> {
+    weak.upgrade().map(|inner| RecipientField { inner })
 }
 
 impl RecipientField {
@@ -84,24 +89,45 @@ impl RecipientField {
             }),
         };
 
-        let me = field.clone();
-        entry.connect_changed(move |_| me.on_text_changed());
+        // Las señales usan `Weak`: los widgets pertenecen a `Inner`, y un `Rc` aquí
+        // formaría un ciclo que impediría liberar el campo al cerrar el compositor.
+        let weak = Rc::downgrade(&field.inner);
+        entry.connect_changed({
+            let weak = weak.clone();
+            move |_| {
+                if let Some(me) = upgrade(&weak) {
+                    me.on_text_changed();
+                }
+            }
+        });
 
         let keys = gtk::EventControllerKey::new();
-        let me = field.clone();
-        keys.connect_key_pressed(move |_, key, _, _| me.on_key(key));
+        keys.connect_key_pressed({
+            let weak = weak.clone();
+            move |_, key, _, _| match upgrade(&weak) {
+                Some(me) => me.on_key(key),
+                None => glib::Propagation::Proceed,
+            }
+        });
         entry.add_controller(keys);
 
         let focus = gtk::EventControllerFocus::new();
-        let me = field.clone();
-        focus.connect_leave(move |_| {
-            me.commit_pending_quietly();
-            me.inner.popover.popdown();
+        focus.connect_leave({
+            let weak = weak.clone();
+            move |_| {
+                if let Some(me) = upgrade(&weak) {
+                    me.commit_pending_quietly();
+                    me.inner.popover.popdown();
+                }
+            }
         });
         entry.add_controller(focus);
 
-        let me = field.clone();
-        list.connect_row_activated(move |_, row| me.pick_suggestion(row.index() as usize));
+        list.connect_row_activated(move |_, row| {
+            if let Some(me) = upgrade(&weak) {
+                me.pick_suggestion(row.index() as usize);
+            }
+        });
 
         field
     }
@@ -344,8 +370,12 @@ impl Inner {
         remove.add_css_class("flat");
         remove.add_css_class("circular");
         remove.set_tooltip_text(Some("Quitar destinatario"));
-        let me = self.clone();
-        remove.connect_clicked(move |_| me.remove_chip(id));
+        let weak = Rc::downgrade(self);
+        remove.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.remove_chip(id);
+            }
+        });
 
         let chip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         chip.add_css_class("card");

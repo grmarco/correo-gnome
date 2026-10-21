@@ -18,6 +18,7 @@ pub enum Target {
 
 pub struct Sidebar {
     page: adw::NavigationPage,
+    add_button: gtk::Button,
     list: gtk::ListBox,
     /// Destino de cada fila, por posición (las cabeceras de cuenta no tienen destino).
     targets: Rc<RefCell<Vec<Option<Target>>>>,
@@ -48,7 +49,10 @@ impl Sidebar {
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
         scroller.set_child(Some(&list));
 
+        let add_button = gtk::Button::from_icon_name("list-add-symbolic");
+        add_button.set_tooltip_text(Some("Añadir cuenta"));
         let header = adw::HeaderBar::new();
+        header.pack_start(&add_button);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&scroller));
@@ -56,6 +60,7 @@ impl Sidebar {
         let page = adw::NavigationPage::new(&toolbar, "Carpetas");
         Self {
             page,
+            add_button,
             list,
             targets,
         }
@@ -63,6 +68,11 @@ impl Sidebar {
 
     pub fn page(&self) -> &adw::NavigationPage {
         &self.page
+    }
+
+    /// Se invoca al pulsar «Añadir cuenta» en la cabecera de la barra lateral.
+    pub fn connect_add_account(&self, f: impl Fn() + 'static) {
+        self.add_button.connect_clicked(move |_| f());
     }
 
     /// Reconstruye la barra con las cuentas y sus carpetas, y selecciona `current`

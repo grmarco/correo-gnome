@@ -56,7 +56,7 @@ impl SyncHandle {
     /// Empieza a sincronizar una cuenta (las cuentas existentes al arrancar y las nuevas
     /// tras `add_account_dialog`).
     pub fn start_account(&self, account: Account) {
-        let backend = Arc::new(imap_backend(&self.services, &account));
+        let backend = Arc::new(self.services.imap(&account));
         let store = Arc::clone(&self.services.store);
         let job = self.services.spawn({
             let account = account.clone();
@@ -152,17 +152,6 @@ fn attach(
             on_new(account.clone(), new_messages);
         }
     });
-}
-
-/// Mismo preset que `Services::backend`, pero con el tipo concreto para poder usar IDLE.
-fn imap_backend(services: &Services, account: &Account) -> ImapBackend {
-    let (tokens, store) = (services.tokens.clone(), services.store.clone());
-    match account.provider {
-        correo_core::Provider::Gmail => {
-            ImapBackend::gmail(account.id, account.email.clone(), tokens, store)
-        }
-        _ => ImapBackend::outlook(account.id, account.email.clone(), tokens, store),
-    }
 }
 
 /// Crea el runner de una cuenta y lo arranca. Debe ejecutarse dentro del runtime de tokio.

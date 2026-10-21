@@ -5,7 +5,6 @@
 //! Añadirlo requiere un método nuevo en correo-imap/correo-core, que este módulo no
 //! toca. Cuando exista, `search_server` debe llamar a ese método solo si el backend
 //! de la cuenta lo anuncia, y devolver cabeceras que se guarden en la caché.
-#![allow(dead_code)]
 
 use correo_core::MessageHeader;
 

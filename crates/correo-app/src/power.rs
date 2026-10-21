@@ -119,12 +119,6 @@ impl PowerWatcher {
         }
     }
 
-    /// Vuelve a emitir las condiciones actuales aunque no hayan cambiado.
-    pub fn emit_current(&self) {
-        self.inner.last.set(None);
-        self.inner.refresh();
-    }
-
     /// La ventana principal visible habilita el barrido de carpetas suscritas.
     pub fn set_window_visible(&self, visible: bool) {
         self.inner.window_visible.set(visible);

@@ -192,9 +192,14 @@ impl Inner {
             let remove = gtk::Button::from_icon_name("window-close-symbolic");
             remove.add_css_class("flat");
             remove.set_tooltip_text(Some("Quitar adjunto"));
-            let me = self.clone();
+            // `Weak`: la fila pertenece a `Inner`; un `Rc` aquí sería un ciclo.
+            let weak = Rc::downgrade(self);
             let id = item.id;
-            remove.connect_clicked(move |_| me.remove(id));
+            remove.connect_clicked(move |_| {
+                if let Some(me) = weak.upgrade() {
+                    me.remove(id);
+                }
+            });
             row.append(&icon);
             row.append(&name);
             row.append(&size);

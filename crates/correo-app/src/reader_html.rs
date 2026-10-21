@@ -1,7 +1,6 @@
 //! Conversión pura de HTML de correo a segmentos de texto con formato (sin GTK, testeable).
 //! El HTML pasa primero por `ammonia` (sin scripts, estilos, imágenes ni esquemas peligrosos)
 //! y después se convierte a una lista plana de `Segment` que la UI pinta en un `TextBuffer`.
-#![allow(dead_code)] // Se usa desde reader.rs; el consumo completo llega con window.rs.
 
 use std::collections::HashSet;
 
@@ -31,15 +30,77 @@ pub enum Segment {
 }
 
 const ALLOWED_TAGS: &[&str] = &[
-    "a", "b", "strong", "i", "em", "u", "s", "del", "strike", "ins", "cite", "code", "pre", "tt",
-    "kbd", "p", "br", "hr", "div", "span", "ul", "ol", "li", "blockquote", "h1", "h2", "h3", "h4",
-    "h5", "h6", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "section",
-    "article", "header", "footer", "dl", "dt", "dd",
+    "a",
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "s",
+    "del",
+    "strike",
+    "ins",
+    "cite",
+    "code",
+    "pre",
+    "tt",
+    "kbd",
+    "p",
+    "br",
+    "hr",
+    "div",
+    "span",
+    "ul",
+    "ol",
+    "li",
+    "blockquote",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "td",
+    "th",
+    "caption",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "dl",
+    "dt",
+    "dd",
 ];
 
 const BLOCK_TAGS: &[&str] = &[
-    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre", "ul", "ol",
-    "table", "tr", "caption", "section", "article", "header", "footer", "dl", "dt", "dd",
+    "p",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "blockquote",
+    "pre",
+    "ul",
+    "ol",
+    "table",
+    "tr",
+    "caption",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "dl",
+    "dt",
+    "dd",
 ];
 
 /// Convierte HTML de correo en segmentos de texto con formato. Scripts, estilos, imágenes y
@@ -65,10 +126,16 @@ pub fn plain_to_segments(text: &str) -> Vec<Segment> {
         if group.is_empty() {
             return;
         }
-        let style = Style { quote, ..Style::default() };
+        let style = Style {
+            quote,
+            ..Style::default()
+        };
         for (i, line) in group.iter().enumerate() {
             if i > 0 {
-                out.push(Segment::Text { text: "\n".into(), style: style.clone() });
+                out.push(Segment::Text {
+                    text: "\n".into(),
+                    style: style.clone(),
+                });
             }
             out.extend(linkify(line, &style));
         }
@@ -97,11 +164,18 @@ fn sanitizer() -> ammonia::Builder<'static> {
     builder
         .tags(ALLOWED_TAGS.iter().copied().collect::<HashSet<_>>())
         .clean_content_tags(
-            ["script", "style", "head", "title", "template", "noscript", "iframe", "object", "embed", "svg", "math"]
+            [
+                "script", "style", "head", "title", "template", "noscript", "iframe", "object",
+                "embed", "svg", "math",
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        )
+        .url_schemes(
+            ["http", "https", "mailto"]
                 .into_iter()
                 .collect::<HashSet<_>>(),
-        )
-        .url_schemes(["http", "https", "mailto"].into_iter().collect::<HashSet<_>>());
+        );
     builder
 }
 
@@ -150,8 +224,14 @@ fn linkify(text: &str, base: &Style) -> Vec<Segment> {
         if start > 0 {
             out.push(text_segment(&rest[..start], base));
         }
-        let style = Style { link: Some(url.to_string()), ..base.clone() };
-        out.push(Segment::Text { text: url.to_string(), style });
+        let style = Style {
+            link: Some(url.to_string()),
+            ..base.clone()
+        };
+        out.push(Segment::Text {
+            text: url.to_string(),
+            style,
+        });
         rest = &rest[start + url.len()..];
     }
     if !rest.is_empty() {
@@ -161,12 +241,19 @@ fn linkify(text: &str, base: &Style) -> Vec<Segment> {
 }
 
 fn text_segment(text: &str, style: &Style) -> Segment {
-    Segment::Text { text: text.to_string(), style: style.clone() }
+    Segment::Text {
+        text: text.to_string(),
+        style: style.clone(),
+    }
 }
 
 #[derive(Debug, PartialEq)]
 enum Token {
-    Open { name: String, href: Option<String>, void: bool },
+    Open {
+        name: String,
+        href: Option<String>,
+        void: bool,
+    },
     Close(String),
     Text(String),
 }
@@ -204,8 +291,12 @@ fn tokenize(mut rest: &str) -> Vec<Token> {
             continue;
         }
         let (name, attrs) = parse_tag(body);
-        let href = attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone());
-        let void = body.trim_end().ends_with('/') || matches!(name.as_str(), "br" | "hr" | "img" | "wbr");
+        let href = attrs
+            .iter()
+            .find(|(k, _)| k == "href")
+            .map(|(_, v)| v.clone());
+        let void =
+            body.trim_end().ends_with('/') || matches!(name.as_str(), "br" | "hr" | "img" | "wbr");
         tokens.push(Token::Open { name, href, void });
     }
     tokens
@@ -219,7 +310,9 @@ fn parse_tag(body: &str) -> (String, Vec<(String, String)>) {
     let mut attrs = Vec::new();
     let mut s = body[name_end..].trim_start();
     while !s.is_empty() {
-        let key_end = s.find(|c: char| c == '=' || c.is_whitespace()).unwrap_or(s.len());
+        let key_end = s
+            .find(|c: char| c == '=' || c.is_whitespace())
+            .unwrap_or(s.len());
         let key = s[..key_end].to_ascii_lowercase();
         s = s[key_end..].trim_start();
         let value = if let Some(after_eq) = s.strip_prefix('=') {
@@ -326,7 +419,10 @@ struct Converter {
 
 impl Converter {
     fn style(&self) -> Style {
-        let mut s = Style { indent: self.lists.len() as u32, ..Style::default() };
+        let mut s = Style {
+            indent: self.lists.len() as u32,
+            ..Style::default()
+        };
         for open in &self.stack {
             match open.name.as_str() {
                 "b" | "strong" => s.bold = true,
@@ -396,10 +492,16 @@ impl Converter {
 
     fn open(&mut self, name: &str, href: Option<String>, void: bool) {
         match name {
-            "br" => self.para.push(Segment::Text { text: "\n".into(), style: self.style() }),
+            "br" => self.para.push(Segment::Text {
+                text: "\n".into(),
+                style: self.style(),
+            }),
             "hr" => {
                 self.end_para();
-                self.para.push(Segment::Text { text: "─".repeat(24), style: self.style() });
+                self.para.push(Segment::Text {
+                    text: "─".repeat(24),
+                    style: self.style(),
+                });
                 self.end_para();
             }
             _ => {
@@ -414,7 +516,10 @@ impl Converter {
                     _ => {}
                 }
                 if !void {
-                    self.stack.push(Open { name: name.to_string(), href });
+                    self.stack.push(Open {
+                        name: name.to_string(),
+                        href,
+                    });
                 }
             }
         }
@@ -430,8 +535,14 @@ impl Converter {
         } else {
             "• ".to_string()
         };
-        let style = Style { indent: self.lists.len() as u32, ..Style::default() };
-        self.para.push(Segment::Text { text: marker, style });
+        let style = Style {
+            indent: self.lists.len() as u32,
+            ..Style::default()
+        };
+        self.para.push(Segment::Text {
+            text: marker,
+            style,
+        });
     }
 
     fn close(&mut self, name: &str) {
@@ -439,7 +550,10 @@ impl Converter {
             self.stack.truncate(pos);
         }
         match name {
-            "td" | "th" => self.para.push(Segment::Text { text: "   ".into(), style: self.style() }),
+            "td" | "th" => self.para.push(Segment::Text {
+                text: "   ".into(),
+                style: self.style(),
+            }),
             "pre" => self.pre = self.pre.saturating_sub(1),
             "ul" | "ol" => {
                 self.lists.pop();
@@ -470,15 +584,24 @@ mod tests {
     use super::*;
 
     fn text(s: &str) -> Segment {
-        Segment::Text { text: s.into(), style: Style::default() }
+        Segment::Text {
+            text: s.into(),
+            style: Style::default(),
+        }
     }
 
     fn styled(s: &str, style: Style) -> Segment {
-        Segment::Text { text: s.into(), style }
+        Segment::Text {
+            text: s.into(),
+            style,
+        }
     }
 
     fn bold() -> Style {
-        Style { bold: true, ..Style::default() }
+        Style {
+            bold: true,
+            ..Style::default()
+        }
     }
 
     #[test]
@@ -499,20 +622,28 @@ mod tests {
     #[test]
     fn strong_and_italic_nest() {
         let segs = html_to_segments("<strong>a <em>b</em></strong>");
-        assert_eq!(
-            segs[0],
-            styled("a ", bold())
-        );
+        assert_eq!(segs[0], styled("a ", bold()));
         assert_eq!(
             segs[1],
-            styled("b", Style { bold: true, italic: true, ..Style::default() })
+            styled(
+                "b",
+                Style {
+                    bold: true,
+                    italic: true,
+                    ..Style::default()
+                }
+            )
         );
     }
 
     #[test]
     fn links_keep_their_url() {
-        let segs = html_to_segments(r#"<p>Mira <a href="https://example.org/x?a=1&amp;b=2">aquí</a></p>"#);
-        let link = Style { link: Some("https://example.org/x?a=1&b=2".into()), ..Style::default() };
+        let segs =
+            html_to_segments(r#"<p>Mira <a href="https://example.org/x?a=1&amp;b=2">aquí</a></p>"#);
+        let link = Style {
+            link: Some("https://example.org/x?a=1&b=2".into()),
+            ..Style::default()
+        };
         assert_eq!(segs[0], text("Mira "));
         assert_eq!(segs[1], styled("aquí", link));
     }
@@ -526,7 +657,10 @@ mod tests {
     #[test]
     fn lists_get_markers_and_indent() {
         let segs = html_to_segments("<ul><li>uno</li><li>dos</li></ul><ol><li>primero</li></ol>");
-        let indented = Style { indent: 1, ..Style::default() };
+        let indented = Style {
+            indent: 1,
+            ..Style::default()
+        };
         assert_eq!(segs[0], styled("• ", indented.clone()));
         assert_eq!(segs[1], styled("uno", indented.clone()));
         assert_eq!(segs[2], Segment::Paragraph);
@@ -540,7 +674,10 @@ mod tests {
     #[test]
     fn blockquotes_are_quoted() {
         let segs = html_to_segments("<blockquote><p>cita</p></blockquote><p>fuera</p>");
-        let quoted = Style { quote: 1, ..Style::default() };
+        let quoted = Style {
+            quote: 1,
+            ..Style::default()
+        };
         assert_eq!(segs[0], styled("cita", quoted));
         assert_eq!(segs[2], text("fuera"));
     }
@@ -593,19 +730,49 @@ mod tests {
     #[test]
     fn plain_text_detects_links_and_quotes() {
         let segs = plain_to_segments("Visita https://example.org/a.\n\n> citado\n> más");
-        assert_eq!(
-            segs[0],
-            text("Visita ")
-        );
+        assert_eq!(segs[0], text("Visita "));
         assert_eq!(
             segs[1],
-            styled("https://example.org/a", Style { link: Some("https://example.org/a".into()), ..Style::default() })
+            styled(
+                "https://example.org/a",
+                Style {
+                    link: Some("https://example.org/a".into()),
+                    ..Style::default()
+                }
+            )
         );
         assert_eq!(segs[2], text("."));
         assert_eq!(segs[3], Segment::Paragraph);
-        assert_eq!(segs[4], styled("citado", Style { quote: 1, ..Style::default() }));
-        assert_eq!(segs[5], styled("\n", Style { quote: 1, ..Style::default() }));
-        assert_eq!(segs[6], styled("más", Style { quote: 1, ..Style::default() }));
+        assert_eq!(
+            segs[4],
+            styled(
+                "citado",
+                Style {
+                    quote: 1,
+                    ..Style::default()
+                }
+            )
+        );
+        assert_eq!(
+            segs[5],
+            styled(
+                "\n",
+                Style {
+                    quote: 1,
+                    ..Style::default()
+                }
+            )
+        );
+        assert_eq!(
+            segs[6],
+            styled(
+                "más",
+                Style {
+                    quote: 1,
+                    ..Style::default()
+                }
+            )
+        );
     }
 
     #[test]

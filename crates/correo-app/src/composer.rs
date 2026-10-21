@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use correo_core::{Account, Address, Draft};
+use correo_core::{Account, Address, Draft, Provider};
 use gtk::{gdk, glib};
 
 use crate::services::Services;
@@ -60,7 +60,6 @@ struct Ctx {
 }
 
 /// Abre una ventana de redacción para `account`.
-#[allow(dead_code)] // lo llama window.rs (otro agente); hasta entonces no hay llamadas.
 pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mode: ComposeMode) {
     let accounts = accounts_for(&services, &account);
     let initial_account = accounts
@@ -239,34 +238,51 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
     });
 
     // Mostrar y ocultar Cc / Cco bajo demanda.
-    {
-        let (row, button) = (cc_row.clone(), cc_button.clone());
-        cc_button.connect_clicked(move |_| {
-            row.set_visible(true);
-            button.set_visible(false);
-        });
-    }
-    {
-        let (row, button) = (bcc_row.clone(), bcc_button.clone());
-        bcc_button.connect_clicked(move |_| {
-            row.set_visible(true);
-            button.set_visible(false);
-        });
-    }
+    // Mostrar Cc / Cco bajo demanda. Con `@weak` la señal no retiene sus propios widgets.
+    cc_button.connect_clicked(glib::clone!(
+        #[weak]
+        cc_row,
+        #[weak]
+        cc_button,
+        move |_| {
+            cc_row.set_visible(true);
+            cc_button.set_visible(false);
+        }
+    ));
+    bcc_button.connect_clicked(glib::clone!(
+        #[weak]
+        bcc_row,
+        #[weak]
+        bcc_button,
+        move |_| {
+            bcc_row.set_visible(true);
+            bcc_button.set_visible(false);
+        }
+    ));
 
+    // Los widgets que pertenecen a `Ctx` y las señales que les conectamos no deben
+    // retener `Ctx` con un `Rc`: eso forma un ciclo y la ventana nunca se libera. Por
+    // eso los manejadores usan `Weak`. La propia ventana retiene `Ctx` a través de
+    // `close_request`, así que `Ctx` vive lo que la ventana.
     {
-        let ctx = ctx.clone();
-        send_button.connect_clicked(move |_| send(&ctx));
+        let weak = Rc::downgrade(&ctx);
+        send_button.connect_clicked(move |_| {
+            if let Some(ctx) = weak.upgrade() {
+                send(&ctx);
+            }
+        });
     }
     {
         // Ctrl+Intro envía; en fase de captura para que el editor no inserte salto de línea.
-        let ctx = ctx.clone();
+        let weak = Rc::downgrade(&ctx);
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(move |_, key, _, state| {
             let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter);
             if enter && state.contains(gdk::ModifierType::CONTROL_MASK) {
-                send(&ctx);
+                if let Some(ctx) = weak.upgrade() {
+                    send(&ctx);
+                }
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -407,6 +423,11 @@ fn send(ctx: &Rc<Ctx>) {
         }
     };
     ctx.set_sending(true);
+    // Gmail guarda la copia en Enviados al enviar por SMTP; Outlook y Microsoft 365 no,
+    // así que la copia se añade por IMAP después del envío.
+    let sent_copy = needs_sent_copy(&account).then(|| {
+        correo_smtp::raw_message(&draft).map_err(|e| format!("no se pudo preparar la copia: {e}"))
+    });
     let sender = ctx.services.sender(&account);
     let sent = ctx
         .services
@@ -422,10 +443,44 @@ fn send(ctx: &Rc<Ctx>) {
                     window.close();
                 }
                 toast_in_other_window(&ctx.app, &ctx.window, "Mensaje enviado");
+                if let Some(raw) = sent_copy {
+                    save_sent_copy(&ctx, &account, raw).await;
+                }
             }
             Err(msg) => ctx.show_error(&format!("No se pudo enviar el mensaje: {msg}")),
         }
     });
+}
+
+/// Outlook.com y Microsoft 365 no guardan una copia de lo enviado por SMTP.
+fn needs_sent_copy(account: &Account) -> bool {
+    matches!(account.provider, Provider::Outlook | Provider::Microsoft365)
+}
+
+/// Añade la copia del mensaje enviado a Enviados. Un fallo no revierte el envío: solo
+/// avisa con un toast en la ventana principal.
+async fn save_sent_copy(ctx: &Ctx, account: &Account, raw: Result<Vec<u8>, String>) {
+    let saved = match raw {
+        Ok(raw) => {
+            let backend = ctx.services.imap(account);
+            ctx.services
+                .spawn(async move {
+                    backend
+                        .append_to_sent(&raw)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = saved {
+        toast_in_other_window(
+            &ctx.app,
+            &ctx.window,
+            &format!("Mensaje enviado, pero no se guardó la copia en Enviados: {e}"),
+        );
+    }
 }
 
 /// Pregunta antes de cerrar con cambios sin enviar. Durante el envío no se cierra.

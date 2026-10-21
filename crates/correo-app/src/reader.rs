@@ -1,7 +1,6 @@
 //! T10: lector de mensaje.
 //! Cabecera, barra de acciones, cuerpo (HTML saneado o texto plano) sin WebKit y adjuntos.
 //! Toda la red va por `services.spawn`; los resultados vuelven al hilo de GTK con `spawn_local`.
-#![allow(dead_code)] // MessageView se consume desde window.rs (T9); hasta entonces no hay llamadas.
 
 #[path = "reader_html.rs"]
 mod reader_html;
@@ -46,6 +45,8 @@ struct Inner {
     /// URLs de los enlaces del cuerpo actual; el tag `link-N` apunta a `links[N]`.
     links: RefCell<Vec<String>>,
     compose: RefCell<Option<ComposeFn>>,
+    /// Se avisa tras cambios que afectan a la lista (archivar, borrar, leer o no leer).
+    changed: RefCell<Option<Rc<dyn Fn()>>>,
 
     root: gtk::Box,
     subject: gtk::Label,
@@ -96,14 +97,37 @@ impl MessageView {
         date.add_css_class("dim-label");
         root.append(&meta);
 
-        let reply = action_button("Responder", "mail-reply-sender-symbolic", "Responder al remitente");
-        let reply_all = action_button("Responder a todos", "mail-reply-all-symbolic", "Responder a todos");
+        let reply = action_button(
+            "Responder",
+            "mail-reply-sender-symbolic",
+            "Responder al remitente",
+        );
+        let reply_all = action_button(
+            "Responder a todos",
+            "mail-reply-all-symbolic",
+            "Responder a todos",
+        );
         let forward = action_button("Reenviar", "mail-forward-symbolic", "Reenviar el mensaje");
-        let archive = action_button("Archivar", "mail-archive-symbolic", "Mover a la carpeta de archivo");
+        let archive = action_button(
+            "Archivar",
+            "mail-archive-symbolic",
+            "Mover a la carpeta de archivo",
+        );
         let delete = action_button("Borrar", "user-trash-symbolic", "Borrar el mensaje");
-        let mark_unread = action_button("Marcar no leído", "mail-unread-symbolic", "Marcar como no leído");
+        let mark_unread = action_button(
+            "Marcar no leído",
+            "mail-unread-symbolic",
+            "Marcar como no leído",
+        );
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        for b in [&reply, &reply_all, &forward, &archive, &delete, &mark_unread] {
+        for b in [
+            &reply,
+            &reply_all,
+            &forward,
+            &archive,
+            &delete,
+            &mark_unread,
+        ] {
             actions.append(b);
         }
         let actions_scroll = gtk::ScrolledWindow::builder()
@@ -160,12 +184,22 @@ impl MessageView {
         text_view.set_wrap_mode(gtk::WrapMode::WordChar);
         text_view.set_left_margin(4);
         text_view.set_right_margin(4);
-        let body_scroll = gtk::ScrolledWindow::builder().child(&text_view).vexpand(true).build();
+        let body_scroll = gtk::ScrolledWindow::builder()
+            .child(&text_view)
+            .vexpand(true)
+            .build();
         stack.add_named(&body_scroll, Some("content"));
         stack.set_visible_child_name("empty");
         root.append(&stack);
 
-        for b in [&reply, &reply_all, &forward, &archive, &delete, &mark_unread] {
+        for b in [
+            &reply,
+            &reply_all,
+            &forward,
+            &archive,
+            &delete,
+            &mark_unread,
+        ] {
             b.set_sensitive(false);
         }
 
@@ -175,6 +209,7 @@ impl MessageView {
             current: RefCell::new(Current::default()),
             links: RefCell::new(Vec::new()),
             compose: RefCell::new(None),
+            changed: RefCell::new(None),
             root: root.clone(),
             subject,
             from,
@@ -240,6 +275,12 @@ impl MessageView {
     pub fn connect_compose(&self, f: impl Fn(ComposeMode) + 'static) {
         *self.inner.compose.borrow_mut() = Some(Box::new(f));
     }
+
+    /// Se invoca cuando el mensaje cambia de estado o desaparece de su carpeta
+    /// (leído al abrirlo, no leído, archivado o borrado). El llamador refresca la lista.
+    pub fn connect_changed(&self, f: impl Fn() + 'static) {
+        *self.inner.changed.borrow_mut() = Some(Rc::new(f));
+    }
 }
 
 fn meta_label(parent: &gtk::Box) -> gtk::Label {
@@ -295,11 +336,17 @@ fn connect_link_clicks(inner: &Rc<Inner>) {
     let weak = Rc::downgrade(inner);
     click.connect_released(move |gesture, _, x, y| {
         let Some(inner) = weak.upgrade() else { return };
-        let Some(view) = gesture.widget().and_then(|w| w.downcast::<gtk::TextView>().ok()) else {
+        let Some(view) = gesture
+            .widget()
+            .and_then(|w| w.downcast::<gtk::TextView>().ok())
+        else {
             return;
         };
-        let (bx, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let Some(iter) = view.iter_at_location(bx, by) else { return };
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let Some(iter) = view.iter_at_location(bx, by) else {
+            return;
+        };
         let url = iter.tags().iter().find_map(|tag| {
             let name = tag.name()?;
             let idx: usize = name.strip_prefix("link-")?.parse().ok()?;
@@ -350,7 +397,9 @@ fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: Mes
     inner.stack.set_visible_child_name("loading");
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
-    let handle = inner.services.spawn(async move { backend.fetch_body(&m, uid).await });
+    let handle = inner
+        .services
+        .spawn(async move { backend.fetch_body(&m, uid).await });
     let weak = Rc::downgrade(inner);
     glib::MainContext::default().spawn_local(async move {
         let result = handle.await;
@@ -382,7 +431,9 @@ fn finish_body(inner: &Rc<Inner>, body: MessageBody) {
 fn mark_seen(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: MessageHeader) {
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
-    let handle = inner.services.spawn(async move { backend.set_seen(&m, uid, true).await });
+    let handle = inner
+        .services
+        .spawn(async move { backend.set_seen(&m, uid, true).await });
     let weak = Rc::downgrade(inner);
     glib::MainContext::default().spawn_local(async move {
         if handle.await.is_err() {
@@ -392,7 +443,17 @@ fn mark_seen(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: Mess
         let mut flags = header.flags.clone();
         flags.seen = true;
         update_flags(&inner, &mailbox, header.uid, header.id, &flags);
+        notify_changed(&inner);
     });
+}
+
+/// Avisa al llamador de que la lista puede haber cambiado. Clona el callback antes de
+/// llamarlo para no retener el `RefCell` durante la llamada.
+fn notify_changed(inner: &Inner) {
+    let callback = inner.changed.borrow().clone();
+    if let Some(callback) = callback {
+        callback();
+    }
 }
 
 /// Guarda flags en la BD local y en el mensaje mostrado (si sigue siendo el mismo).
@@ -410,7 +471,8 @@ fn update_flags(inner: &Inner, mailbox: &Mailbox, uid: u32, message_id: i64, fla
 
 fn run_action(inner: &Rc<Inner>, action: Action) {
     let cur = inner.current.borrow().clone();
-    let (Some(account), Some(mailbox), Some(header)) = (cur.account, cur.mailbox, cur.header) else {
+    let (Some(account), Some(mailbox), Some(header)) = (cur.account, cur.mailbox, cur.header)
+    else {
         return;
     };
 
@@ -427,7 +489,11 @@ fn run_action(inner: &Rc<Inner>, action: Action) {
             match archive {
                 Some(target) => Some(target),
                 None => {
-                    alert(&inner.root, "No se puede archivar", "No se encontró la carpeta de archivo de esta cuenta.");
+                    alert(
+                        &inner.root,
+                        "No se puede archivar",
+                        "No se encontró la carpeta de archivo de esta cuenta.",
+                    );
                     return;
                 }
             }
@@ -456,11 +522,13 @@ fn run_action(inner: &Rc<Inner>, action: Action) {
                         let _ = store.delete_uid(mailbox.id, header.uid);
                     }
                     clear_view(&inner);
+                    notify_changed(&inner);
                 }
                 Action::MarkUnread => {
                     let mut flags = header.flags.clone();
                     flags.seen = false;
                     update_flags(&inner, &mailbox, header.uid, header.id, &flags);
+                    notify_changed(&inner);
                 }
             },
             Err(e) => alert(
@@ -509,10 +577,16 @@ fn set_header_labels(inner: &Inner, header: &MessageHeader) {
     } else {
         &header.subject
     });
-    inner.from.set_text(&format!("De: {}", format_addresses(&header.from)));
-    inner.to.set_text(&format!("Para: {}", format_addresses(&header.to)));
+    inner
+        .from
+        .set_text(&format!("De: {}", format_addresses(&header.from)));
+    inner
+        .to
+        .set_text(&format!("Para: {}", format_addresses(&header.to)));
     inner.cc.set_visible(!header.cc.is_empty());
-    inner.cc.set_text(&format!("CC: {}", format_addresses(&header.cc)));
+    inner
+        .cc
+        .set_text(&format!("CC: {}", format_addresses(&header.cc)));
     let date = glib::DateTime::from_unix_local(header.date)
         .ok()
         .and_then(|d| d.format("%d/%m/%Y %H:%M").ok())
@@ -527,10 +601,12 @@ fn format_addresses(addresses: &[Address]) -> String {
     }
     addresses
         .iter()
-        .map(|a| match a.name.as_deref().filter(|n| !n.trim().is_empty()) {
-            Some(name) => format!("{name} <{}>", a.email),
-            None => a.email.clone(),
-        })
+        .map(
+            |a| match a.name.as_deref().filter(|n| !n.trim().is_empty()) {
+                Some(name) => format!("{name} <{}>", a.email),
+                None => a.email.clone(),
+            },
+        )
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -573,7 +649,8 @@ fn populate_attachments(inner: &Rc<Inner>, body: &MessageBody) {
         return;
     }
     let cur = inner.current.borrow().clone();
-    let (Some(account), Some(mailbox), Some(header)) = (cur.account, cur.mailbox, cur.header) else {
+    let (Some(account), Some(mailbox), Some(header)) = (cur.account, cur.mailbox, cur.header)
+    else {
         return;
     };
     for (index, att) in body.attachments.iter().enumerate() {
@@ -634,7 +711,11 @@ fn save_attachment(inner: &Rc<Inner>, btn: &gtk::Button, att: AttachmentRef) {
         let Ok(file) = res else { return };
         let Some(path) = file.path() else {
             if let Some(inner) = weak.upgrade() {
-                alert(&inner.root, "No se puede guardar", "La ruta elegida no es válida.");
+                alert(
+                    &inner.root,
+                    "No se puede guardar",
+                    "La ruta elegida no es válida.",
+                );
             }
             return;
         };
@@ -760,7 +841,12 @@ fn build_buffer(segments: &[Segment], links: &mut Vec<String>) -> gtk::TextBuffe
                     }
                 }
                 let mut tags = Vec::new();
-                let char_style = Style { quote: 0, indent: 0, link: None, ..style.clone() };
+                let char_style = Style {
+                    quote: 0,
+                    indent: 0,
+                    link: None,
+                    ..style.clone()
+                };
                 if style.link.is_none() {
                     tags.push(style_tag(&buffer, &mut style_tags, &char_style));
                 }
@@ -799,7 +885,11 @@ fn build_buffer(segments: &[Segment], links: &mut Vec<String>) -> gtk::TextBuffe
     buffer
 }
 
-fn style_tag(buffer: &gtk::TextBuffer, cache: &mut HashMap<String, gtk::TextTag>, style: &Style) -> gtk::TextTag {
+fn style_tag(
+    buffer: &gtk::TextBuffer,
+    cache: &mut HashMap<String, gtk::TextTag>,
+    style: &Style,
+) -> gtk::TextTag {
     let key = format!("{style:?}");
     if let Some(tag) = cache.get(&key) {
         return tag.clone();

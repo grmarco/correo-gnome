@@ -1,6 +1,3 @@
-// Temporal: varios módulos de la interfaz aún no están conectados desde main.
-#![allow(dead_code)]
-
 mod composer;
 mod message_list;
 mod notify;
@@ -12,6 +9,7 @@ mod sidebar;
 mod ui_types;
 mod window;
 
+use std::cell::OnceCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -22,8 +20,10 @@ const APP_ID: &str = "io.github.gmarco.Correo";
 
 fn main() -> gtk::glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(|app| {
-        let services = Rc::new(build_services());
+    // Los servicios se crean una sola vez: `activate` puede repetirse (segunda ejecución).
+    let services: Rc<OnceCell<Rc<Services>>> = Rc::default();
+    app.connect_activate(move |app| {
+        let services = services.get_or_init(|| Rc::new(build_services())).clone();
         window::present(app, services);
     });
     app.run()

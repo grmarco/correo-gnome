@@ -178,6 +178,26 @@ impl ImapBackend {
         Ok(event)
     }
 
+    /// Guarda `raw` (RFC 5322) en la carpeta de rol Enviados, marcada como leída.
+    /// Lo usan los servidores que no guardan la copia al enviar por SMTP (Outlook).
+    pub async fn append_to_sent(&self, raw: &[u8]) -> Result<()> {
+        let sent = correo_core::MailBackend::list_mailboxes(self)
+            .await?
+            .into_iter()
+            .find(|m| m.role == MailboxRole::Sent)
+            .ok_or_else(|| Error::NotFound(format!("carpeta de Enviados de {}", self.email)))?;
+        self.retry(|| self.append_once(&sent, raw)).await
+    }
+
+    async fn append_once(&self, sent: &Mailbox, raw: &[u8]) -> Result<()> {
+        let mut guard = self.conn().await?;
+        guard
+            .session
+            .append(&sent.path, Some("(\\Seen)"), None, raw)
+            .await
+            .map_err(map_imap_error)
+    }
+
     /// Cabeceras cacheadas de una carpeta, paginando.
     fn cached_headers(&self, mailbox_id: MailboxId) -> Result<Vec<MessageHeader>> {
         let mut all = Vec::new();

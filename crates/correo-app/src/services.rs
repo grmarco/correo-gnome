@@ -4,7 +4,6 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use correo_auth::{MemoryTokenStore, OAuthClient, OAuthProvider, OAuthTokenProvider};
 use correo_core::{Account, ContactSource, MailBackend, Provider, Result, Sender, TokenProvider};
 use correo_imap::ImapBackend;
 use correo_store::Store;
@@ -42,12 +41,18 @@ impl Services {
     }
 
     pub fn backend(&self, account: &Account) -> Arc<dyn MailBackend> {
+        Arc::new(self.imap(account))
+    }
+
+    /// Backend IMAP concreto (para operaciones fuera de `MailBackend`, p. ej. IDLE o
+    /// guardar una copia en Enviados).
+    pub fn imap(&self, account: &Account) -> ImapBackend {
         let (tokens, store) = (self.tokens.clone(), self.store.clone());
         let email = account.email.clone();
-        Arc::new(match account.provider {
+        match account.provider {
             Provider::Gmail => ImapBackend::gmail(account.id, email, tokens, store),
             _ => ImapBackend::outlook(account.id, email, tokens, store),
-        })
+        }
     }
 
     pub fn sender(&self, account: &Account) -> Arc<dyn Sender> {
@@ -70,15 +75,3 @@ impl Services {
         self.store.lock().expect("store envenenado").list_accounts()
     }
 }
-
-/// Construye el proveedor de tokens a partir de los client IDs (variables de entorno
-/// `CORREO_GOOGLE_CLIENT_ID` / `CORREO_MICROSOFT_CLIENT_ID`, o fichero de config en T12).
-pub fn oauth_provider(provider: Provider, client_id: &str) -> OAuthProvider {
-    match provider {
-        Provider::Gmail => OAuthProvider::google(client_id),
-        _ => OAuthProvider::microsoft(client_id),
-    }
-}
-
-#[allow(dead_code)]
-type _Used = (OAuthClient, OAuthTokenProvider, MemoryTokenStore);

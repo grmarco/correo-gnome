@@ -12,9 +12,11 @@ use gtk::{gio, glib};
 
 use crate::composer;
 use crate::message_list::{thread_rows, MessageList};
+use crate::notify;
 use crate::reader::MessageView;
 use crate::search;
 use crate::services::Services;
+use crate::setup::{self, SyncHandle};
 use crate::sidebar::{Sidebar, Target};
 use crate::ui_types::ComposeMode;
 
@@ -22,12 +24,56 @@ use crate::ui_types::ComposeMode;
 const PAGE: usize = 50;
 /// Resultados máximos de la búsqueda local.
 const SEARCH_LIMIT: usize = 200;
+/// Tipo de las acciones de notificación: (id de carpeta, uid).
+const MESSAGE_TARGET: &str = "(xu)";
 
+thread_local! {
+    /// Ventana única de la aplicación. Vive mientras dure el proceso: así las acciones
+    /// de las notificaciones funcionan aunque la ventana esté oculta (modo residente).
+    static SHELL: RefCell<Option<Rc<Shell>>> = const { RefCell::new(None) };
+}
+
+/// Muestra la ventana principal, o la vuelve a mostrar si ya existe.
 pub fn present(app: &adw::Application, services: Rc<Services>) {
+    if let Some(shell) = SHELL.with(|s| s.borrow().clone()) {
+        shell.window.present();
+        return;
+    }
+
     let shell = Shell::new(app, services);
     shell.install_actions();
+    shell.install_app_actions(app);
     shell.start();
+
+    // Con CORREO_DEMO no se toca la red: la base es ficticia.
+    if !demo_mode() {
+        let weak = shell.weak.clone();
+        let handle = setup::start_sync(shell.services.clone(), app, move |account, ids| {
+            if let Some(s) = weak.upgrade() {
+                s.on_new_messages(account, &ids);
+            }
+        });
+        *shell.sync.borrow_mut() = Some(handle);
+        for account in shell.services.accounts().unwrap_or_default() {
+            shell.sync_contacts(&account);
+        }
+    }
+    shell.watch_focus();
+
     shell.window.present();
+    shell.update_visibility();
+    SHELL.with(|s| *s.borrow_mut() = Some(shell));
+}
+
+/// Modo de demostración (solo compilaciones de depuración con `CORREO_DEMO`).
+fn demo_mode() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("CORREO_DEMO").is_some()
+}
+
+/// Con modo residente, cerrar la ventana solo la oculta: la app sigue activa en segundo
+/// plano y las notificaciones pueden volver a abrirla.
+fn resident() -> bool {
+    setup::app_config().run_in_background
 }
 
 /// Fuente de cabeceras paginada para la vista actual.
@@ -61,7 +107,10 @@ pub struct Shell {
     list: MessageList,
     search: gtk::SearchEntry,
     sync_btn: gtk::Button,
-    outer: adw::NavigationSplitView,
+    /// Sincronización en segundo plano; `None` en modo demostración.
+    sync: RefCell<Option<SyncHandle>>,
+    /// Cuentas recién añadidas cuyo primer informe de sincronización aún no ha llegado.
+    fresh_accounts: RefCell<Vec<correo_core::AccountId>>,
     inner: adw::NavigationSplitView,
     reader_stack: gtk::Stack,
     reader_box: gtk::Box,
@@ -81,6 +130,14 @@ impl Shell {
                     }
                 })
             };
+            {
+                let w = weak.clone();
+                sidebar.connect_add_account(move || {
+                    if let Some(s) = w.upgrade() {
+                        s.add_account();
+                    }
+                });
+            }
             let list = {
                 let w = weak.clone();
                 MessageList::new(move |h| {
@@ -96,6 +153,14 @@ impl Shell {
                 .default_width(1100)
                 .default_height(720)
                 .build();
+            window.connect_close_request(|win| {
+                if resident() {
+                    win.set_visible(false);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
 
             // Lista de mensajes: cabecera con sincronizar, búsqueda y redactar.
             let search = gtk::SearchEntry::builder()
@@ -158,7 +223,7 @@ impl Shell {
                 let w = weak.clone();
                 add_btn.connect_clicked(move |_| {
                     if let Some(s) = w.upgrade() {
-                        s.toast("El alta de cuentas llegará con la próxima versión");
+                        s.add_account();
                     }
                 });
             }
@@ -241,11 +306,12 @@ impl Shell {
                 list,
                 search,
                 sync_btn,
-                outer,
                 inner,
                 reader_stack,
                 reader_box,
                 reader: RefCell::new(None),
+                sync: RefCell::new(None),
+                fresh_accounts: RefCell::new(Vec::new()),
                 state: RefCell::new(State {
                     accounts: Vec::new(),
                     mailboxes: Vec::new(),
@@ -269,6 +335,53 @@ impl Shell {
         self.action("toggle-read", &["<Primary>u"], |s| s.toggle_read());
         self.action("search", &["<Primary>f"], |s| {
             s.search.grab_focus();
+        });
+    }
+
+    /// Acciones de aplicación: las usan las notificaciones (`app.open-message`,
+    /// `app.mark-read`, `app.archive`) y funcionan aunque la ventana esté oculta.
+    fn install_app_actions(self: &Rc<Self>, app: &adw::Application) {
+        let ty = glib::VariantTy::new(MESSAGE_TARGET).expect("tipo de acción válido");
+        type MessageAction = fn(&Rc<Shell>, MailboxId, u32);
+        let entries: [(&str, MessageAction); 3] = [
+            ("open-message", |s, m, uid| s.open_message(m, uid)),
+            ("mark-read", |s, m, uid| s.mark_read_message(m, uid)),
+            ("archive", |s, m, uid| s.archive_message_by_id(m, uid)),
+        ];
+        for (name, f) in entries {
+            let action = gio::SimpleAction::new(name, Some(ty));
+            let w = self.weak.clone();
+            action.connect_activate(move |_, param| {
+                let Some((mailbox, uid)) = param.and_then(|p| p.get::<(i64, u32)>()) else {
+                    return;
+                };
+                if let Some(s) = w.upgrade() {
+                    f(&s, mailbox, uid);
+                }
+            });
+            app.add_action(&action);
+        }
+    }
+
+    /// Visibilidad efectiva de la ventana: visible y con el foco. Alimenta el barrido
+    /// de sincronización y la decisión de notificar.
+    fn is_in_front(&self) -> bool {
+        self.window.is_visible() && self.window.is_active()
+    }
+
+    fn update_visibility(&self) {
+        let visible = self.is_in_front();
+        if let Some(sync) = self.sync.borrow().as_ref() {
+            sync.set_window_visible(visible);
+        }
+    }
+
+    fn watch_focus(self: &Rc<Self>) {
+        let w = self.weak.clone();
+        self.window.connect_is_active_notify(move |_| {
+            if let Some(s) = w.upgrade() {
+                s.update_visibility();
+            }
         });
     }
 
@@ -384,6 +497,11 @@ impl Shell {
             return;
         }
         self.state.borrow_mut().target = target;
+        if let Target::Mailbox(id) = target {
+            if let (Some(mailbox), Some(sync)) = (self.mailbox(id), self.sync.borrow().as_ref()) {
+                sync.mailbox_opened(mailbox.account_id, id);
+            }
+        }
         self.apply_target();
     }
 
@@ -540,6 +658,12 @@ impl Shell {
                 s.compose(mode);
             }
         });
+        let w = self.weak.clone();
+        view.connect_changed(move || {
+            if let Some(s) = w.upgrade() {
+                s.on_reader_changed();
+            }
+        });
         self.reader_box.append(view.widget());
         *self.reader.borrow_mut() = Some(view);
     }
@@ -556,6 +680,120 @@ impl Shell {
         match account {
             Some(account) => composer::open(&self.app, self.services.clone(), account, mode),
             None => self.toast("Añade una cuenta antes de redactar"),
+        }
+    }
+
+    // ----- Cuentas y avisos del sincronizador -------------------------------
+
+    /// Abre el alta de cuenta; al terminar, la añade a la barra y la sincroniza.
+    fn add_account(self: &Rc<Self>) {
+        let w = self.weak.clone();
+        setup::add_account_dialog(&self.window, self.services.clone(), move |account| {
+            if let Some(s) = w.upgrade() {
+                s.on_account_added(account);
+            }
+        });
+    }
+
+    fn on_account_added(self: &Rc<Self>, account: Account) {
+        if let Err(e) = self.reload_model() {
+            self.toast(format!("No se pudo leer la base de datos: {e}"));
+        }
+        self.root.set_visible_child_name("main");
+        self.apply_target();
+
+        self.fresh_accounts.borrow_mut().push(account.id);
+        if let Some(sync) = self.sync.borrow().as_ref() {
+            sync.start_account(account.clone());
+        }
+        self.sync_contacts(&account);
+        self.toast(format!("Cuenta añadida: {}", account.email));
+    }
+
+    /// Descarga los contactos de la cuenta para el autocompletado del compositor. Un
+    /// fallo no afecta al correo: se registra en la salida de error.
+    fn sync_contacts(self: &Rc<Self>, account: &Account) {
+        let source = self.services.contacts(account);
+        let store = self.services.store.clone();
+        let job = self.services.spawn(async move {
+            correo_contacts::sync_into_store(source.as_ref(), &store)
+                .await
+                .map_err(|e| e.to_string())
+        });
+        let email = account.email.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Err(e) = job.await {
+                eprintln!("correo: {email}: contactos no sincronizados: {e}");
+            }
+        });
+    }
+
+    /// Llega un informe de sincronización de una cuenta, con los ids de sus mensajes
+    /// nuevos y no leídos (puede estar vacío). Avisa si la ventana no tiene el foco y
+    /// refresca la lista si se muestra la bandeja de esa cuenta.
+    fn on_new_messages(self: &Rc<Self>, account: Account, ids: &[i64]) {
+        let headers: Vec<MessageHeader> = ids
+            .iter()
+            .filter_map(|id| self.with_store(|s| s.get_header(*id)).ok().flatten())
+            .collect();
+        notify::notify_new_if_inactive(&self.app, &account, &headers, self.is_in_front());
+
+        // La primera sincronización de una cuenta recién añadida no trae ids nuevos
+        // (la caché estaba vacía), pero sí debe verse en la lista.
+        let first_report = {
+            let mut fresh = self.fresh_accounts.borrow_mut();
+            let before = fresh.len();
+            fresh.retain(|id| *id != account.id);
+            before != fresh.len()
+        };
+        if headers.is_empty() && !first_report {
+            return;
+        }
+        if let Err(e) = self.reload_model() {
+            self.toast(format!("Error al leer la caché: {e}"));
+            return;
+        }
+        self.reload_sidebar();
+        let shows_inbox = self
+            .target_mailboxes()
+            .iter()
+            .any(|m| m.account_id == account.id && m.role == MailboxRole::Inbox);
+        if shows_inbox {
+            self.refresh_list();
+        }
+    }
+
+    /// El lector cambió un mensaje (leído, no leído, archivado o borrado).
+    fn on_reader_changed(self: &Rc<Self>) {
+        if let Err(e) = self.reload_model() {
+            self.toast(format!("Error al leer la caché: {e}"));
+        }
+        self.reload_sidebar();
+        // Si el mensaje seleccionado ya no está en la caché, se limpia el lector.
+        let selected = self.state.borrow().selected.clone();
+        if let Some(h) = selected {
+            match self.with_store(|s| s.get_header(h.id)) {
+                Ok(Some(fresh)) => self.state.borrow_mut().selected = Some(fresh),
+                Ok(None) => {
+                    self.state.borrow_mut().selected = None;
+                    self.reader_stack.set_visible_child_name("empty");
+                }
+                Err(_) => {}
+            }
+        }
+        self.refresh_list();
+    }
+
+    /// Relee la lista de la vista actual: la búsqueda se repite; el listado normal,
+    /// desde la primera página.
+    fn refresh_list(self: &Rc<Self>) {
+        let query = self.state.borrow().query.clone();
+        if query.is_empty() {
+            self.reset_list();
+        } else {
+            let hits = search::search_local(&self.services, &query, SEARCH_LIMIT);
+            self.state.borrow_mut().headers = hits;
+            self.refresh_rows();
         }
     }
 
@@ -621,6 +859,27 @@ impl Shell {
         Some((account, mailbox, h))
     }
 
+    /// Localiza un mensaje por (carpeta, uid) en la caché, con su cuenta y carpeta.
+    /// Recarga el modelo antes: una notificación puede llegar de una cuenta recién añadida.
+    fn context_for(
+        &self,
+        mailbox_id: MailboxId,
+        uid: u32,
+    ) -> Option<(Account, Mailbox, MessageHeader)> {
+        if let Err(e) = self.reload_model() {
+            self.toast(format!("Error al leer la caché: {e}"));
+            return None;
+        }
+        let id = self
+            .with_store(|s| s.message_id(mailbox_id, uid))
+            .ok()
+            .flatten()?;
+        let h = self.with_store(|s| s.get_header(id)).ok().flatten()?;
+        let mailbox = self.mailbox(mailbox_id)?;
+        let account = self.account(mailbox.account_id)?;
+        Some((account, mailbox, h))
+    }
+
     /// Ejecuta una operación remota y, si sale bien, aplica `on_ok` en el hilo de GTK.
     fn run<T: 'static>(
         self: &Rc<Self>,
@@ -643,18 +902,31 @@ impl Shell {
             return;
         };
         let seen = !h.flags.seen;
-        let backend = self.services.backend(&account);
-        let (uid, mb) = (h.uid, mailbox.clone());
+        self.set_seen_remote(&account, mailbox, h, seen);
+    }
+
+    fn set_seen_remote(
+        self: &Rc<Self>,
+        account: &Account,
+        mailbox: Mailbox,
+        h: MessageHeader,
+        seen: bool,
+    ) {
+        let backend = self.services.backend(account);
+        let uid = h.uid;
         let fut = self
             .services
-            .spawn(async move { backend.set_seen(&mb, uid, seen).await });
+            .spawn(async move { backend.set_seen(&mailbox, uid, seen).await });
         self.run(fut, move |s, ()| s.apply_seen(&h, seen));
     }
 
     fn archive(self: &Rc<Self>) {
-        let Some((account, mailbox, h)) = self.selected_context() else {
-            return;
-        };
+        if let Some((account, mailbox, h)) = self.selected_context() {
+            self.archive_remote(&account, mailbox, h);
+        }
+    }
+
+    fn archive_remote(self: &Rc<Self>, account: &Account, mailbox: Mailbox, h: MessageHeader) {
         let target = self
             .state
             .borrow()
@@ -669,11 +941,11 @@ impl Shell {
         if target.id == mailbox.id {
             return;
         }
-        let backend = self.services.backend(&account);
-        let (uid, mb) = (h.uid, mailbox.clone());
+        let backend = self.services.backend(account);
+        let uid = h.uid;
         let fut = self
             .services
-            .spawn(async move { backend.move_to(&mb, uid, &target).await });
+            .spawn(async move { backend.move_to(&mailbox, uid, &target).await });
         self.run(fut, move |s, ()| s.drop_local(&h));
     }
 
@@ -682,11 +954,36 @@ impl Shell {
             return;
         };
         let backend = self.services.backend(&account);
-        let (uid, mb) = (h.uid, mailbox.clone());
+        let uid = h.uid;
         let fut = self
             .services
-            .spawn(async move { backend.delete(&mb, uid).await });
+            .spawn(async move { backend.delete(&mailbox, uid).await });
         self.run(fut, move |s, ()| s.drop_local(&h));
+    }
+
+    // ----- Acciones de notificación (funcionan con la ventana oculta) ---------
+
+    /// Presenta la ventana, selecciona la carpeta y abre el mensaje.
+    fn open_message(self: &Rc<Self>, mailbox_id: MailboxId, uid: u32) {
+        self.window.present();
+        let Some((_, _, h)) = self.context_for(mailbox_id, uid) else {
+            self.toast("El mensaje ya no está en la caché");
+            return;
+        };
+        self.set_target(Target::Mailbox(mailbox_id));
+        self.on_select(Some(h));
+    }
+
+    fn mark_read_message(self: &Rc<Self>, mailbox_id: MailboxId, uid: u32) {
+        if let Some((account, mailbox, h)) = self.context_for(mailbox_id, uid) {
+            self.set_seen_remote(&account, mailbox, h, true);
+        }
+    }
+
+    fn archive_message_by_id(self: &Rc<Self>, mailbox_id: MailboxId, uid: u32) {
+        if let Some((account, mailbox, h)) = self.context_for(mailbox_id, uid) {
+            self.archive_remote(&account, mailbox, h);
+        }
     }
 
     /// Refleja en la caché y en pantalla un cambio de estado de lectura.

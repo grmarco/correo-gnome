@@ -46,11 +46,6 @@ impl Paragraph {
         };
         Self { kind, runs }
     }
-
-    /// Texto del párrafo sin formato.
-    pub fn text(&self) -> String {
-        self.runs.iter().map(|r| r.text.as_str()).collect()
-    }
 }
 
 /// Acepta solo enlaces de navegador o de correo; el resto se descarta por seguridad.

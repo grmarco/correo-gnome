@@ -3,7 +3,6 @@
 //! Cada cuenta usa ids estables (`correo-new-<cuenta>-<n>`) para que un lote nuevo
 //! reemplace al anterior en lugar de apilarse. Las acciones (`app.open-message`,
 //! `app.mark-read`, `app.archive`) las registra window.rs.
-#![allow(dead_code)]
 
 use adw::prelude::*;
 use correo_core::{Account, MessageHeader};

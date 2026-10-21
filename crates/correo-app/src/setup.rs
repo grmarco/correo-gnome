@@ -3,22 +3,16 @@
 //! Este fichero declara también los módulos de su área (`config`, `power`,
 //! `account_dialog`, `background`) para no tocar `main.rs`.
 
-#[allow(dead_code)]
 #[path = "account_dialog.rs"]
 mod account_dialog;
-#[allow(dead_code)]
 #[path = "background.rs"]
 pub mod background;
-#[allow(dead_code)]
 #[path = "config.rs"]
 pub mod config;
-#[allow(dead_code)]
 #[path = "power.rs"]
 pub mod power;
 
-#[allow(unused_imports)]
 pub use account_dialog::add_account_dialog;
-#[allow(unused_imports)]
 pub use background::{start_sync, SyncHandle};
 
 use std::error::Error as StdError;
