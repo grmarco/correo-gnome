@@ -116,7 +116,17 @@ impl ContactSource for GoogleContacts {
         {
             Ok(others) => out.extend(others),
             Err(Error::Auth(e)) => return Err(Error::Auth(e)),
-            Err(e) => eprintln!("correo-contacts: «otros contactos» no disponibles: {e}"),
+            Err(e) => {
+                // Una sola vez por ejecución: es un aviso de configuración, no un fallo.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "correo-contacts: «otros contactos» (gente a la que has escrito sin \
+                         guardarla) no disponibles: {e}. Opcional: añade el scope \
+                         contacts.other.readonly a la pantalla de consentimiento de Google."
+                    )
+                });
+            }
         }
 
         Ok(dedupe(out))

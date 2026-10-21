@@ -150,7 +150,26 @@ impl Shared {
             // se reintenta en el siguiente barrido. Sí cuenta un rechazo de credenciales.
             Action::SyncMailbox(_, id) => match self.sync_mailbox(id).await {
                 Err(Error::Auth(_)) => Some(Event::AuthFailed),
-                _ => None,
+                Ok(changed) => {
+                    // Sin ids nuevos (no se notifica nada): el informe solo hace que la
+                    // interfaz relea la carpeta recién sincronizada.
+                    if changed > 0 {
+                        let _ = notices
+                            .send(SyncNotice::NewMessages(SyncReport {
+                                account: self.account,
+                                new_messages: Vec::new(),
+                            }))
+                            .await;
+                    }
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "correo-sync: cuenta {}: carpeta {id} no sincronizada: {e}",
+                        self.account
+                    );
+                    None
+                }
             },
             _ => None,
         }
@@ -620,6 +639,27 @@ mod tests {
             .await
             .unwrap();
         eventually(|| backend.sync_count(SECONDARY) == 1).await;
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn syncing_a_secondary_folder_with_changes_tells_the_ui_to_reload() {
+        let backend = FakeBackend::new(3);
+        let mut ch = runner(backend.clone(), None, vec![]).spawn();
+        // Informe de la bandeja (sincronización inicial).
+        let first = tokio::time::timeout(Duration::from_secs(5), ch.reports.recv()).await;
+        assert!(matches!(first, Ok(Some(SyncNotice::NewMessages(_)))));
+        ch.events
+            .send(Event::MailboxOpened(SECONDARY))
+            .await
+            .unwrap();
+        eventually(|| backend.sync_count(SECONDARY) == 1).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), ch.reports.recv()).await;
+        match second {
+            Ok(Some(SyncNotice::NewMessages(r))) => assert!(r.new_messages.is_empty()),
+            other => panic!("se esperaba un informe vacío de recarga: {other:?}"),
+        }
         drop(ch.events);
         ch.task.await.unwrap();
     }
