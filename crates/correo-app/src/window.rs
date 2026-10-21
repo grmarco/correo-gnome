@@ -2,25 +2,29 @@
 //! contiene otro (lista de hilos | lector). Toda la E/S de red va por `Services::spawn`.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use correo_core::{
-    Account, AccountId, Address, Mailbox, MailboxId, MailboxRole, MessageHeader,
-    Result as CoreResult,
+    Account, AccountId, Address, BatchReport, Mailbox, MailboxId, MailboxRole, MessageHeader,
+    MessageId, Result as CoreResult,
 };
 use correo_store::Store;
 use gtk::{gio, glib};
 
+use crate::batch::{self, Phrase};
+use crate::batch_bar::BatchBar;
 use crate::composer;
-use crate::message_list::{thread_rows, MessageList};
+use crate::message_list::{thread_rows, MessageList, Selection};
 use crate::notify;
 use crate::reader::MessageView;
 use crate::search;
 use crate::services::{flatten, Services};
 use crate::setup::{self, AddOutcome, SyncHandle};
 use crate::sidebar::{Sidebar, Target};
+use crate::ui_style;
 use crate::ui_types::ComposeMode;
 
 /// Cabeceras por página al desplazarse.
@@ -120,6 +124,10 @@ pub struct Shell {
     list: MessageList,
     search: gtk::SearchEntry,
     sync_btn: gtk::Button,
+    /// Botón «Seleccionar» de la cabecera de la lista (casillas en cada fila).
+    select_btn: gtk::ToggleButton,
+    /// Barra de acciones en lote y estado del panel derecho.
+    batch_bar: BatchBar,
     /// Sincronización en segundo plano; `None` en modo demostración.
     sync: RefCell<Option<SyncHandle>>,
     /// Cuentas recién añadidas cuyo primer informe de sincronización aún no ha llegado.
@@ -172,9 +180,9 @@ impl Shell {
             }
             let list = {
                 let w = weak.clone();
-                MessageList::new(move |h| {
+                MessageList::new(move |sel| {
                     if let Some(s) = w.upgrade() {
-                        s.on_select(h);
+                        s.on_selection(sel);
                     }
                 })
             };
@@ -220,13 +228,59 @@ impl Shell {
             compose_btn.add_css_class("correo-compose-button");
             compose_btn.set_tooltip_text(Some("Redactar un mensaje nuevo (Ctrl+N)"));
             compose_btn.update_property(&[gtk::accessible::Property::Label("Redactar")]);
+            let select_btn = gtk::ToggleButton::new();
+            select_btn.set_icon_name(ui_style::icon_or(
+                "selection-mode-symbolic",
+                "object-select-symbolic",
+            ));
+            select_btn.add_css_class("correo-select-toggle");
+            select_btn.set_tooltip_text(Some("Seleccionar varios mensajes"));
+            select_btn.update_property(&[gtk::accessible::Property::Label("Seleccionar varios")]);
+            let batch_bar = BatchBar::new();
             let list_header = adw::HeaderBar::new();
             list_header.pack_start(&sync_btn);
+            list_header.pack_start(&select_btn);
             list_header.pack_end(&compose_btn);
             list_header.set_title_widget(Some(&search_clamp));
             let list_toolbar = adw::ToolbarView::new();
             list_toolbar.add_top_bar(&list_header);
-            list_toolbar.set_content(Some(list.widget()));
+            // La barra de lote flota sobre el borde inferior de la lista: al aparecer no
+            // redimensiona la lista (las filas no se mueven y el siguiente Ctrl+clic cae donde
+            // se espera) y queda al alcance del pulgar.
+            let list_overlay = gtk::Overlay::new();
+            list_overlay.set_child(Some(list.widget()));
+            batch_bar.widget().set_valign(gtk::Align::End);
+            list_overlay.add_overlay(batch_bar.widget());
+            list_toolbar.set_content(Some(&list_overlay));
+            // Teclado con el foco en la lista o en la barra: Supr borra y Esc cancela la
+            // selección (Ctrl+Supr, Ctrl+E y Ctrl+U son atajos de ventana).
+            {
+                let keys = gtk::EventControllerKey::new();
+                let w = weak.clone();
+                keys.connect_key_pressed(move |_, key, _, state| {
+                    let Some(s) = w.upgrade() else {
+                        return glib::Propagation::Proceed;
+                    };
+                    s.on_list_key(key, state)
+                });
+                list_toolbar.add_controller(keys);
+            }
+            {
+                let w = weak.clone();
+                select_btn.connect_toggled(move |b| {
+                    if let Some(s) = w.upgrade() {
+                        s.set_select_mode(b.is_active());
+                    }
+                });
+            }
+            {
+                let w = weak.clone();
+                batch_bar.popover().connect_show(move |_| {
+                    if let Some(s) = w.upgrade() {
+                        s.fill_move_menu();
+                    }
+                });
+            }
             let list_page = adw::NavigationPage::new(&list_toolbar, "Mensajes");
 
             // Lector: placeholder hasta que se abre un mensaje.
@@ -241,6 +295,7 @@ impl Shell {
             let reader_stack = gtk::Stack::new();
             reader_stack.add_named(&reader_empty, Some("empty"));
             reader_stack.add_named(&reader_box, Some("reader"));
+            reader_stack.add_named(batch_bar.status_page(), Some("batch"));
             reader_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
             reader_stack.set_transition_duration(160);
             reader_stack.set_visible_child_name("empty");
@@ -383,6 +438,8 @@ impl Shell {
                 list,
                 search,
                 sync_btn,
+                select_btn,
+                batch_bar,
                 inner,
                 outer,
                 reader_stack,
@@ -409,9 +466,22 @@ impl Shell {
     fn install_actions(self: &Rc<Self>) {
         self.action("compose", &["<Primary>n"], |s| s.compose(ComposeMode::New));
         self.action("sync", &["<Primary>r"], |s| s.sync());
-        self.action("archive", &["<Primary>e"], |s| s.archive());
-        self.action("delete", &["<Primary>Delete"], |s| s.delete());
-        self.action("toggle-read", &["<Primary>u"], |s| s.toggle_read());
+        self.action("archive", &["<Primary>e"], |s| s.batch_archive());
+        self.action("delete", &["<Primary>Delete"], |s| s.batch_delete());
+        self.action("toggle-read", &["<Primary>u"], |s| s.batch_toggle_read());
+        self.action("select-all", &[], |s| s.list.select_all());
+        self.action("clear-selection", &[], |s| s.clear_selection());
+        let move_to = gio::SimpleAction::new("move-to", Some(glib::VariantTy::INT64));
+        let w = self.weak.clone();
+        move_to.connect_activate(move |_, param| {
+            let Some(id) = param.and_then(|p| p.get::<i64>()) else {
+                return;
+            };
+            if let Some(s) = w.upgrade() {
+                s.batch_move(id);
+            }
+        });
+        self.window.add_action(&move_to);
         self.action("search", &["<Primary>f"], |s| {
             s.search.grab_focus();
         });
@@ -596,7 +666,7 @@ impl Shell {
         // Una carpeta de una cuenta plegada la despliega (notificaciones, bandejas).
         if let Target::Mailbox(id) = target {
             if let Some(mailbox) = self.mailbox(id) {
-                self.sidebar.expand_account(mailbox.account_id);
+                self.sidebar.reveal_mailbox(&mailbox);
             }
         }
         if self.state.borrow().target == target {
@@ -708,6 +778,7 @@ impl Shell {
         self.list.set_empty_for_query(&self.state.borrow().query);
         let rows = thread_rows(&self.state.borrow().headers);
         self.list.set_rows(&rows);
+        self.update_batch_ui();
     }
 
     fn on_search(self: &Rc<Self>) {
@@ -730,6 +801,25 @@ impl Shell {
     }
 
     // ----- Selección y lector ----------------------------------------------
+
+    /// Cambió la selección de la lista: una fila abre el lector; varias, el estado de lote.
+    fn on_selection(self: &Rc<Self>, selection: Selection) {
+        self.update_batch_ui();
+        match selection {
+            // En el modo «Seleccionar» marcar una casilla no abre el mensaje (y, con la lista
+            // a pantalla completa, no navega al lector).
+            Selection::None => self.on_select(None),
+            Selection::One(_) if self.list.select_mode() => self.on_select(None),
+            Selection::One(h) => self.on_select(Some(*h)),
+            Selection::Many(_) => {
+                self.state.borrow_mut().selected = None;
+                if let Some(reader) = self.reader.borrow().as_ref() {
+                    reader.clear();
+                }
+                self.reader_stack.set_visible_child_name("batch");
+            }
+        }
+    }
 
     fn on_select(self: &Rc<Self>, header: Option<MessageHeader>) {
         self.state.borrow_mut().selected = header.clone();
@@ -1128,13 +1218,6 @@ impl Shell {
 
     // ----- Acciones sobre el mensaje seleccionado --------------------------
 
-    fn selected_context(&self) -> Option<(Account, Mailbox, MessageHeader)> {
-        let h = self.state.borrow().selected.clone()?;
-        let mailbox = self.mailbox(h.mailbox_id)?;
-        let account = self.account(mailbox.account_id)?;
-        Some((account, mailbox, h))
-    }
-
     /// Localiza un mensaje por (carpeta, uid) en la caché, con su cuenta y carpeta.
     /// Recarga el modelo antes: una notificación puede llegar de una cuenta recién añadida.
     fn context_for(
@@ -1173,14 +1256,6 @@ impl Shell {
         });
     }
 
-    fn toggle_read(self: &Rc<Self>) {
-        let Some((account, mailbox, h)) = self.selected_context() else {
-            return;
-        };
-        let seen = !h.flags.seen;
-        self.set_seen_remote(&account, mailbox, h, seen);
-    }
-
     fn set_seen_remote(
         self: &Rc<Self>,
         account: &Account,
@@ -1195,12 +1270,6 @@ impl Shell {
                 .spawn(async move { backend.set_seen(&mailbox, uid, seen).await }),
         );
         self.run(fut, move |s, ()| s.apply_seen(&h, seen));
-    }
-
-    fn archive(self: &Rc<Self>) {
-        if let Some((account, mailbox, h)) = self.selected_context() {
-            self.archive_remote(&account, mailbox, h);
-        }
     }
 
     fn archive_remote(self: &Rc<Self>, account: &Account, mailbox: Mailbox, h: MessageHeader) {
@@ -1227,17 +1296,547 @@ impl Shell {
         self.run(fut, move |s, ()| s.drop_local(&h));
     }
 
-    fn delete(self: &Rc<Self>) {
-        let Some((account, mailbox, h)) = self.selected_context() else {
-            return;
-        };
-        let backend = self.services.backend(&account);
-        let uid = h.uid;
-        let fut = flatten(
-            self.services
-                .spawn(async move { backend.delete(&mailbox, uid).await }),
+    // ----- Selección múltiple y acciones en lote ---------------------------------
+
+    fn clear_selection(&self) {
+        if self.list.selection_len() > 0 {
+            self.list.unselect_all();
+        } else if self.list.select_mode() {
+            self.set_select_mode(false);
+        }
+    }
+
+    /// Activa o desactiva el modo «Seleccionar» (casillas en cada fila).
+    fn set_select_mode(&self, on: bool) {
+        self.list.set_select_mode(on);
+        // Con una sola fila seleccionada se conserva (el mensaje sigue abierto).
+        if !on && self.list.selection_len() >= 2 {
+            self.list.unselect_all();
+        }
+        if self.select_btn.is_active() != on {
+            self.select_btn.set_active(on);
+        }
+        self.select_btn.set_tooltip_text(Some(if on {
+            "Terminar la selección"
+        } else {
+            "Seleccionar varios mensajes"
+        }));
+        self.update_batch_ui();
+    }
+
+    /// Supr borra la selección y Esc la cancela, salvo que se esté escribiendo en un campo.
+    fn on_list_key(
+        self: &Rc<Self>,
+        key: gtk::gdk::Key,
+        state: gtk::gdk::ModifierType,
+    ) -> glib::Propagation {
+        use gtk::gdk::{Key, ModifierType};
+        if GtkWindowExt::focus(&self.window).is_some_and(|w| w.is::<gtk::Editable>()) {
+            return glib::Propagation::Proceed;
+        }
+        let plain = !state.intersects(
+            ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SHIFT_MASK,
         );
-        self.run(fut, move |s, ()| s.drop_local(&h));
+        let busy = self.list.selection_len() > 0;
+        match key {
+            Key::Escape if busy || self.list.select_mode() => {
+                self.clear_selection();
+                glib::Propagation::Stop
+            }
+            Key::Delete | Key::KP_Delete if plain && busy => {
+                self.batch_delete();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    /// Refleja la selección en la barra de lote y en el panel derecho.
+    fn update_batch_ui(&self) {
+        let n = self.list.selection_len();
+        let mode = self.list.select_mode();
+        let (any_unread, accounts) = if n == 0 {
+            (true, HashSet::new())
+        } else {
+            let account_of: HashMap<MailboxId, AccountId> = self
+                .state
+                .borrow()
+                .mailboxes
+                .iter()
+                .map(|m| (m.id, m.account_id))
+                .collect();
+            let rows = self.list.selected_rows();
+            (
+                rows.iter().any(|r| r.unread > 0),
+                rows.iter()
+                    .filter_map(|r| account_of.get(&r.last.mailbox_id).copied())
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        let blocked = (accounts.len() > 1).then_some(
+            "La selección mezcla mensajes de varias cuentas: no se pueden mover a una carpeta",
+        );
+        let show = n >= 2 || mode;
+        self.batch_bar.update(n, show, any_unread, blocked);
+        // Hueco al final de la lista para que la barra flotante no tape las últimas filas.
+        self.list.set_bottom_inset(show);
+    }
+
+    /// Mensajes de la selección: todos los de cada hilo seleccionado que hay en la lista.
+    fn selection_headers(&self) -> Vec<MessageHeader> {
+        let selected = self.list.selected_rows();
+        if selected.is_empty() {
+            return Vec::new();
+        }
+        let st = self.state.borrow();
+        let by_id: HashMap<MessageId, &MessageHeader> =
+            st.headers.iter().map(|h| (h.id, h)).collect();
+        batch::selected_messages(&selected, &[(0, selected.len() as u32)], &by_id)
+    }
+
+    fn batch_archive(self: &Rc<Self>) {
+        self.start_batch(BatchOp::Archive);
+    }
+
+    fn batch_delete(self: &Rc<Self>) {
+        self.start_batch(BatchOp::Delete);
+    }
+
+    fn batch_toggle_read(self: &Rc<Self>) {
+        self.start_batch(BatchOp::ToggleRead);
+    }
+
+    fn batch_move(self: &Rc<Self>, target: MailboxId) {
+        self.start_batch(BatchOp::Move(target));
+    }
+
+    /// Resuelve la selección a grupos (cuenta, carpeta) y los ejecuta; pide confirmación
+    /// antes de un borrado definitivo grande o desde la Papelera.
+    fn start_batch(self: &Rc<Self>, op: BatchOp) {
+        let headers = self.selection_headers();
+        if headers.is_empty() {
+            return;
+        }
+        let op = match op {
+            BatchOp::ToggleRead => BatchOp::Seen(batch::target_seen(&headers)),
+            other => other,
+        };
+        let plan = self.plan_batch(op, headers);
+        for problem in &plan.problems {
+            self.toast(problem);
+        }
+        if plan.groups.is_empty() {
+            return;
+        }
+        let permanent: usize = plan
+            .groups
+            .iter()
+            .filter(|g| matches!(g.dest, Dest::Expunge))
+            .map(|g| g.headers.len())
+            .sum();
+        let from_trash = plan
+            .groups
+            .iter()
+            .any(|g| matches!(g.dest, Dest::Expunge) && g.mailbox.role == MailboxRole::Trash);
+        if !batch::needs_delete_confirmation(permanent, from_trash) {
+            self.execute_batch(plan);
+            return;
+        }
+        let body = format!(
+            "Se borrarán {permanent} mensajes de forma permanente. Esta acción no se puede deshacer."
+        );
+        let dialog = adw::AlertDialog::new(Some("¿Borrar definitivamente?"), Some(&body));
+        dialog.add_response("cancel", "Cancelar");
+        dialog.add_response("delete", "Borrar");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let w = self.weak.clone();
+        let plan = RefCell::new(Some(plan));
+        dialog.connect_response(None, move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            if let (Some(s), Some(plan)) = (w.upgrade(), plan.borrow_mut().take()) {
+                s.execute_batch(plan);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn plan_batch(&self, op: BatchOp, headers: Vec<MessageHeader>) -> Plan {
+        let (mailboxes, accounts) = {
+            let st = self.state.borrow();
+            (st.mailboxes.clone(), st.accounts.clone())
+        };
+        let mut groups = Vec::new();
+        let mut problems = Vec::new();
+        for (mailbox_id, mut hs) in batch::group_by_mailbox(headers) {
+            let Some(mailbox) = mailboxes.iter().find(|m| m.id == mailbox_id).cloned() else {
+                continue;
+            };
+            let Some(account) = accounts
+                .iter()
+                .find(|a| a.id == mailbox.account_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let with_role = |role: MailboxRole| {
+                mailboxes
+                    .iter()
+                    .find(|m| m.account_id == account.id && m.role == role)
+                    .cloned()
+            };
+            let dest = match op {
+                BatchOp::Seen(seen) => {
+                    hs.retain(|h| h.flags.seen != seen);
+                    Dest::Seen(seen)
+                }
+                BatchOp::ToggleRead => continue,
+                BatchOp::Archive => match with_role(MailboxRole::Archive) {
+                    Some(t) if t.id == mailbox.id => continue,
+                    Some(t) => Dest::Move(t),
+                    None => {
+                        problems.push(format!("{} no tiene carpeta de archivo", account.email));
+                        continue;
+                    }
+                },
+                BatchOp::Delete => match with_role(MailboxRole::Trash) {
+                    Some(t) if mailbox.role != MailboxRole::Trash && t.id != mailbox.id => {
+                        Dest::Move(t)
+                    }
+                    _ => Dest::Expunge,
+                },
+                BatchOp::Move(target) => match mailboxes.iter().find(|m| m.id == target) {
+                    Some(t) if t.account_id == account.id => {
+                        if t.id == mailbox.id {
+                            continue;
+                        }
+                        Dest::Move(t.clone())
+                    }
+                    _ => {
+                        problems.push("No se puede mover mensajes entre cuentas".to_string());
+                        continue;
+                    }
+                },
+            };
+            if hs.is_empty() {
+                continue;
+            }
+            groups.push(Group {
+                account,
+                mailbox,
+                headers: hs,
+                dest,
+            });
+        }
+        Plan {
+            op,
+            groups,
+            problems,
+        }
+    }
+
+    /// Aplica el lote: primero la lista y la caché en pantalla (optimista), luego un trabajo
+    /// por (cuenta, carpeta) en tokio; la interfaz solo vuelve a tocarse al final.
+    fn execute_batch(self: &Rc<Self>, plan: Plan) {
+        let Plan { op, groups, .. } = plan;
+        let removal = !matches!(op, BatchOp::Seen(_));
+        // Fila a la que ir tras quitar la selección.
+        let one_selected = self.list.selection_len() == 1;
+        let next = if removal {
+            let positions = self.list.selected_positions();
+            batch::next_position(&positions, self.list.row_count() as u32)
+                .and_then(|p| self.list.row_id_at(p))
+        } else {
+            None
+        };
+
+        let jobs: Vec<_> = groups.iter().map(|g| self.spawn_group(g)).collect();
+        for g in &groups {
+            self.apply_local(g.mailbox.id, &g.headers, g.local(), false);
+        }
+        self.refresh_rows();
+        self.reload_sidebar();
+        if let Some(id) = next {
+            if self.list.selection_len() == 0 {
+                if one_selected {
+                    self.list.select_by_id(id);
+                } else {
+                    self.list.focus_id(id);
+                }
+            }
+        }
+
+        let w = self.weak.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let mut reports = Vec::new();
+            for job in jobs {
+                reports.push(job.await);
+            }
+            if let Some(s) = w.upgrade() {
+                s.finish_batch(op, groups, reports);
+            }
+        });
+    }
+
+    /// Lanza en tokio el trabajo de un grupo: cambia la caché, ejecuta el lote en el servidor
+    /// y, si algo falla, devuelve a la caché lo que no se pudo aplicar.
+    fn spawn_group(&self, g: &Group) -> impl Future<Output = BatchReport> + 'static {
+        let backend = self.services.backend(&g.account);
+        let store = self.services.store.clone();
+        let (mailbox, headers, dest) = (g.mailbox.clone(), g.headers.clone(), g.dest.clone());
+        let uids = batch::uids(&headers);
+        let job = self.services.spawn({
+            let uids = uids.clone();
+            async move {
+                cache_apply(&store, &mailbox, &headers, &dest);
+                let report = match &dest {
+                    Dest::Seen(seen) => backend.set_seen_many(&mailbox, &uids, *seen).await,
+                    Dest::Move(target) => backend.move_many(&mailbox, &uids, target).await,
+                    Dest::Expunge => backend.delete_many(&mailbox, &uids).await,
+                };
+                if !report.failed.is_empty() {
+                    cache_revert(&store, &mailbox, &headers, &dest, &report.failed);
+                }
+                report
+            }
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|e| BatchReport::all_failed(&uids, &e))
+        }
+    }
+
+    /// Ajusta la lista en memoria y el contador de no leídos. Con `revert` solo deshace el
+    /// contador: la lista se relee de la caché, que ya recuperó lo que falló.
+    fn apply_local(
+        &self,
+        mailbox_id: MailboxId,
+        headers: &[MessageHeader],
+        kind: Local,
+        revert: bool,
+    ) {
+        let delta: i64 = match kind {
+            Local::Seen(seen) => {
+                let changed = headers.iter().filter(|h| h.flags.seen != seen).count() as i64;
+                if !revert {
+                    let ids: HashSet<MessageId> = headers.iter().map(|h| h.id).collect();
+                    let mut st = self.state.borrow_mut();
+                    for m in st.headers.iter_mut().filter(|m| ids.contains(&m.id)) {
+                        m.flags.seen = seen;
+                    }
+                    if let Some(sel) = st.selected.as_mut().filter(|m| ids.contains(&m.id)) {
+                        sel.flags.seen = seen;
+                    }
+                }
+                if seen {
+                    -changed
+                } else {
+                    changed
+                }
+            }
+            Local::Remove => {
+                if !revert {
+                    let ids: HashSet<MessageId> = headers.iter().map(|h| h.id).collect();
+                    self.state
+                        .borrow_mut()
+                        .headers
+                        .retain(|m| !ids.contains(&m.id));
+                }
+                -(headers.iter().filter(|h| !h.flags.seen).count() as i64)
+            }
+        };
+        self.adjust_unread(mailbox_id, if revert { -delta } else { delta });
+    }
+
+    fn adjust_unread(&self, mailbox_id: MailboxId, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let current = self.mailbox(mailbox_id).map_or(0, |m| i64::from(m.unread));
+        let unread = u32::try_from((current + delta).max(0)).unwrap_or(u32::MAX);
+        self.set_unread(mailbox_id, unread);
+    }
+
+    /// Resultado del lote: revierte lo que falló, resume con un aviso y ofrece deshacer.
+    fn finish_batch(self: &Rc<Self>, op: BatchOp, groups: Vec<Group>, reports: Vec<BatchReport>) {
+        let (mut ok, mut total) = (0usize, 0usize);
+        let mut error: Option<String> = None;
+        let mut any_failed = false;
+        let mut undo: Vec<UndoItem> = Vec::new();
+        for (g, report) in groups.iter().zip(&reports) {
+            let failed: HashSet<u32> = report.failed.iter().copied().collect();
+            let (bad, good): (Vec<&MessageHeader>, Vec<&MessageHeader>) =
+                g.headers.iter().partition(|h| failed.contains(&h.uid));
+            total += g.headers.len();
+            ok += good.len();
+            if error.is_none() {
+                error.clone_from(&report.error);
+            }
+            if !bad.is_empty() {
+                any_failed = true;
+                let bad: Vec<MessageHeader> = bad.into_iter().cloned().collect();
+                self.apply_local(g.mailbox.id, &bad, g.local(), true);
+            }
+            if let Dest::Move(to) = &g.dest {
+                let message_ids: HashSet<String> =
+                    good.iter().filter_map(|h| h.message_id.clone()).collect();
+                if !message_ids.is_empty() {
+                    undo.push(UndoItem {
+                        account: g.account.clone(),
+                        from: g.mailbox.clone(),
+                        to: to.clone(),
+                        message_ids,
+                    });
+                }
+            }
+        }
+        if any_failed {
+            // La caché ya recuperó lo que falló: se relee todo de ella.
+            if let Err(e) = self.reload_model() {
+                self.toast(format!("Error al leer la caché: {e}"));
+            }
+            self.refresh_list();
+            self.reload_sidebar();
+        }
+
+        let seen_op = matches!(op, BatchOp::Seen(_));
+        if seen_op && ok == total {
+            return;
+        }
+        let phrase = phrase_for(op, &groups, |id| {
+            self.mailbox(id)
+                .map(|m| folder_label(&m))
+                .unwrap_or_default()
+        });
+        let text = batch::summary(&phrase, ok, total, error.as_deref());
+        let undoable =
+            ok > 0 && !undo.is_empty() && matches!(op, BatchOp::Archive | BatchOp::Delete);
+        if !undoable {
+            self.toast(text);
+            return;
+        }
+        let toast = adw::Toast::new(&text);
+        toast.set_button_label(Some("Deshacer"));
+        toast.set_timeout(10);
+        let undo = Rc::new(RefCell::new(Some(undo)));
+        let w = self.weak.clone();
+        toast.connect_button_clicked(move |_| {
+            if let (Some(s), Some(items)) = (w.upgrade(), undo.borrow_mut().take()) {
+                s.undo_batch(items);
+            }
+        });
+        self.toasts.add_toast(toast);
+    }
+
+    /// Deshace un archivado o un borrado a la papelera: sincroniza la carpeta de destino para
+    /// ver los mensajes (su UID cambió al moverlos), los localiza por `Message-ID` y los
+    /// devuelve a su carpeta de origen.
+    fn undo_batch(self: &Rc<Self>, items: Vec<UndoItem>) {
+        let jobs: Vec<_> = items
+            .into_iter()
+            .map(|it| {
+                let backend = self.services.backend(&it.account);
+                let store = self.services.store.clone();
+                let days = it.account.sync_days;
+                flatten(self.services.spawn(async move {
+                    backend.sync_mailbox(&it.to, days).await?;
+                    let uids = find_moved(&store, &it.to, &it.message_ids)?;
+                    if uids.is_empty() {
+                        return Err(correo_core::Error::NotFound(
+                            "los mensajes ya no están en la carpeta de destino".into(),
+                        ));
+                    }
+                    let report = backend.move_many(&it.to, &uids, &it.from).await;
+                    // Trae de vuelta a la caché de origen lo que acaba de regresar.
+                    let _ = backend.sync_mailbox(&it.from, days).await;
+                    Ok(report)
+                }))
+            })
+            .collect();
+        let w = self.weak.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let mut restored = 0usize;
+            let mut failed = 0usize;
+            let mut error: Option<String> = None;
+            for job in jobs {
+                match job.await {
+                    Ok(report) => {
+                        restored += report.done.len();
+                        failed += report.failed.len();
+                        if error.is_none() {
+                            error = report.error;
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        error.get_or_insert(e.to_string());
+                    }
+                }
+            }
+            let Some(s) = w.upgrade() else { return };
+            if let Err(e) = s.reload_model() {
+                s.toast(format!("Error al leer la caché: {e}"));
+            }
+            s.reload_sidebar();
+            s.refresh_list();
+            let text = match (restored, failed) {
+                (0, _) => format!(
+                    "No se pudo deshacer: {}",
+                    error.unwrap_or_else(|| "no se encontraron los mensajes".into())
+                ),
+                (n, 0) => format!(
+                    "Se {} {n} {}",
+                    if n == 1 { "restauró" } else { "restauraron" },
+                    if n == 1 { "mensaje" } else { "mensajes" }
+                ),
+                (n, f) => format!(
+                    "Se restauraron {n}; {f} no se pudieron deshacer: {}",
+                    error.unwrap_or_default()
+                ),
+            };
+            s.toast(text);
+        });
+    }
+
+    /// Rellena el popover «Mover a…» con las carpetas de la cuenta de la selección.
+    fn fill_move_menu(self: &Rc<Self>) {
+        let holder = self.batch_bar.move_list();
+        while let Some(child) = holder.first_child() {
+            holder.remove(&child);
+        }
+        let rows = self.list.selected_rows();
+        let (boxes, sources) = {
+            let st = self.state.borrow();
+            let sources: HashSet<MailboxId> = rows.iter().map(|r| r.last.mailbox_id).collect();
+            let account = sources
+                .iter()
+                .find_map(|id| st.mailboxes.iter().find(|m| m.id == *id))
+                .map(|m| m.account_id);
+            let boxes: Vec<Mailbox> = st
+                .mailboxes
+                .iter()
+                .filter(|m| Some(m.account_id) == account)
+                .cloned()
+                .collect();
+            (boxes, sources)
+        };
+        if boxes.is_empty() {
+            let empty = gtk::Label::new(Some("No hay carpetas"));
+            empty.add_css_class("dim-label");
+            holder.append(&empty);
+            return;
+        }
+        let popover = self.batch_bar.popover().clone();
+        add_move_nodes(
+            holder,
+            &crate::folder_tree::folder_tree(&boxes),
+            0,
+            &sources,
+            &popover,
+        );
     }
 
     // ----- Acciones de notificación (funcionan con la ventana oculta) ---------
@@ -1335,6 +1934,214 @@ impl Shell {
 
     fn toast(&self, text: impl AsRef<str>) {
         self.toasts.add_toast(adw::Toast::new(text.as_ref()));
+    }
+}
+
+/// Acción en lote pedida por el usuario.
+#[derive(Clone, Copy)]
+enum BatchOp {
+    Archive,
+    Delete,
+    ToggleRead,
+    /// Marcar como leído (`true`) o no leído (`false`).
+    Seen(bool),
+    Move(MailboxId),
+}
+
+/// Qué se hace con los mensajes de un grupo.
+#[derive(Clone)]
+enum Dest {
+    Seen(bool),
+    Move(Mailbox),
+    /// Borrado definitivo (carpeta Papelera o cuenta sin ella): `UID EXPUNGE`.
+    Expunge,
+}
+
+/// Cambio de la lista en memoria que implica una acción.
+#[derive(Clone, Copy)]
+enum Local {
+    Seen(bool),
+    Remove,
+}
+
+/// Mensajes de una misma (cuenta, carpeta) sobre los que se aplica la acción.
+struct Group {
+    account: Account,
+    mailbox: Mailbox,
+    headers: Vec<MessageHeader>,
+    dest: Dest,
+}
+
+impl Group {
+    fn local(&self) -> Local {
+        match self.dest {
+            Dest::Seen(seen) => Local::Seen(seen),
+            Dest::Move(_) | Dest::Expunge => Local::Remove,
+        }
+    }
+}
+
+struct Plan {
+    op: BatchOp,
+    groups: Vec<Group>,
+    /// Avisos de lo que no se puede hacer (cuentas sin carpeta de archivo, etc.).
+    problems: Vec<String>,
+}
+
+/// Datos para deshacer un movimiento: los mensajes están ahora en `to`.
+struct UndoItem {
+    account: Account,
+    from: Mailbox,
+    to: Mailbox,
+    message_ids: HashSet<String>,
+}
+
+/// Aplica el cambio a la caché local, por tandas para no retener el almacén mucho tiempo.
+fn cache_apply(
+    store: &std::sync::Mutex<Store>,
+    mailbox: &Mailbox,
+    headers: &[MessageHeader],
+    dest: &Dest,
+) {
+    for chunk in headers.chunks(100) {
+        let Ok(store) = store.lock() else { return };
+        for h in chunk {
+            let _ = match dest {
+                Dest::Seen(seen) => {
+                    let mut flags = h.flags.clone();
+                    flags.seen = *seen;
+                    store.set_flags(mailbox.id, h.uid, &flags)
+                }
+                Dest::Move(_) | Dest::Expunge => store.delete_uid(mailbox.id, h.uid),
+            };
+        }
+    }
+}
+
+/// Devuelve a la caché los mensajes de `failed` (UIDs) que el servidor no aplicó.
+fn cache_revert(
+    store: &std::sync::Mutex<Store>,
+    mailbox: &Mailbox,
+    headers: &[MessageHeader],
+    dest: &Dest,
+    failed: &[u32],
+) {
+    let failed: HashSet<u32> = failed.iter().copied().collect();
+    let bad: Vec<MessageHeader> = headers
+        .iter()
+        .filter(|h| failed.contains(&h.uid))
+        .cloned()
+        .collect();
+    let Ok(store) = store.lock() else { return };
+    match dest {
+        Dest::Seen(_) => {
+            for h in &bad {
+                let _ = store.set_flags(mailbox.id, h.uid, &h.flags);
+            }
+        }
+        Dest::Move(_) | Dest::Expunge => {
+            let _ = store.upsert_headers(mailbox.id, &bad);
+        }
+    }
+}
+
+/// UIDs, en la carpeta `to`, de los mensajes con esos `Message-ID` (recorre la caché por
+/// páginas hasta encontrarlos todos o agotarla).
+fn find_moved(
+    store: &std::sync::Mutex<Store>,
+    to: &Mailbox,
+    wanted: &HashSet<String>,
+) -> CoreResult<Vec<u32>> {
+    const PAGE: usize = 500;
+    const MAX_SCAN: usize = 50_000;
+    let mut found = Vec::new();
+    let mut offset = 0;
+    while offset < MAX_SCAN && found.len() < wanted.len() {
+        let page = {
+            let store = store.lock().unwrap_or_else(|p| p.into_inner());
+            store.list_headers(to.id, PAGE, offset)?
+        };
+        found.extend(batch::pick_uids(&page, wanted));
+        if page.len() < PAGE {
+            break;
+        }
+        offset += PAGE;
+    }
+    Ok(found)
+}
+
+/// Frase del resultado de una acción para el aviso.
+fn phrase_for(op: BatchOp, groups: &[Group], label_of: impl Fn(MailboxId) -> String) -> Phrase {
+    let (singular, plural, suffix) = match op {
+        BatchOp::Archive => ("archivó", "archivaron", String::new()),
+        BatchOp::Delete => {
+            if groups.iter().all(|g| matches!(g.dest, Dest::Expunge)) {
+                ("borró", "borraron", String::new())
+            } else {
+                ("movió", "movieron", " a la papelera".to_string())
+            }
+        }
+        BatchOp::Move(target) => ("movió", "movieron", format!(" a «{}»", label_of(target))),
+        BatchOp::Seen(true) => ("marcó como leído", "marcaron como leídos", String::new()),
+        BatchOp::Seen(false) | BatchOp::ToggleRead => (
+            "marcó como no leído",
+            "marcaron como no leídos",
+            String::new(),
+        ),
+    };
+    Phrase {
+        singular,
+        plural,
+        suffix,
+    }
+}
+
+/// Nombre visible de una carpeta en avisos.
+fn folder_label(m: &Mailbox) -> String {
+    crate::folder_tree::role_name(m.role).map_or_else(
+        || {
+            let sep = m.delimiter.unwrap_or('/');
+            m.path.rsplit(sep).next().unwrap_or(&m.path).to_string()
+        },
+        str::to_string,
+    )
+}
+
+/// Añade al popover «Mover a…» los nodos del árbol de carpetas, con sangría por nivel.
+fn add_move_nodes(
+    holder: &gtk::Box,
+    nodes: &[crate::folder_tree::Node],
+    depth: i32,
+    sources: &HashSet<MailboxId>,
+    popover: &gtk::Popover,
+) {
+    for node in nodes {
+        let label = gtk::Label::new(Some(&node.name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_halign(gtk::Align::Fill);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_margin_start(6 + 14 * depth);
+        match node.mailbox {
+            Some(id) => {
+                let button = gtk::Button::new();
+                button.add_css_class("flat");
+                button.set_child(Some(&label));
+                button.set_action_name(Some("win.move-to"));
+                button.set_action_target_value(Some(&id.to_variant()));
+                button.set_sensitive(!sources.contains(&id));
+                let popover = popover.clone();
+                button.connect_clicked(move |_| popover.popdown());
+                holder.append(&button);
+            }
+            None => {
+                label.add_css_class("dim-label");
+                label.add_css_class("caption");
+                label.set_margin_top(4);
+                holder.append(&label);
+            }
+        }
+        add_move_nodes(holder, &node.children, depth + 1, sources, popover);
     }
 }
 
@@ -1457,6 +2264,12 @@ pub fn seed_demo(store: &Store) {
             role,
             uid_validity: Some(1),
             unread,
+            // Gmail y Outlook usan «/»; Microsoft 365 usa «.» para probar ambos.
+            delimiter: Some(if provider == Provider::Microsoft365 {
+                '.'
+            } else {
+                '/'
+            }),
         };
         let inbox = store
             .upsert_mailbox(&mailbox(inbox_path, MailboxRole::Inbox, 0))
@@ -1464,6 +2277,52 @@ pub fn seed_demo(store: &Store) {
         store
             .upsert_mailbox(&mailbox(sent_path, MailboxRole::Sent, 0))
             .expect("carpeta demo");
+        // Jerarquía de carpetas (sin mensajes) para probar el árbol de la barra lateral.
+        let extra: Vec<(String, MailboxRole, u32)> = match index {
+            0 => [
+                ("[Gmail]/Borradores", MailboxRole::Drafts, 1),
+                ("[Gmail]/Spam", MailboxRole::Spam, 2),
+                ("[Gmail]/Papelera", MailboxRole::Trash, 0),
+                ("[Gmail]/Todos", MailboxRole::Archive, 0),
+                ("[Gmail]/Destacados", MailboxRole::Other, 0),
+                ("Proyectos", MailboxRole::Other, 1),
+                ("Proyectos/Casa", MailboxRole::Other, 0),
+                ("Proyectos/Casa/Obra", MailboxRole::Other, 3),
+                ("Proyectos/Casa/Obra/Facturas", MailboxRole::Other, 0),
+                ("Proyectos/Viaje", MailboxRole::Other, 0),
+            ]
+            .into_iter()
+            .map(|(p, r, u)| (p.to_string(), r, u))
+            .collect(),
+            2 => std::iter::once(("Archives".to_string(), MailboxRole::Archive, 0))
+                .chain((2014..=2023).map(|y| {
+                    (
+                        format!("Archives/{y}"),
+                        MailboxRole::Other,
+                        u32::from(y == 2017),
+                    )
+                }))
+                .chain([
+                    ("Drafts".to_string(), MailboxRole::Drafts, 0),
+                    ("Deleted Items".to_string(), MailboxRole::Trash, 0),
+                ])
+                .collect(),
+            3 => [
+                ("Clientes.Acme", MailboxRole::Other, 0),
+                ("Clientes.Acme.2024", MailboxRole::Other, 2),
+                ("Clientes.Acme.2024.T1", MailboxRole::Other, 0),
+                ("Clientes.Zeta", MailboxRole::Other, 0),
+            ]
+            .into_iter()
+            .map(|(p, r, u)| (p.to_string(), r, u))
+            .collect(),
+            _ => Vec::new(),
+        };
+        for (path, role, unread) in extra {
+            store
+                .upsert_mailbox(&mailbox(&path, role, unread))
+                .expect("carpeta demo");
+        }
 
         let mut headers = Vec::new();
         let mut unread = 0;

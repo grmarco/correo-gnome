@@ -60,6 +60,10 @@ pub struct Mailbox {
     pub role: MailboxRole,
     pub uid_validity: Option<u32>,
     pub unread: u32,
+    /// Delimitador de jerarquía que declara el servidor en LIST (`None` si no hay
+    /// jerarquía o aún no se conoce). Nunca se adivina.
+    #[serde(default)]
+    pub delimiter: Option<char>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +184,92 @@ pub trait MailBackend: Send + Sync {
     async fn set_seen(&self, mailbox: &Mailbox, uid: u32, seen: bool) -> Result<()>;
     async fn move_to(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()>;
     async fn delete(&self, mailbox: &Mailbox, uid: u32) -> Result<()>;
+
+    // ----- Operaciones por lotes ---------------------------------------------------------
+    // Todos los UIDs pertenecen a `mailbox`. Un fallo no aborta el resto: el resultado
+    // indica qué UIDs se aplicaron y cuáles no. La implementación por defecto itera; los
+    // backends pueden sobrescribirla con conjuntos de UID reales.
+
+    async fn set_seen_many(&self, mailbox: &Mailbox, uids: &[u32], seen: bool) -> BatchReport {
+        let mut report = BatchReport::default();
+        for &uid in uids {
+            let r = self.set_seen(mailbox, uid, seen).await;
+            report.record(&[uid], r);
+        }
+        report
+    }
+
+    async fn move_many(&self, mailbox: &Mailbox, uids: &[u32], target: &Mailbox) -> BatchReport {
+        let mut report = BatchReport::default();
+        for &uid in uids {
+            let r = self.move_to(mailbox, uid, target).await;
+            report.record(&[uid], r);
+        }
+        report
+    }
+
+    async fn delete_many(&self, mailbox: &Mailbox, uids: &[u32]) -> BatchReport {
+        let mut report = BatchReport::default();
+        for &uid in uids {
+            let r = self.delete(mailbox, uid).await;
+            report.record(&[uid], r);
+        }
+        report
+    }
+}
+
+/// Máximo de UIDs por conjunto en una orden IMAP por lotes.
+pub const BATCH_MAX_UIDS: usize = 500;
+
+/// Ordena, deduplica y trocea `uids` en lotes de como máximo `max` elementos
+/// (`max == 0` se trata como 1).
+pub fn chunk_uids(uids: &[u32], max: usize) -> Vec<Vec<u32>> {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted.chunks(max.max(1)).map(<[u32]>::to_vec).collect()
+}
+
+/// Resultado de una operación por lotes sobre una carpeta.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchReport {
+    /// UIDs aplicados.
+    pub done: Vec<u32>,
+    /// UIDs que fallaron.
+    pub failed: Vec<u32>,
+    /// Primer error observado (texto para el usuario).
+    pub error: Option<String>,
+}
+
+impl BatchReport {
+    /// Anota el resultado de una operación sobre `uids`.
+    pub fn record(&mut self, uids: &[u32], result: Result<()>) {
+        match result {
+            Ok(()) => self.done.extend_from_slice(uids),
+            Err(e) => {
+                self.failed.extend_from_slice(uids);
+                self.error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+
+    /// Informe en el que todos los UIDs fallaron por el mismo motivo.
+    pub fn all_failed(uids: &[u32], error: &Error) -> Self {
+        Self {
+            done: Vec::new(),
+            failed: uids.to_vec(),
+            error: Some(error.to_string()),
+        }
+    }
+
+    /// Une otro informe al actual.
+    pub fn merge(&mut self, other: BatchReport) {
+        self.done.extend(other.done);
+        self.failed.extend(other.failed);
+        if self.error.is_none() {
+            self.error = other.error;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -194,7 +284,36 @@ pub trait Sender: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::AccessToken;
+    use super::{AccessToken, BATCH_MAX_UIDS, BatchReport, Error, chunk_uids};
+
+    #[test]
+    fn chunk_uids_sorts_dedups_and_splits() {
+        assert!(chunk_uids(&[], 500).is_empty());
+        assert_eq!(chunk_uids(&[5, 1, 5, 3], 2), vec![vec![1, 3], vec![5]]);
+        let many: Vec<u32> = (1..=1201).collect();
+        let chunks = chunk_uids(&many, BATCH_MAX_UIDS);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= BATCH_MAX_UIDS));
+        assert_eq!(chunks.concat(), many);
+        // Un tope de 0 no debe provocar un pánico.
+        assert_eq!(chunk_uids(&[1, 2], 0), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn batch_report_records_and_merges() {
+        let mut a = BatchReport::default();
+        a.record(&[1, 2], Ok(()));
+        a.record(&[3], Err(Error::Network("corte".into())));
+        a.record(&[4], Err(Error::Network("otro".into())));
+        assert_eq!(a.done, vec![1, 2]);
+        assert_eq!(a.failed, vec![3, 4]);
+        assert_eq!(a.error.as_deref(), Some("red: corte"));
+        let mut b = BatchReport::default();
+        b.merge(a);
+        b.merge(BatchReport::all_failed(&[9], &Error::Auth("x".into())));
+        assert_eq!(b.failed, vec![3, 4, 9]);
+        assert_eq!(b.error.as_deref(), Some("red: corte"));
+    }
 
     #[test]
     fn access_token_debug_redacts_secret() {

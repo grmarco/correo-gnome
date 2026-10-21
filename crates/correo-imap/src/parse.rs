@@ -87,6 +87,11 @@ pub fn role_from_name(name: &str) -> MailboxRole {
     }
 }
 
+/// Delimitador de jerarquía declarado en LIST (`None` si el servidor no tiene jerarquía).
+pub fn delimiter_char(delimiter: Option<&str>) -> Option<char> {
+    delimiter.and_then(|d| d.chars().next())
+}
+
 /// Indica si una carpeta puede seleccionarse (no tiene \Noselect).
 pub fn is_selectable(attributes: &[String]) -> bool {
     !attributes
@@ -157,6 +162,15 @@ pub fn uid_set(uids: &[u32]) -> String {
         i += 1;
     }
     parts.join(",")
+}
+
+/// Conjuntos de UID para órdenes por lotes: ordena, deduplica, trocea en lotes de a lo
+/// sumo `max` UIDs y formatea cada lote (`1:3,7`). Devuelve cada conjunto con sus UIDs.
+pub fn uid_sets(uids: &[u32], max: usize) -> Vec<(String, Vec<u32>)> {
+    correo_core::chunk_uids(uids, max)
+        .into_iter()
+        .map(|chunk| (uid_set(&chunk), chunk))
+        .collect()
 }
 
 /// Resultado de comparar el servidor con la caché.
@@ -541,6 +555,14 @@ JVBERi0xLjQK\r\n\
     }
 
     #[test]
+    fn delimiter_comes_from_the_server() {
+        assert_eq!(delimiter_char(Some("/")), Some('/'));
+        assert_eq!(delimiter_char(Some(".")), Some('.'));
+        assert_eq!(delimiter_char(Some("")), None);
+        assert_eq!(delimiter_char(None), None);
+    }
+
+    #[test]
     fn noselect_is_not_selectable() {
         assert!(!is_selectable(&["\\Noselect".to_owned()]));
         assert!(is_selectable(&["\\HasChildren".to_owned()]));
@@ -569,6 +591,29 @@ JVBERi0xLjQK\r\n\
         assert_eq!(uid_set(&[]), "");
         assert_eq!(uid_set(&[5]), "5");
         assert_eq!(uid_set(&[9, 1, 2, 3, 7, 10, 3]), "1:3,7,9:10");
+    }
+
+    #[test]
+    fn uid_sets_are_chunked_sorted_and_compact() {
+        assert!(uid_sets(&[], 500).is_empty());
+        let sets = uid_sets(&[9, 1, 3, 2, 5, 9], 500);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].0, "1:3,5,9");
+        assert_eq!(sets[0].1, vec![1, 2, 3, 5, 9]);
+
+        // 1201 UIDs contiguos: tres órdenes, ninguna con más de 500, y rangos compactos.
+        let many: Vec<u32> = (1..=1201).collect();
+        let sets = uid_sets(&many, correo_core::BATCH_MAX_UIDS);
+        let texts: Vec<&str> = sets.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts, ["1:500", "501:1000", "1001:1201"]);
+
+        // UIDs alternos: el troceo respeta el tope aunque no haya rangos.
+        let odd: Vec<u32> = (0..1000).map(|i| i * 2 + 1).collect();
+        let sets = uid_sets(&odd, 500);
+        assert_eq!(sets.len(), 2);
+        assert!(sets.iter().all(|(_, u)| u.len() == 500));
+        assert!(sets[0].0.starts_with("1,3,5,"));
+        assert!(!sets[0].0.contains(':'));
     }
 
     #[test]

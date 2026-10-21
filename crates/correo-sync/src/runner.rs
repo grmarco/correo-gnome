@@ -392,6 +392,7 @@ mod tests {
             role,
             uid_validity: None,
             unread: 0,
+            delimiter: None,
         }
     }
 

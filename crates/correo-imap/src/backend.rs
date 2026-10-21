@@ -13,8 +13,8 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::{Fetch, Name};
 use async_trait::async_trait;
 use correo_core::{
-    AccountId, Error, Flags, Mailbox, MailboxId, MailboxRole, MessageBody, MessageHeader,
-    MessageId, Result, TokenProvider,
+    AccountId, BATCH_MAX_UIDS, BatchReport, Error, Flags, Mailbox, MailboxId, MailboxRole,
+    MessageBody, MessageHeader, MessageId, Result, TokenProvider,
 };
 use correo_store::Store;
 use futures::TryStreamExt;
@@ -23,7 +23,8 @@ use tokio::sync::{MappedMutexGuard, Mutex as AsyncMutex, MutexGuard};
 use crate::conn::{self, Conn, OP_TIMEOUT, imap, is_network, map_imap_error, timeout_error};
 use crate::parse::{
     self, BATCH_SIZE, FetchMeta, attachment_contents, attribute_strings, flags_from, imap_date,
-    mailbox_role, parse_body, plan_sync, same_flags, today_days, uid_set, uid_validity_changed,
+    mailbox_role, parse_body, plan_sync, same_flags, today_days, uid_set, uid_sets,
+    uid_validity_changed,
 };
 
 pub const GMAIL_HOST: &str = "imap.gmail.com";
@@ -352,6 +353,59 @@ impl correo_core::MailBackend for ImapBackend {
             _ => self.retry(|| self.expunge_uid_once(mailbox, uid)).await,
         }
     }
+
+    async fn set_seen_many(&self, mailbox: &Mailbox, uids: &[u32], seen: bool) -> BatchReport {
+        let mut report = BatchReport::default();
+        for (set, chunk) in uid_sets(uids, BATCH_MAX_UIDS) {
+            let r = self
+                .retry(|| self.set_seen_set_once(mailbox, &set, seen))
+                .await;
+            report.record(&chunk, r);
+        }
+        report
+    }
+
+    async fn move_many(&self, mailbox: &Mailbox, uids: &[u32], target: &Mailbox) -> BatchReport {
+        let native = match self.retry(|| self.supports_move()).await {
+            Ok(native) => native,
+            Err(e) => return BatchReport::all_failed(uids, &e),
+        };
+        let mut report = BatchReport::default();
+        for (set, chunk) in uid_sets(uids, BATCH_MAX_UIDS) {
+            // Igual que `move_to`: MOVE se reintenta; COPY + marcar + expurgar, no.
+            let r = if native {
+                self.retry(|| self.uid_move_set_once(mailbox, &set, &chunk, target))
+                    .await
+            } else {
+                self.attempt(self.copy_move_set_once(mailbox, &set, &chunk, target))
+                    .await
+            };
+            report.record(&chunk, r);
+        }
+        report
+    }
+
+    async fn delete_many(&self, mailbox: &Mailbox, uids: &[u32]) -> BatchReport {
+        let trash = match self.trash_mailbox() {
+            Ok(trash) => trash,
+            Err(e) => return BatchReport::all_failed(uids, &e),
+        };
+        match trash {
+            Some(trash) if mailbox.role != MailboxRole::Trash && trash.id != mailbox.id => {
+                self.move_many(mailbox, uids, &trash).await
+            }
+            _ => {
+                let mut report = BatchReport::default();
+                for (set, chunk) in uid_sets(uids, BATCH_MAX_UIDS) {
+                    let r = self
+                        .retry(|| self.expunge_set_once(mailbox, &set, &chunk))
+                        .await;
+                    report.record(&chunk, r);
+                }
+                report
+            }
+        }
+    }
 }
 
 // ----- Operaciones contra el servidor (una tentativa cada una) ----------
@@ -376,6 +430,7 @@ impl ImapBackend {
                 continue;
             }
             let path = name.name().to_owned();
+            let delimiter = parse::delimiter_char(name.delimiter());
             let role = mailbox_role(&attrs, &path);
             // upsert_mailbox sobrescribe uid_validity y unread: se conservan los guardados.
             let prev = existing.iter().find(|m| m.path == path);
@@ -386,6 +441,7 @@ impl ImapBackend {
                 role,
                 uid_validity: prev.and_then(|m| m.uid_validity),
                 unread: prev.map(|m| m.unread).unwrap_or(0),
+                delimiter,
             };
             let id = self.with_store(|s| s.upsert_mailbox(&mailbox))?;
             out.push(Mailbox { id, ..mailbox });
@@ -596,6 +652,95 @@ impl ImapBackend {
     }
 }
 
+// ----- Variantes por lotes: un conjunto de UID por orden ----------------
+
+impl ImapBackend {
+    /// `UID STORE <set> +/-FLAGS (\Seen)` y actualización de la caché con los flags devueltos.
+    async fn set_seen_set_once(&self, mailbox: &Mailbox, set: &str, seen: bool) -> Result<()> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        self.select_checked(mailbox, conn).await?;
+        let op = if seen {
+            "+FLAGS (\\Seen)"
+        } else {
+            "-FLAGS (\\Seen)"
+        };
+        let stream = imap(OP_TIMEOUT, conn.session.uid_store(set, op)).await?;
+        let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
+        drop(guard);
+        for f in &fetches {
+            if let Some(uid) = f.uid {
+                self.cache_flags(mailbox.id, uid, &flags_from(f.flags()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `UID MOVE <set>` (solo si el servidor anuncia MOVE).
+    async fn uid_move_set_once(
+        &self,
+        mailbox: &Mailbox,
+        set: &str,
+        uids: &[u32],
+        target: &Mailbox,
+    ) -> Result<()> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        self.select_checked(mailbox, conn).await?;
+        imap(OP_TIMEOUT, conn.session.uid_mv(set, &target.path)).await?;
+        drop(guard);
+        self.forget_cached(mailbox.id, uids)
+    }
+
+    /// Sin MOVE: `UID COPY <set>`, marcar \Deleted y `UID EXPUNGE <set>` (solo con UIDPLUS;
+    /// jamás un EXPUNGE global).
+    async fn copy_move_set_once(
+        &self,
+        mailbox: &Mailbox,
+        set: &str,
+        uids: &[u32],
+        target: &Mailbox,
+    ) -> Result<()> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        self.select_checked(mailbox, conn).await?;
+        imap(OP_TIMEOUT, conn.session.uid_copy(set, &target.path)).await?;
+        store_deleted(conn, set).await?;
+        if !conn.caps.uidplus {
+            return Err(Error::Protocol(format!(
+                "copiados a '{}', pero el servidor no admite UIDPLUS: los originales quedaron marcados como borrados sin expurgar",
+                target.path
+            )));
+        }
+        uid_expunge(conn, set).await?;
+        drop(guard);
+        self.forget_cached(mailbox.id, uids)
+    }
+
+    /// Marca \Deleted y expurga solo ese conjunto (UIDPLUS).
+    async fn expunge_set_once(&self, mailbox: &Mailbox, set: &str, uids: &[u32]) -> Result<()> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        self.select_checked(mailbox, conn).await?;
+        store_deleted(conn, set).await?;
+        if !conn.caps.uidplus {
+            return Err(Error::Protocol(
+                "el servidor no admite UIDPLUS: los mensajes quedaron marcados como borrados y no se expurgaron".into(),
+            ));
+        }
+        uid_expunge(conn, set).await?;
+        drop(guard);
+        self.forget_cached(mailbox.id, uids)
+    }
+
+    fn forget_cached(&self, mailbox_id: MailboxId, uids: &[u32]) -> Result<()> {
+        for &uid in uids {
+            self.with_store(|s| s.delete_uid(mailbox_id, uid))?;
+        }
+        Ok(())
+    }
+}
+
 /// STORE +FLAGS.SILENT \Deleted sobre un UID.
 async fn store_deleted(conn: &mut Conn, uid_str: &str) -> Result<()> {
     let stream = imap(
@@ -672,6 +817,7 @@ mod guard_tests {
                 role: MailboxRole::Inbox,
                 uid_validity: stored_validity,
                 unread: 0,
+                delimiter: None,
             })
             .unwrap();
         let mailbox = store.get_mailbox(id).unwrap();

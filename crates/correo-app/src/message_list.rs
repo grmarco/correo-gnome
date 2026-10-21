@@ -2,7 +2,7 @@
 //! de `glib::BoxedAnyObject` que envuelven `ThreadRow`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -20,6 +20,26 @@ pub struct ThreadRow {
     pub count: usize,
     pub unread: usize,
     pub has_attachments: bool,
+    /// Todos los mensajes del hilo que hay en la lista cargada (orden cronológico).
+    pub message_ids: Vec<MessageId>,
+}
+
+/// ¿Dos filas se muestran igual y apuntan a los mismos mensajes? Sirve para actualizar la
+/// lista sin tocar las filas que no cambian (y así conservar el desplazamiento).
+fn same_row(a: &ThreadRow, b: &ThreadRow) -> bool {
+    let (x, y) = (&a.last, &b.last);
+    x.id == y.id
+        && x.date == y.date
+        && x.flags.seen == y.flags.seen
+        && x.flags.flagged == y.flags.flagged
+        && x.snippet == y.snippet
+        && x.labels == y.labels
+        && x.from == y.from
+        && a.subject == b.subject
+        && a.count == b.count
+        && a.unread == b.unread
+        && a.has_attachments == b.has_attachments
+        && a.message_ids == b.message_ids
 }
 
 /// Agrupa cabeceras en hilos (más recientes primero).
@@ -39,40 +59,109 @@ pub fn thread_rows(headers: &[MessageHeader]) -> Vec<ThreadRow> {
                 count: t.message_ids.len(),
                 unread: t.unread,
                 has_attachments,
+                message_ids: t.message_ids,
             })
         })
         .collect()
 }
 
-type SelectFn = dyn Fn(Option<MessageHeader>);
+/// Qué hay seleccionado en la lista.
+#[derive(Debug, Clone)]
+pub enum Selection {
+    None,
+    /// Exactamente una fila: se abre en el lector (cabecera del último mensaje del hilo).
+    One(Box<MessageHeader>),
+    /// Dos o más filas: acciones en lote, sin abrir ningún mensaje.
+    Many(usize),
+}
+
+/// Identidad de una selección, para no avisar dos veces de lo mismo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelKey {
+    None,
+    One(MessageId),
+    Many(usize),
+}
+
+impl Selection {
+    fn key(&self) -> SelKey {
+        match self {
+            Selection::None => SelKey::None,
+            Selection::One(h) => SelKey::One(h.id),
+            Selection::Many(n) => SelKey::Many(*n),
+        }
+    }
+}
+
+type SelectFn = dyn Fn(Selection);
+
+/// Estado compartido entre la lista y los cierres de sus filas y señales.
+struct Shared {
+    rows: RefCell<Vec<ThreadRow>>,
+    /// Mientras se actualiza la lista no se notifica cada cambio intermedio.
+    updating: Cell<bool>,
+    /// Modo «Seleccionar»: casillas visibles y un clic alterna la fila.
+    select_mode: Cell<bool>,
+    last: Cell<SelKey>,
+}
 
 pub struct MessageList {
     stack: gtk::Stack,
     empty: adw::StatusPage,
     scroller: gtk::ScrolledWindow,
+    view: gtk::ListView,
     store: gio::ListStore,
-    selection: gtk::SingleSelection,
-    /// Mientras se reconstruye la lista no se notifica cada cambio intermedio.
-    updating: Rc<Cell<bool>>,
+    selection: gtk::MultiSelection,
+    shared: Rc<Shared>,
+    views: Rc<RefCell<HashMap<gtk::ListItem, RowView>>>,
     on_select: Rc<SelectFn>,
 }
 
 impl MessageList {
-    /// `on_select` recibe la cabecera del último mensaje del hilo seleccionado, o `None`.
-    pub fn new(on_select: impl Fn(Option<MessageHeader>) + 'static) -> Self {
+    /// `on_select` avisa de cada cambio de la selección.
+    pub fn new(on_select: impl Fn(Selection) + 'static) -> Self {
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let selection = gtk::MultiSelection::new(Some(store.clone()));
+        let shared = Rc::new(Shared {
+            rows: RefCell::new(Vec::new()),
+            updating: Cell::new(false),
+            select_mode: Cell::new(false),
+            last: Cell::new(SelKey::None),
+        });
 
         let factory = gtk::SignalListItemFactory::new();
         // Vista de cada fila reciclada, por `ListItem`.
         let views: Rc<RefCell<HashMap<gtk::ListItem, RowView>>> = Rc::default();
         {
             let views = views.clone();
+            let selection = selection.clone();
+            let shared = shared.clone();
             factory.connect_setup(move |_, obj| {
                 let Some(item) = obj.downcast_ref::<gtk::ListItem>() else {
                     return;
                 };
                 let view = build_row();
                 item.set_child(Some(&view.root));
+                // En modo «Seleccionar» un clic en cualquier punto de la fila la alterna
+                // (apto para táctil); fuera de ese modo el ListView gestiona el clic.
+                let gesture = gtk::GestureClick::new();
+                gesture.set_button(1);
+                let weak = item.downgrade();
+                let (selection, shared) = (selection.clone(), shared.clone());
+                gesture.connect_pressed(move |g, _, _, _| {
+                    if !shared.select_mode.get() {
+                        return;
+                    }
+                    let Some(item) = weak.upgrade() else { return };
+                    let pos = item.position();
+                    if selection.is_selected(pos) {
+                        selection.unselect_item(pos);
+                    } else {
+                        selection.select_item(pos, false);
+                    }
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                });
+                view.root.add_controller(gesture);
                 views.borrow_mut().insert(item.clone(), view);
             });
         }
@@ -84,29 +173,51 @@ impl MessageList {
                 }
             });
         }
-        factory.connect_bind(move |_, obj| {
-            let Some(item) = obj.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let Some(any) = item
-                .item()
-                .and_then(|o| o.downcast::<glib::BoxedAnyObject>().ok())
-            else {
-                return;
-            };
-            let view = views.borrow().get(item).cloned();
-            if let Some(view) = view {
-                bind_row(&view, &any.borrow::<ThreadRow>());
-            }
-        });
-
-        let selection = gtk::SingleSelection::new(Some(store.clone()));
-        selection.set_autoselect(false);
-        selection.set_can_unselect(true);
+        {
+            let views = views.clone();
+            let shared = shared.clone();
+            factory.connect_bind(move |_, obj| {
+                let Some(item) = obj.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(any) = item
+                    .item()
+                    .and_then(|o| o.downcast::<glib::BoxedAnyObject>().ok())
+                else {
+                    return;
+                };
+                let view = views.borrow().get(item).cloned();
+                if let Some(view) = view {
+                    bind_row(&view, &any.borrow::<ThreadRow>());
+                    // Casilla: refleja el estado de selección de la fila y lo sigue.
+                    view.check.set_active(item.is_selected());
+                    let check = view.check.clone();
+                    let id = item.connect_selected_notify(move |it| {
+                        check.set_active(it.is_selected());
+                    });
+                    *view.handler.borrow_mut() = Some(id);
+                    view.reveal.set_transition_duration(0);
+                    view.reveal.set_reveal_child(shared.select_mode.get());
+                }
+            });
+        }
+        {
+            let views = views.clone();
+            factory.connect_unbind(move |_, obj| {
+                let Some(item) = obj.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let view = views.borrow().get(item).cloned();
+                if let Some(id) = view.and_then(|v| v.handler.borrow_mut().take()) {
+                    item.disconnect(id);
+                }
+            });
+        }
 
         let view = gtk::ListView::new(Some(selection.clone()), Some(factory));
         view.set_single_click_activate(false);
         view.add_css_class("correo-thread-list");
+        view.update_property(&[gtk::accessible::Property::Label("Conversaciones")]);
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -126,15 +237,21 @@ impl MessageList {
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
         stack.set_transition_duration(160);
         stack.set_visible_child_name("empty");
+        stack.set_vexpand(true);
 
-        let updating = Rc::new(Cell::new(false));
         let on_select: Rc<SelectFn> = Rc::new(on_select);
         {
-            let updating = updating.clone();
+            let shared = shared.clone();
             let on_select = on_select.clone();
-            selection.connect_selected_item_notify(move |sel| {
-                if !updating.get() {
-                    on_select(header_of(sel.selected_item()));
+            let selection = selection.clone();
+            selection.clone().connect_selection_changed(move |_, _, _| {
+                if shared.updating.get() {
+                    return;
+                }
+                let state = selection_state(&selection, &shared.rows.borrow());
+                if state.key() != shared.last.get() {
+                    shared.last.set(state.key());
+                    on_select(state);
                 }
             });
         }
@@ -143,9 +260,11 @@ impl MessageList {
             stack,
             empty,
             scroller,
+            view,
             store,
             selection,
-            updating,
+            shared,
+            views,
             on_select,
         }
     }
@@ -174,47 +293,194 @@ impl MessageList {
         }
     }
 
-    pub fn selected_header(&self) -> Option<MessageHeader> {
-        header_of(self.selection.selected_item())
+    /// Número de filas seleccionadas.
+    pub fn selection_len(&self) -> usize {
+        self.selection.selection().size() as usize
     }
 
-    /// Sustituye todas las filas. Conserva la selección si el último mensaje
-    /// seleccionado sigue en la lista; si no, avisa con `on_select(None)`.
-    pub fn set_rows(&self, rows: &[ThreadRow]) {
-        let prev = self.selected_header().map(|h| h.id);
+    /// Posiciones seleccionadas, en orden de lista.
+    pub fn selected_positions(&self) -> Vec<u32> {
+        let n = self.store.n_items();
+        (0..n).filter(|&i| self.selection.is_selected(i)).collect()
+    }
 
-        self.updating.set(true);
-        let items: Vec<glib::BoxedAnyObject> = rows
+    /// Rangos `(inicio, longitud)` de las filas seleccionadas.
+    pub fn selected_ranges(&self) -> Vec<(u32, u32)> {
+        let n = self.store.n_items();
+        crate::batch::ranges_from_flags((0..n).map(|i| self.selection.is_selected(i)))
+    }
+
+    /// Filas (hilos) seleccionadas, en orden de lista.
+    pub fn selected_rows(&self) -> Vec<ThreadRow> {
+        let rows = self.shared.rows.borrow();
+        let ranges = self.selected_ranges();
+        crate::batch::positions_in(&ranges)
+            .filter_map(|p| rows.get(p as usize).cloned())
+            .collect()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.shared.rows.borrow().len()
+    }
+
+    /// Id del último mensaje de la fila en `position`.
+    pub fn row_id_at(&self, position: u32) -> Option<MessageId> {
+        self.shared
+            .rows
+            .borrow()
+            .get(position as usize)
+            .map(|r| r.last.id)
+    }
+
+    /// Reserva (o no) un hueco al final de la lista para la barra de lote flotante.
+    pub fn set_bottom_inset(&self, on: bool) {
+        self.view.set_margin_bottom(if on { 52 } else { 0 });
+    }
+
+    pub fn select_all(&self) {
+        self.selection.select_all();
+    }
+
+    pub fn unselect_all(&self) {
+        self.selection.unselect_all();
+    }
+
+    /// Selecciona solo la fila cuyo último mensaje es `id` y la hace visible.
+    pub fn select_by_id(&self, id: MessageId) -> bool {
+        let position = self
+            .shared
+            .rows
+            .borrow()
+            .iter()
+            .position(|r| r.last.id == id);
+        let Some(p) = position else { return false };
+        self.selection.select_item(p as u32, true);
+        self.view
+            .scroll_to(p as u32, gtk::ListScrollFlags::FOCUS, None);
+        true
+    }
+
+    /// Lleva el foco de teclado a la fila de `id` sin seleccionarla.
+    pub fn focus_id(&self, id: MessageId) {
+        let position = self
+            .shared
+            .rows
+            .borrow()
+            .iter()
+            .position(|r| r.last.id == id);
+        if let Some(p) = position {
+            self.view
+                .scroll_to(p as u32, gtk::ListScrollFlags::FOCUS, None);
+        }
+    }
+
+    pub fn select_mode(&self) -> bool {
+        self.shared.select_mode.get()
+    }
+
+    /// Activa o desactiva el modo «Seleccionar» (casillas en cada fila).
+    pub fn set_select_mode(&self, on: bool) {
+        if self.shared.select_mode.replace(on) == on {
+            return;
+        }
+        let duration = if adw::is_animations_enabled(&self.view) {
+            180
+        } else {
+            0
+        };
+        if on {
+            self.view.add_css_class("correo-select-mode");
+        } else {
+            self.view.remove_css_class("correo-select-mode");
+        }
+        for view in self.views.borrow().values() {
+            view.reveal.set_transition_duration(duration);
+            view.reveal.set_reveal_child(on);
+        }
+    }
+
+    /// Sustituye las filas. Solo se tocan las que cambian (así la lista no salta ni pierde
+    /// el desplazamiento) y se conserva la selección de las filas que siguen estando. Si la
+    /// selección cambia, se avisa con `on_select`.
+    pub fn set_rows(&self, rows: &[ThreadRow]) {
+        let prev_key = self.shared.last.get();
+        let prev_selected: HashSet<MessageId> =
+            self.selected_rows().iter().map(|r| r.last.id).collect();
+
+        self.shared.updating.set(true);
+        let (prefix, suffix, old_len) = {
+            let old = self.shared.rows.borrow();
+            let max = old.len().min(rows.len());
+            let mut prefix = 0;
+            while prefix < max && same_row(&old[prefix], &rows[prefix]) {
+                prefix += 1;
+            }
+            let mut suffix = 0;
+            while suffix < max - prefix
+                && same_row(&old[old.len() - 1 - suffix], &rows[rows.len() - 1 - suffix])
+            {
+                suffix += 1;
+            }
+            (prefix, suffix, old.len())
+        };
+        let removed = old_len - prefix - suffix;
+        let added: Vec<glib::BoxedAnyObject> = rows[prefix..rows.len() - suffix]
             .iter()
             .cloned()
             .map(glib::BoxedAnyObject::new)
             .collect();
-        self.store.splice(0, self.store.n_items(), &items);
-        let position = prev.and_then(|id| rows.iter().position(|r| r.last.id == id));
-        self.selection
-            .set_selected(position.map_or(gtk::INVALID_LIST_POSITION, |p| p as u32));
-        self.updating.set(false);
+        let replaced_all = old_len > 0 && !rows.is_empty() && prefix == 0 && suffix == 0;
+        if removed > 0 || !added.is_empty() {
+            self.store.splice(prefix as u32, removed as u32, &added);
+        }
+        *self.shared.rows.borrow_mut() = rows.to_vec();
+        if replaced_all {
+            self.scroller.vadjustment().set_value(0.0);
+        }
+        if !prev_selected.is_empty() {
+            let selected = gtk::Bitset::new_empty();
+            for (i, r) in rows.iter().enumerate() {
+                if prev_selected.contains(&r.last.id) {
+                    selected.add(i as u32);
+                }
+            }
+            let mask = gtk::Bitset::new_range(0, rows.len() as u32);
+            self.selection.set_selection(&selected, &mask);
+        }
+        self.shared.updating.set(false);
 
         self.stack
             .set_visible_child_name(if rows.is_empty() { "empty" } else { "list" });
 
-        let now = self.selected_header().map(|h| h.id);
-        if now != prev {
-            (self.on_select)(self.selected_header());
+        let state = selection_state(&self.selection, &self.shared.rows.borrow());
+        if state.key() != prev_key {
+            self.shared.last.set(state.key());
+            (self.on_select)(state);
         }
     }
 }
 
-fn header_of(item: Option<glib::Object>) -> Option<MessageHeader> {
-    let any = item?.downcast::<glib::BoxedAnyObject>().ok()?;
-    let row = any.borrow::<ThreadRow>();
-    Some(row.last.clone())
+fn selection_state(selection: &gtk::MultiSelection, rows: &[ThreadRow]) -> Selection {
+    let bitset = selection.selection();
+    match bitset.size() {
+        0 => Selection::None,
+        1 => match rows.get(bitset.minimum() as usize) {
+            Some(row) => Selection::One(Box::new(row.last.clone())),
+            None => Selection::None,
+        },
+        n => Selection::Many(n as usize),
+    }
 }
 
 /// Referencias a los widgets de una fila, creadas junto a ella en `build_row`.
 #[derive(Clone)]
 struct RowView {
     root: gtk::Box,
+    /// Casilla del modo «Seleccionar» (solo indicadora: el clic lo recoge la fila).
+    check: gtk::CheckButton,
+    reveal: gtk::Revealer,
+    /// Manejador de `selected` del `ListItem` enlazado, para soltarlo al desenlazar.
+    handler: Rc<RefCell<Option<glib::SignalHandlerId>>>,
     avatar: adw::Avatar,
     sender: gtk::Label,
     count: gtk::Label,
@@ -267,13 +533,29 @@ fn build_row() -> RowView {
     col.append(&middle);
     col.append(&snippet);
 
+    let check = gtk::CheckButton::new();
+    check.add_css_class("selection-mode");
+    check.add_css_class("correo-select-check");
+    check.set_valign(gtk::Align::Center);
+    check.set_can_target(false);
+    check.set_can_focus(false);
+    check.set_accessible_role(gtk::AccessibleRole::Presentation);
+    let reveal = gtk::Revealer::new();
+    reveal.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    reveal.set_child(Some(&check));
+    reveal.set_reveal_child(false);
+
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     root.add_css_class("correo-thread-row");
+    root.append(&reveal);
     root.append(&dot);
     root.append(&avatar);
     root.append(&col);
     RowView {
         root,
+        check,
+        reveal,
+        handler: Rc::default(),
         avatar,
         sender,
         count,

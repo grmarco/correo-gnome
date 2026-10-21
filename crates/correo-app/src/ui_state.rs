@@ -2,7 +2,7 @@
 //! lateral). Se guarda en `~/.local/share/correo/ui-state.json`; cualquier error de
 //! lectura o escritura solo se informa por `eprintln` y nunca bloquea la interfaz.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +18,10 @@ pub struct UiState {
     /// Cuentas cuya lista de carpetas está plegada.
     #[serde(default)]
     collapsed_accounts: BTreeSet<AccountId>,
+    /// Plegado de carpetas con hijos distinto del predeterminado, por cuenta y ruta
+    /// normalizada (`true` = plegada). Ausente = el valor por defecto del nodo.
+    #[serde(default)]
+    folder_folds: BTreeMap<AccountId, BTreeMap<String, bool>>,
 }
 
 impl UiState {
@@ -43,6 +47,50 @@ impl UiState {
     /// Olvida las cuentas que ya no existen.
     pub fn retain_accounts(&mut self, existing: &[AccountId]) {
         self.collapsed_accounts.retain(|id| existing.contains(id));
+        self.folder_folds.retain(|id, _| existing.contains(id));
+    }
+
+    /// `true` si la carpeta `key` de la cuenta está plegada; `default` si el usuario no
+    /// ha elegido.
+    pub fn folder_collapsed(&self, account: AccountId, key: &str, default: bool) -> bool {
+        self.folder_folds
+            .get(&account)
+            .and_then(|m| m.get(key))
+            .copied()
+            .unwrap_or(default)
+    }
+
+    /// Recuerda el plegado de una carpeta (solo se guarda si difiere del predeterminado).
+    pub fn set_folder_collapsed(
+        &mut self,
+        account: AccountId,
+        key: &str,
+        collapsed: bool,
+        default: bool,
+    ) {
+        if collapsed == default {
+            if let Some(m) = self.folder_folds.get_mut(&account) {
+                m.remove(key);
+                if m.is_empty() {
+                    self.folder_folds.remove(&account);
+                }
+            }
+        } else {
+            self.folder_folds
+                .entry(account)
+                .or_default()
+                .insert(key.to_owned(), collapsed);
+        }
+    }
+
+    /// Olvida las carpetas de `account` que ya no existen (`keys` son las claves vigentes).
+    pub fn retain_folders(&mut self, account: AccountId, keys: &BTreeSet<String>) {
+        if let Some(m) = self.folder_folds.get_mut(&account) {
+            m.retain(|k, _| keys.contains(k));
+            if m.is_empty() {
+                self.folder_folds.remove(&account);
+            }
+        }
     }
 
     /// Lee el estado de `dir`. Si falta o está dañado, devuelve el estado por defecto.
@@ -156,5 +204,39 @@ mod tests {
         s.retain_accounts(&[2, 5]);
         assert!(!s.is_collapsed(1));
         assert!(s.is_collapsed(2));
+    }
+
+    #[test]
+    fn old_format_without_folders_still_loads() {
+        let dir = temp_dir("old-format");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ui-state.json"), r#"{"collapsed_accounts":[3]}"#).unwrap();
+        let s = UiState::load_from(&dir);
+        assert!(s.is_collapsed(3));
+        assert!(!s.folder_collapsed(3, "Archives", false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_folds_store_only_overrides_and_roundtrip() {
+        let dir = temp_dir("folders");
+        let mut s = UiState::default();
+        assert!(!s.folder_collapsed(1, "Archives", false));
+        assert!(s.folder_collapsed(1, "[Gmail]", true));
+        s.set_folder_collapsed(1, "Archives", true, false);
+        s.set_folder_collapsed(1, "[Gmail]", false, true);
+        s.set_folder_collapsed(2, "Otra", false, false); // igual al defecto: no se guarda
+        s.save_to(&dir).unwrap();
+        let loaded = UiState::load_from(&dir);
+        assert_eq!(loaded, s);
+        assert!(loaded.folder_collapsed(1, "Archives", false));
+        assert!(!loaded.folder_collapsed(1, "[Gmail]", true));
+        assert!(!loaded.folder_collapsed(2, "Otra", false));
+        let mut s = loaded;
+        s.set_folder_collapsed(1, "Archives", false, false);
+        assert!(!s.folder_collapsed(1, "Archives", false));
+        s.retain_accounts(&[2]);
+        assert!(s.folder_collapsed(1, "[Gmail]", true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

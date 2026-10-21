@@ -82,6 +82,10 @@ struct Inner {
     current: RefCell<Current>,
     /// Enlaces del cuerpo actual; el tag `link-N` apunta a `links[N]`.
     links: RefCell<Vec<LinkTarget>>,
+    /// Última posición del puntero sobre el cuerpo (coordenadas del widget), si está dentro.
+    pointer: Cell<Option<(f64, f64)>>,
+    /// El cursor actual es el de enlace.
+    over_link: Cell<bool>,
     compose: RefCell<Option<ComposeFn>>,
     /// Se avisa tras cambios que afectan a la lista (archivar, borrar, leer o no leer).
     changed: RefCell<Option<Rc<dyn Fn()>>>,
@@ -297,6 +301,8 @@ impl MessageView {
             generation: Cell::new(0),
             current: RefCell::new(Current::default()),
             links: RefCell::new(Vec::new()),
+            pointer: Cell::new(None),
+            over_link: Cell::new(false),
             compose: RefCell::new(None),
             changed: RefCell::new(None),
             root: root.clone(),
@@ -349,6 +355,7 @@ impl MessageView {
         connect_action_button(&inner, &mark_unread, Action::MarkUnread);
         connect_link_clicks(&inner);
         connect_link_tooltips(&inner);
+        connect_link_cursor(&inner);
 
         let retry = gtk::Button::with_label("Reintentar");
         retry.set_halign(gtk::Align::Center);
@@ -514,6 +521,55 @@ fn link_at(inner: &Inner, view: &gtk::TextView, x: i32, y: i32) -> Option<LinkTa
     })
 }
 
+/// Nombre del cursor del cuerpo según haya o no un enlace bajo el puntero.
+fn cursor_name(over_link: bool) -> &'static str {
+    if over_link {
+        "pointer"
+    } else {
+        "text"
+    }
+}
+
+/// Recalcula el cursor con la última posición conocida del puntero. Se llama al mover el
+/// ratón y también cuando el contenido se mueve bajo un puntero quieto (scroll, mensaje nuevo).
+fn update_link_cursor(inner: &Inner) {
+    let over = inner
+        .pointer
+        .get()
+        .is_some_and(|(x, y)| link_at(inner, &inner.text_view, x as i32, y as i32).is_some());
+    if over != inner.over_link.replace(over) {
+        inner
+            .text_view
+            .set_cursor_from_name(Some(cursor_name(over)));
+    }
+}
+
+/// Cursor de mano sobre los enlaces del cuerpo; el de texto en el resto.
+fn connect_link_cursor(inner: &Rc<Inner>) {
+    let motion = gtk::EventControllerMotion::new();
+    let weak = Rc::downgrade(inner);
+    motion.connect_motion(move |_, x, y| {
+        let Some(inner) = weak.upgrade() else { return };
+        inner.pointer.set(Some((x, y)));
+        update_link_cursor(&inner);
+    });
+    let weak = Rc::downgrade(inner);
+    motion.connect_leave(move |_| {
+        let Some(inner) = weak.upgrade() else { return };
+        inner.pointer.set(None);
+        update_link_cursor(&inner);
+    });
+    inner.text_view.add_controller(motion);
+    if let Some(adjustment) = inner.text_view.vadjustment() {
+        let weak = Rc::downgrade(inner);
+        adjustment.connect_value_changed(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                update_link_cursor(&inner);
+            }
+        });
+    }
+}
+
 /// Clic en un enlace del cuerpo: si el texto parece otro dominio, pide confirmación.
 fn connect_link_clicks(inner: &Rc<Inner>) {
     let click = gtk::GestureClick::new();
@@ -599,6 +655,7 @@ fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: Mes
     inner.banner.set_revealed(false);
     clear_attachments(inner);
     inner.links.borrow_mut().clear();
+    update_link_cursor(inner);
     *inner.current.borrow_mut() = Current {
         account: Some(account.clone()),
         mailbox: Some(mailbox.clone()),
@@ -775,6 +832,7 @@ fn clear_view(inner: &Rc<Inner>) {
     destroy_original(inner);
     *inner.current.borrow_mut() = Current::default();
     inner.links.borrow_mut().clear();
+    update_link_cursor(inner);
     inner.subject.set_text("");
     inner.from.set_text("");
     inner.to.set_text("");
@@ -919,6 +977,7 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     };
     *inner.links.borrow_mut() = links;
     inner.text_view.set_buffer(Some(&buffer));
+    update_link_cursor(inner);
     inner.stack.set_visible_child_name("content");
     #[cfg(feature = "webkit")]
     inner.original.set_visible(html.is_some());
@@ -1447,6 +1506,12 @@ fn para_tag(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_cursor_names() {
+        assert_eq!(super::cursor_name(true), "pointer");
+        assert_eq!(super::cursor_name(false), "text");
+    }
+
     use super::*;
 
     #[test]

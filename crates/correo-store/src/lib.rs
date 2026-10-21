@@ -166,6 +166,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX contacts_by_name ON contacts (name COLLATE NOCASE);
     CREATE INDEX contacts_by_email ON contacts (email COLLATE NOCASE);
 "#,
+    r#"
+    -- v4: delimitador de jerarquía de cada carpeta (el que da el servidor en LIST).
+    -- NULL hasta la próxima lista de carpetas.
+    ALTER TABLE mailboxes ADD COLUMN delimiter TEXT;
+"#,
 ];
 
 /// Columnas de `messages` en el orden que espera `header_from_row`.
@@ -174,7 +179,7 @@ const HEADER_COLS: &str = "id, mailbox_id, uid, message_id, in_reply_to, referen
     has_attachments, snippet, labels_json";
 
 /// Columnas de `mailboxes` en el orden que espera `mailbox_from_row`.
-const MAILBOX_COLS: &str = "id, account_id, path, role, uid_validity, unread";
+const MAILBOX_COLS: &str = "id, account_id, path, role, uid_validity, unread, delimiter";
 
 /// Columnas de `accounts` en el orden que espera `account_from_row`.
 const ACCOUNT_COLS: &str = "id, provider, email, display_name, sync_days";
@@ -303,19 +308,21 @@ impl Store {
     pub fn upsert_mailbox(&self, mailbox: &Mailbox) -> Result<MailboxId> {
         self.conn
             .query_row(
-                "INSERT INTO mailboxes (account_id, path, role, uid_validity, unread) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                "INSERT INTO mailboxes (account_id, path, role, uid_validity, unread, delimiter) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT (account_id, path) DO UPDATE SET \
                      role = excluded.role, \
                      uid_validity = excluded.uid_validity, \
-                     unread = excluded.unread \
+                     unread = excluded.unread, \
+                     delimiter = excluded.delimiter \
                  RETURNING id",
                 params![
                     mailbox.account_id,
                     mailbox.path,
                     role_to_str(mailbox.role),
                     mailbox.uid_validity,
-                    mailbox.unread
+                    mailbox.unread,
+                    mailbox.delimiter.map(String::from)
                 ],
                 |row| row.get(0),
             )
@@ -923,6 +930,9 @@ fn mailbox_from_row(row: &Row) -> rusqlite::Result<Mailbox> {
         role: role_from_str(&role).ok_or_else(|| bad_value(3, &role))?,
         uid_validity: row.get(4)?,
         unread: row.get(5)?,
+        delimiter: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|d| d.chars().next()),
     })
 }
 
@@ -981,6 +991,7 @@ mod tests {
                 role: MailboxRole::Inbox,
                 uid_validity: Some(1),
                 unread: 0,
+                delimiter: Some('/'),
             })
             .unwrap()
     }
@@ -1134,12 +1145,14 @@ mod tests {
                 role: MailboxRole::Inbox,
                 uid_validity: Some(42),
                 unread: 5,
+                delimiter: Some('.'),
             })
             .unwrap();
         assert_eq!(first, again);
         let got = s.get_mailbox(first).unwrap();
         assert_eq!(got.uid_validity, Some(42));
         assert_eq!(got.unread, 5);
+        assert_eq!(got.delimiter, Some('.'));
 
         let sent = new_mailbox(&s, acc, "Sent");
         let boxes = s.list_mailboxes(acc).unwrap();
@@ -1554,6 +1567,24 @@ mod tests {
     }
 
     #[test]
+    fn migration_4_adds_a_null_delimiter_to_existing_mailboxes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let acc = new_account(&store, "m@example.com");
+        let id = new_mailbox(&store, acc, "Archives/2014");
+        // Simula la BD v3: sin la columna `delimiter`.
+        store
+            .conn
+            .execute_batch("ALTER TABLE mailboxes DROP COLUMN delimiter; PRAGMA user_version = 3;")
+            .unwrap();
+        migrate(&mut store.conn).unwrap();
+        assert_eq!(store.get_mailbox(id).unwrap().delimiter, None);
+        let mut m = store.get_mailbox(id).unwrap();
+        m.delimiter = Some('/');
+        store.upsert_mailbox(&m).unwrap();
+        assert_eq!(store.get_mailbox(id).unwrap().delimiter, Some('/'));
+    }
+
+    #[test]
     fn migration_3_keeps_legacy_contacts_without_account() {
         let mut store = Store::open_in_memory().unwrap();
         // Simula la BD v2: se deshace la migración 3 y se inserta una fila heredada.
@@ -1565,6 +1596,7 @@ mod tests {
                      email TEXT PRIMARY KEY COLLATE NOCASE, name TEXT, source TEXT NOT NULL);
                  CREATE INDEX contacts_by_name ON contacts (name COLLATE NOCASE);
                  INSERT INTO contacts VALUES ('old@example.com', 'Viejo', 'google');
+                 ALTER TABLE mailboxes DROP COLUMN delimiter;
                  PRAGMA user_version = 2;",
             )
             .unwrap();

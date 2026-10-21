@@ -7,6 +7,11 @@
 //! leídos si está plegada, opciones y chevron) y, debajo, una lista de carpetas dentro de
 //! un `gtk::Revealer`. La selección es única entre todas las listas. El estado de plegado
 //! se guarda en `ui_state` y se conserva al reconstruir la barra.
+//!
+//! Las carpetas forman un árbol (`folder_tree`): la lista de la cuenta sigue siendo un
+//! `ListBox` plano con una fila por nodo, sangrada por nivel y con el contenido dentro de
+//! un `Revealer`; plegar un nodo anima (y luego oculta) las filas de sus descendientes.
+//! El plegado de cada nodo se guarda por (cuenta, ruta).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -15,6 +20,7 @@ use adw::prelude::*;
 use correo_core::{Account, AccountId, Mailbox, MailboxId, MailboxRole};
 use gtk::gio;
 
+use crate::folder_tree::{self, Node};
 use crate::ui_state::UiState;
 use crate::ui_style;
 
@@ -34,7 +40,34 @@ pub enum Target {
 #[derive(Clone)]
 struct TargetList {
     list: gtk::ListBox,
-    targets: Rc<Vec<Target>>,
+    /// `None` en los contenedores (no seleccionables).
+    targets: Rc<Vec<Option<Target>>>,
+}
+
+/// Fila de un nodo del árbol de carpetas de una cuenta.
+#[derive(Clone)]
+struct TreeRow {
+    /// Clave de plegado (ruta normalizada).
+    key: String,
+    default_collapsed: bool,
+    /// Índice del padre en la misma lista.
+    parent: Option<usize>,
+    has_children: bool,
+    row: gtk::ListBoxRow,
+    revealer: gtk::Revealer,
+    chevron: gtk::Image,
+    badge: gtk::Label,
+    name: String,
+    own_unread: u32,
+    total_unread: u32,
+}
+
+/// Árbol de carpetas de una cuenta, con una fila por nodo en orden de recorrido.
+#[derive(Clone)]
+struct Tree {
+    account: AccountId,
+    list: gtk::ListBox,
+    rows: Rc<Vec<TreeRow>>,
 }
 
 /// Sección plegable de una cuenta.
@@ -62,6 +95,10 @@ pub struct Sidebar {
     /// Listas de destinos (la primera es la de «Todas las entradas»).
     lists: Shared<Vec<TargetList>>,
     sections: Shared<Vec<Section>>,
+    trees: Shared<Vec<Tree>>,
+    /// Verdadero mientras se reconstruyen las listas: las selecciones que GTK hace por su
+    /// cuenta (el foco salta a otra fila al destruir la enfocada) no cambian de destino.
+    rebuilding: Rc<Cell<bool>>,
     state: Shared<UiState>,
     on_select: Rc<dyn Fn(Target)>,
     on_activate: Rc<dyn Fn()>,
@@ -149,6 +186,8 @@ impl Sidebar {
             content,
             lists: Rc::new(RefCell::new(Vec::new())),
             sections: Rc::new(RefCell::new(Vec::new())),
+            trees: Rc::new(RefCell::new(Vec::new())),
+            rebuilding: Rc::new(Cell::new(false)),
             state: Rc::new(RefCell::new(UiState::load())),
             on_select: Rc::new(on_select),
             on_activate: Rc::new(on_activate),
@@ -204,11 +243,50 @@ impl Sidebar {
         }
     }
 
+    /// Despliega la cuenta y los ancestros plegados de `mailbox` para que su fila sea visible
+    /// (selección programática: notificaciones, búsqueda).
+    pub fn reveal_mailbox(&self, mailbox: &Mailbox) {
+        self.expand_account(mailbox.account_id);
+        let tree = self
+            .trees
+            .borrow()
+            .iter()
+            .find(|t| t.account == mailbox.account_id)
+            .cloned();
+        let Some(tree) = tree else { return };
+        let mut changed = false;
+        for key in folder_tree::ancestor_keys(mailbox) {
+            let Some(row) = tree.rows.iter().find(|r| r.key == key) else {
+                continue;
+            };
+            let mut st = self.state.borrow_mut();
+            if st.folder_collapsed(tree.account, &key, row.default_collapsed) {
+                st.set_folder_collapsed(tree.account, &key, false, row.default_collapsed);
+                changed = true;
+            }
+        }
+        if changed {
+            self.state.borrow().save();
+            apply_tree(&self.state, &tree, true);
+        }
+    }
+
     /// Reconstruye la barra con las cuentas y sus carpetas, y selecciona `current`
     /// sin que ello cambie de destino (el llamador comprueba si ya estaba activo).
     /// El plegado de cada cuenta se conserva.
     pub fn reload(&self, accounts: &[(Account, Vec<Mailbox>)], current: Target) {
         // Recuerda si el foco estaba en una cabecera para devolvérselo a la nueva.
+        let focused_folder = self.trees.borrow().iter().find_map(|t| {
+            let i = t.rows.iter().position(|r| r.row.is_focus())?;
+            Some((t.account, t.rows[i].key.clone()))
+        });
+        let focused_unified = self
+            .lists
+            .borrow()
+            .first()
+            .and_then(|l| l.list.row_at_index(0))
+            .is_some_and(|r| r.is_focus());
+        self.rebuilding.set(true);
         let focused_header = self
             .sections
             .borrow()
@@ -221,6 +299,7 @@ impl Sidebar {
         }
         self.lists.borrow_mut().clear();
         self.sections.borrow_mut().clear();
+        self.trees.borrow_mut().clear();
 
         if !accounts.is_empty() {
             let ids: Vec<AccountId> = accounts.iter().map(|(a, _)| a.id).collect();
@@ -244,34 +323,15 @@ impl Sidebar {
                 unified_unread,
                 true,
             ),
-            Target::Unified,
+            Some(Target::Unified),
         )];
         let list = self.target_list(unified);
         self.content.append(&list.list);
         self.lists.borrow_mut().push(list);
 
         for (index, (account, boxes)) in accounts.iter().enumerate() {
-            let mut sorted: Vec<&Mailbox> = boxes.iter().collect();
-            sorted.sort_by(|a, b| {
-                role_rank(a.role)
-                    .cmp(&role_rank(b.role))
-                    .then_with(|| a.path.cmp(&b.path))
-            });
-            let rows = sorted
-                .iter()
-                .map(|m| {
-                    (
-                        target_row(
-                            role_icon(m.role),
-                            &mailbox_label(m),
-                            m.unread,
-                            matches!(m.role, MailboxRole::Inbox | MailboxRole::Drafts),
-                        ),
-                        Target::Mailbox(m.id),
-                    )
-                })
-                .collect();
-            let list = self.target_list(rows);
+            let nodes = folder_tree::folder_tree(boxes);
+            let (list, tree) = self.build_tree(account.id, &nodes);
 
             let unread: u32 = boxes.iter().map(|m| m.unread).sum();
             let inbox_unread = boxes
@@ -291,6 +351,7 @@ impl Sidebar {
             block.append(&section.revealer);
             self.content.append(&block);
             self.lists.borrow_mut().push(list);
+            self.trees.borrow_mut().push(tree);
             self.sections.borrow_mut().push(section);
         }
 
@@ -298,12 +359,33 @@ impl Sidebar {
         self.menu.popdown();
 
         let found = self.lists.borrow().iter().find_map(|l| {
-            let pos = l.targets.iter().position(|t| *t == current)?;
+            let pos = l.targets.iter().position(|t| *t == Some(current))?;
             l.list.row_at_index(pos as i32)
         });
         if let Some(row) = found {
             if let Some(list) = row.parent().and_then(|p| p.downcast::<gtk::ListBox>().ok()) {
                 list.select_row(Some(&row));
+            }
+        }
+        self.rebuilding.set(false);
+        if focused_unified {
+            if let Some(row) = self
+                .lists
+                .borrow()
+                .first()
+                .and_then(|l| l.list.row_at_index(0))
+            {
+                row.grab_focus();
+            }
+        }
+        if let Some((account, key)) = focused_folder {
+            let row = self.trees.borrow().iter().find_map(|t| {
+                (t.account == account)
+                    .then(|| t.rows.iter().find(|r| r.key == key).map(|r| r.row.clone()))
+                    .flatten()
+            });
+            if let Some(row) = row.filter(|r| r.is_visible()) {
+                row.grab_focus();
             }
         }
         if let Some(id) = focused_header {
@@ -320,7 +402,7 @@ impl Sidebar {
     }
 
     /// Crea una lista de filas seleccionables y conecta selección única entre listas.
-    fn target_list(&self, rows: Vec<(gtk::ListBoxRow, Target)>) -> TargetList {
+    fn target_list(&self, rows: Vec<(gtk::ListBoxRow, Option<Target>)>) -> TargetList {
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
         list.add_css_class("correo-sidebar");
@@ -336,6 +418,7 @@ impl Sidebar {
             let targets = Rc::clone(&targets);
             let on_select = Rc::clone(&self.on_select);
             let lists = Rc::clone(&self.lists);
+            let rebuilding = Rc::clone(&self.rebuilding);
             list.connect_row_selected(move |this, row| {
                 let Some(row) = row else { return };
                 // Selección única entre listas.
@@ -344,8 +427,11 @@ impl Sidebar {
                         other.list.unselect_all();
                     }
                 }
+                if rebuilding.get() {
+                    return;
+                }
                 let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
-                if let Some(target) = targets.get(index).copied() {
+                if let Some(Some(target)) = targets.get(index).copied() {
                     on_select(target);
                 }
             });
@@ -357,13 +443,24 @@ impl Sidebar {
             let on_activate = Rc::clone(&self.on_activate);
             list.connect_row_activated({
                 let on_activate = Rc::clone(&on_activate);
-                move |_, _| on_activate()
+                let targets = Rc::clone(&targets);
+                move |_, row| {
+                    let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
+                    if matches!(targets.get(index), Some(Some(_))) {
+                        on_activate();
+                    }
+                }
             });
             let click = gtk::GestureClick::new();
             click.set_button(1);
             let list_for_rows = list.clone();
+            let targets = Rc::clone(&targets);
             click.connect_released(move |_, _, _, y| {
-                if list_for_rows.row_at_y(y as i32).is_some() {
+                let selectable = list_for_rows
+                    .row_at_y(y as i32)
+                    .and_then(|row| usize::try_from(row.index()).ok())
+                    .is_some_and(|i| matches!(targets.get(i), Some(Some(_))));
+                if selectable {
                     on_activate();
                 }
             });
@@ -593,18 +690,6 @@ impl Sidebar {
     }
 }
 
-fn role_rank(role: MailboxRole) -> u8 {
-    match role {
-        MailboxRole::Inbox => 0,
-        MailboxRole::Drafts => 1,
-        MailboxRole::Sent => 2,
-        MailboxRole::Archive => 3,
-        MailboxRole::Spam => 4,
-        MailboxRole::Trash => 5,
-        MailboxRole::Other => 6,
-    }
-}
-
 fn role_icon(role: MailboxRole) -> &'static str {
     match role {
         MailboxRole::Inbox => ui_style::icon_or("mail-inbox-symbolic", "mail-unread-symbolic"),
@@ -617,16 +702,278 @@ fn role_icon(role: MailboxRole) -> &'static str {
     }
 }
 
-/// Nombre visible de una carpeta: los roles tienen nombre fijo en castellano y el
-/// resto usa el último segmento de su ruta IMAP.
-fn mailbox_label(m: &Mailbox) -> String {
-    match m.role {
-        MailboxRole::Inbox => "Entrada".to_string(),
-        MailboxRole::Drafts => "Borradores".to_string(),
-        MailboxRole::Sent => "Enviados".to_string(),
-        MailboxRole::Archive => "Archivo".to_string(),
-        MailboxRole::Spam => "Spam".to_string(),
-        MailboxRole::Trash => "Papelera".to_string(),
-        MailboxRole::Other => m.path.rsplit('/').next().unwrap_or(&m.path).to_string(),
+// ----- Árbol de carpetas ----------------------------------------------------
+
+/// Sangría por nivel, en píxeles.
+const INDENT: i32 = 16;
+/// Ancho de la columna del chevron de plegado, en píxeles.
+const CHEVRON_W: i32 = 22;
+
+/// Aplana el árbol en orden de recorrido: (nodo, nivel, índice del padre).
+fn flatten<'a>(
+    nodes: &'a [Node],
+    level: usize,
+    parent: Option<usize>,
+    out: &mut Vec<(&'a Node, usize, Option<usize>)>,
+) {
+    for node in nodes {
+        let index = out.len();
+        out.push((node, level, parent));
+        flatten(&node.children, level + 1, Some(index), out);
+    }
+}
+
+impl Sidebar {
+    /// Crea la lista de una cuenta con una fila por nodo del árbol y conecta el plegado
+    /// (chevron, contenedores y teclado).
+    fn build_tree(&self, account: AccountId, nodes: &[Node]) -> (TargetList, Tree) {
+        let mut flat = Vec::new();
+        flatten(nodes, 0, None, &mut flat);
+        let with_chevrons = flat.iter().any(|(n, ..)| !n.children.is_empty());
+
+        let mut rows = Vec::with_capacity(flat.len());
+        let mut targets = Vec::with_capacity(flat.len());
+        for (node, level, parent) in &flat {
+            rows.push(folder_row(node, *level, *parent, with_chevrons));
+            targets.push(node.mailbox.map(Target::Mailbox));
+        }
+        let list = self.target_list(
+            rows.iter()
+                .map(|r| r.row.clone())
+                .zip(targets.iter().copied())
+                .collect(),
+        );
+        let tree = Tree {
+            account,
+            list: list.list.clone(),
+            rows: Rc::new(rows),
+        };
+        // Estado inicial sin animación.
+        apply_tree(&self.state, &tree, false);
+        let present: std::collections::BTreeSet<String> =
+            tree.rows.iter().map(|r| r.key.clone()).collect();
+        let before = self.state.borrow().clone();
+        self.state.borrow_mut().retain_folders(account, &present);
+        if *self.state.borrow() != before {
+            self.state.borrow().save();
+        }
+
+        for (i, tr) in tree.rows.iter().enumerate() {
+            if !tr.has_children {
+                continue;
+            }
+            // El chevron pliega sin seleccionar: reclama el clic para que la lista no lo vea.
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let (state, tree) = (Rc::clone(&self.state), tree.clone());
+            click.connect_pressed(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                toggle_node(&state, &tree, i, None);
+            });
+            tr.chevron.set_cursor_from_name(Some("pointer"));
+            tr.chevron.add_controller(click);
+        }
+        {
+            // Pulsar un contenedor (no seleccionable) o pulsar Enter sobre él lo pliega.
+            let (state, tree) = (Rc::clone(&self.state), tree.clone());
+            let targets = Rc::new(targets);
+            tree.list.clone().connect_row_activated(move |_, row| {
+                let Ok(i) = usize::try_from(row.index()) else {
+                    return;
+                };
+                if matches!(targets.get(i), Some(None)) && tree.rows[i].has_children {
+                    toggle_node(&state, &tree, i, None);
+                }
+            });
+        }
+        {
+            // Derecha despliega (o baja al primer hijo); izquierda pliega (o sube al padre).
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let list_widget = tree.list.clone();
+            let (state, tree) = (Rc::clone(&self.state), tree.clone());
+            keys.connect_key_pressed(move |_, key, _, modifiers| {
+                use gtk::gdk::Key;
+                if modifiers.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SHIFT_MASK,
+                ) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                let Some(i) = tree.rows.iter().position(|r| r.row.is_focus()) else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                let tr = &tree.rows[i];
+                let collapsed = tr.has_children && node_collapsed(&state, &tree, i);
+                match key {
+                    Key::Right | Key::KP_Right if tr.has_children => {
+                        if collapsed {
+                            toggle_node(&state, &tree, i, Some(false));
+                        } else if let Some(child) = tree.rows.get(i + 1) {
+                            child.row.grab_focus();
+                        }
+                    }
+                    Key::Left | Key::KP_Left => {
+                        if tr.has_children && !collapsed {
+                            toggle_node(&state, &tree, i, Some(true));
+                        } else if let Some(parent) = tr.parent {
+                            tree.rows[parent].row.grab_focus();
+                        } else {
+                            return gtk::glib::Propagation::Proceed;
+                        }
+                    }
+                    _ => return gtk::glib::Propagation::Proceed,
+                }
+                gtk::glib::Propagation::Stop
+            });
+            list_widget.add_controller(keys);
+        }
+        (list, tree)
+    }
+}
+
+/// Fila de un nodo: sangría, chevron (si hay árbol), icono, nombre e insignia.
+fn folder_row(node: &Node, level: usize, parent: Option<usize>, with_chevrons: bool) -> TreeRow {
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("correo-folder-row");
+    row.set_selectable(node.mailbox.is_some());
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    content.add_css_class("correo-folder-content");
+    content.set_margin_start(4 + INDENT * i32::try_from(level).unwrap_or(0));
+    content.set_margin_end(8);
+
+    let has_children = !node.children.is_empty();
+    let chevron = gtk::Image::from_icon_name("pan-down-symbolic");
+    chevron.add_css_class("correo-chevron");
+    if with_chevrons {
+        if has_children {
+            chevron.set_size_request(CHEVRON_W, -1);
+            content.append(&chevron);
+        } else {
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_size_request(CHEVRON_W, -1);
+            content.append(&spacer);
+        }
+    }
+    let icon = gtk::Image::from_icon_name(role_icon(node.role));
+    icon.set_margin_end(6);
+    content.append(&icon);
+    let name = gtk::Label::new(Some(&node.name));
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    content.append(&name);
+    let badge = gtk::Label::new(None);
+    badge.add_css_class("correo-badge");
+    if matches!(node.role, MailboxRole::Inbox | MailboxRole::Drafts) {
+        badge.add_css_class("correo-badge-accent");
+    }
+    badge.set_visible(false);
+    content.append(&badge);
+
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(0);
+    revealer.set_reveal_child(true);
+    revealer.set_child(Some(&content));
+    row.set_child(Some(&revealer));
+    {
+        // Al terminar de plegarse, la fila se oculta del todo (el teclado la salta).
+        let row = row.clone();
+        revealer.connect_child_revealed_notify(move |rev| {
+            if !rev.is_child_revealed() && !rev.reveals_child() {
+                row.set_visible(false);
+            }
+        });
+    }
+    TreeRow {
+        key: node.key.clone(),
+        default_collapsed: node.default_collapsed,
+        parent,
+        has_children,
+        row,
+        revealer,
+        chevron,
+        badge,
+        name: node.name.clone(),
+        own_unread: node.unread,
+        total_unread: node.total_unread(),
+    }
+}
+
+fn node_collapsed(state: &Shared<UiState>, tree: &Tree, i: usize) -> bool {
+    let tr = &tree.rows[i];
+    state
+        .borrow()
+        .folder_collapsed(tree.account, &tr.key, tr.default_collapsed)
+}
+
+/// Pliega (`Some(true)`), despliega (`Some(false)`) o alterna (`None`) un nodo; lo guarda
+/// y anima los cambios.
+fn toggle_node(state: &Shared<UiState>, tree: &Tree, i: usize, collapsed: Option<bool>) {
+    let tr = &tree.rows[i];
+    let current = node_collapsed(state, tree, i);
+    let wanted = collapsed.unwrap_or(!current);
+    if wanted == current {
+        return;
+    }
+    state
+        .borrow_mut()
+        .set_folder_collapsed(tree.account, &tr.key, wanted, tr.default_collapsed);
+    state.borrow().save();
+    apply_tree(state, tree, true);
+}
+
+/// Refleja el plegado en todas las filas: visibilidad (con animación), chevron, insignia
+/// (la suma de los hijos solo se ve con el nodo plegado) y estado accesible.
+fn apply_tree(state: &Shared<UiState>, tree: &Tree, animate: bool) {
+    let mut collapsed = vec![false; tree.rows.len()];
+    let mut visible = vec![true; tree.rows.len()];
+    for (i, tr) in tree.rows.iter().enumerate() {
+        collapsed[i] = tr.has_children && node_collapsed(state, tree, i);
+        visible[i] = tr.parent.is_none_or(|p| visible[p] && !collapsed[p]);
+    }
+    for (i, tr) in tree.rows.iter().enumerate() {
+        let duration = if animate && ui_style::animations_enabled(&tr.revealer) {
+            FOLD_MS
+        } else {
+            0
+        };
+        tr.revealer.set_transition_duration(duration);
+        if visible[i] {
+            tr.row.set_visible(true);
+            tr.revealer.set_reveal_child(true);
+        } else {
+            tr.revealer.set_reveal_child(false);
+            if duration == 0 || !tr.revealer.is_mapped() {
+                tr.row.set_visible(false);
+            }
+        }
+        let unread = if collapsed[i] {
+            tr.total_unread
+        } else {
+            tr.own_unread
+        };
+        tr.badge.set_label(&unread.to_string());
+        tr.badge.set_visible(unread > 0);
+        let mut label = tr.name.clone();
+        if unread > 0 {
+            label = format!("{label}, {unread} sin leer");
+        }
+        tr.row
+            .update_property(&[gtk::accessible::Property::Label(&label)]);
+        if tr.has_children {
+            if collapsed[i] {
+                tr.chevron.add_css_class("correo-collapsed");
+            } else {
+                tr.chevron.remove_css_class("correo-collapsed");
+            }
+            let tip = if collapsed[i] { "Desplegar" } else { "Plegar" };
+            tr.chevron.set_tooltip_text(Some(tip));
+            tr.row
+                .update_state(&[gtk::accessible::State::Expanded(Some(!collapsed[i]))]);
+        }
     }
 }

@@ -1,4 +1,7 @@
+mod batch;
+mod batch_bar;
 mod composer;
+mod folder_tree;
 mod message_list;
 mod notify;
 mod reader;
