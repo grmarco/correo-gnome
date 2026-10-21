@@ -74,6 +74,24 @@ Yo (orquestador, Sonnet) defino interfaces (traits y tipos en `correo-core`), re
 - **T14** Empaquetado (Flatpak o `.deb`), icono, metainfo, accesibilidad, atajos de teclado.
 - **T15** (post-MVP) Backend Microsoft Graph para correo si IMAP está bloqueado en el tenant; calendario fuera de alcance.
 
+## Notificaciones y consumo de batería (requisito añadido)
+
+- **Notificaciones nativas**: `GNotification` vía `GApplication` (libadwaita), con acciones "Abrir", "Marcar como leído" y "Archivar". Se agrupan por cuenta, no se notifica la carpeta de spam y se respeta No molestar de GNOME. Solo notifican mensajes nuevos de la bandeja de entrada y no leídos.
+- **Servicio en segundo plano**: la app puede quedarse residente sin ventana (portal Background de Flatpak / `--gapplication-service`) y arrancar con la sesión, para notificar con la ventana cerrada.
+- **Sincronización ligera**:
+  - IMAP IDLE sobre la bandeja de entrada (una sola conexión por cuenta). Fuera de IDLE no se hace polling agresivo.
+  - Si IDLE no está disponible o la conexión cae: polling con intervalo creciente (2 a 15 min) y reconexión con backoff exponencial más jitter. IDLE se reinicia cada 25 min (límite de los servidores).
+  - Las demás carpetas se sincronizan solo al abrirlas o con un barrido lento (cada 30 min) y únicamente las suscritas o visibles.
+  - Sin ventana visible y sin cambios: ningún trabajo de CPU ni de red salvo IDLE.
+- **Batería y red** (`gio::PowerProfileMonitor` + `gio::NetworkMonitor`):
+  - Con ahorro de energía o batería baja: se alargan los intervalos, se pausa el barrido de carpetas secundarias y no se descargan cuerpos por adelantado.
+  - Red de pago (`NetworkMonitor::is_network_metered`): no se descargan adjuntos ni imágenes automáticamente.
+  - Sin red: se suspende todo y se reanuda al volver (señal `network-changed`), sin reintentos en bucle.
+  - Al suspender y reanudar el equipo, resincronización inmediata de la bandeja de entrada.
+- **Objetivos medibles** (se verifican en T14): menos de 60 MB de RSS en reposo con 2 cuentas, 0 % de CPU en reposo, y sin despertares periódicos por debajo de 1 por minuto.
+
+Impacto en tareas: **T6** pasa a incluir IDLE, backoff y política de intervalos (módulo `SyncScheduler` testeable con reloj simulado); **T13** incluye las notificaciones y el modo residente; nueva **T13b** integra `PowerProfileMonitor`/`NetworkMonitor` con el planificador; **T14** incluye la medición de consumo (`powertop`/`perf`).
+
 ## Control de calidad
 - Cada tarea termina con tests y `cargo clippy -D warnings` en verde.
 - Haiku trabaja en ramas o worktrees aislados por tarea; yo reviso el diff antes de fusionar.
