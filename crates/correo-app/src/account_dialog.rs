@@ -207,7 +207,24 @@ fn start(flow: Rc<Flow>, choice: Choice) {
         let authorized = services
             .spawn(async move {
                 let tokens = request.finish().await?;
-                let profile = fetch_profile(provider, &tokens.access_token).await?;
+                // En Microsoft el token inicial es del recurso de correo; el perfil (Graph)
+                // necesita un token propio obtenido con el refresh token.
+                let profile_token = match (provider, tokens.refresh_token.as_deref()) {
+                    (Provider::Gmail, _) => tokens.access_token.clone(),
+                    (_, Some(refresh)) => {
+                        let config = crate::setup::oauth_config(provider)
+                            .ok_or_else(|| Error::Auth("falta el client_id de Microsoft".into()))?;
+                        let scopes = config.directory_scopes.clone();
+                        OAuthClient::new(config)?
+                            .refresh_scoped(refresh, &scopes)
+                            .await?
+                            .access_token
+                    }
+                    (_, None) => {
+                        return Err(Error::Auth("Microsoft no devolvió refresh token".into()));
+                    }
+                };
+                let profile = fetch_profile(provider, &profile_token).await?;
                 Ok::<_, Error>((tokens, profile))
             })
             .await;

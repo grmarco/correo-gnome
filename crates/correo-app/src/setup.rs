@@ -24,7 +24,7 @@ use correo_auth::{
     MemoryTokenStore, OAuthClient, OAuthProvider, OAuthTokenProvider, SecretServiceStore,
     TokenStore,
 };
-use correo_core::{AccessToken, AccountId, Error, Provider, Result, TokenProvider};
+use correo_core::{AccessToken, AccountId, Error, Provider, Result, TokenAudience, TokenProvider};
 use correo_store::Store;
 use gtk::glib;
 
@@ -174,6 +174,16 @@ impl TokenRouter {
 impl TokenProvider for TokenRouter {
     async fn access_token(&self, account: AccountId) -> Result<AccessToken> {
         self.route(account)?.access_token(account).await
+    }
+
+    async fn access_token_for(
+        &self,
+        account: AccountId,
+        audience: TokenAudience,
+    ) -> Result<AccessToken> {
+        self.route(account)?
+            .access_token_for(account, audience)
+            .await
     }
 }
 
