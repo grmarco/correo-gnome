@@ -1,14 +1,21 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! OAuth2 para correo: autorización de escritorio con PKCE y redirección loopback,
+//! almacenamiento de refresh tokens y proveedor de access tokens con refresco.
+
+mod config;
+mod loopback;
+mod oauth;
+mod pkce;
+mod store;
+mod token_provider;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod test_support;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use config::OAuthProvider;
+pub use oauth::{AuthorizationRequest, OAuthClient, TokenSet};
+pub use pkce::{Pkce, random_state, s256_challenge};
+pub use store::{MemoryTokenStore, TokenStore};
+pub use token_provider::{OAuthTokenProvider, REFRESH_MARGIN};
+
+#[cfg(feature = "libsecret")]
+pub use store::SecretServiceStore;

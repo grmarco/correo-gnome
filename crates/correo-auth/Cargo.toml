@@ -3,4 +3,22 @@ name = "correo-auth"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Almacenamiento de tokens en el Secret Service (GNOME Keyring / KWallet) vía oo7 (sin libs del sistema).
+libsecret = ["dep:oo7"]
+
 [dependencies]
+correo-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+serde.workspace = true
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+oo7 = { version = "0.7.0-beta", default-features = false, features = ["tokio", "native_crypto"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
