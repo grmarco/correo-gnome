@@ -80,7 +80,7 @@ impl OAuthClient {
             .local_addr()
             .map_err(|e| Error::Network(format!("dirección loopback: {e}")))?
             .port();
-        let redirect_uri = format!("http://127.0.0.1:{port}/");
+        let redirect_uri = format!("http://localhost:{port}/");
 
         let mut url = Url::parse(&self.provider.authorization_url)
             .map_err(|e| Error::Protocol(format!("URL de autorización inválida: {e}")))?;
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(param(&params, "access_type"), "offline");
         assert_eq!(param(&params, "redirect_uri"), request.redirect_uri());
         assert!(param(&params, "scope").contains("https://mail.google.com/"));
-        assert!(request.redirect_uri().starts_with("http://127.0.0.1:"));
+        assert!(request.redirect_uri().starts_with("http://localhost:"));
         assert!(!param(&params, "code_challenge").is_empty());
     }
 
