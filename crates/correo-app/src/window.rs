@@ -927,17 +927,11 @@ impl Shell {
         let several = self.state.borrow().accounts.len() > 1;
         notify::notify_new_if_inactive(&self.app, &account, &headers, self.is_in_front(), several);
 
-        // La primera sincronización de una cuenta recién añadida no trae ids nuevos
-        // (la caché estaba vacía), pero sí debe verse en la lista.
-        let first_report = {
-            let mut fresh = self.fresh_accounts.borrow_mut();
-            let before = fresh.len();
-            fresh.retain(|id| *id != account.id);
-            before != fresh.len()
-        };
-        if headers.is_empty() && !first_report {
-            return;
-        }
+        // Un informe llega siempre que la sincronización cambió algo, aunque no haya ids
+        // nuevos (p. ej. la primera sincronización de una cuenta): refresca barra y lista.
+        self.fresh_accounts
+            .borrow_mut()
+            .retain(|id| *id != account.id);
         if let Err(e) = self.reload_model() {
             self.toast(format!("Error al leer la caché: {e}"));
             return;

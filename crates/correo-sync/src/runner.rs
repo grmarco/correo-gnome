@@ -105,10 +105,10 @@ impl Shared {
     async fn sync_inbox(&self, notices: &mpsc::Sender<SyncNotice>) -> Event {
         match self.sync_mailbox(self.inbox).await {
             Ok(changed) => {
-                if changed > 0
-                    && let Ok(ids) = self.news.take_new(self.inbox).await
-                    && !ids.is_empty()
-                {
+                if changed > 0 {
+                    // Con ids vacíos el informe solo sirve para que la interfaz se refresque
+                    // (p. ej. tras la primera sincronización de una cuenta nueva).
+                    let ids = self.news.take_new(self.inbox).await.unwrap_or_default();
                     let _ = notices
                         .send(SyncNotice::NewMessages(SyncReport {
                             account: self.account,
@@ -120,8 +120,20 @@ impl Shared {
                     new_messages: changed,
                 }
             }
-            Err(Error::Auth(_)) => Event::AuthFailed,
-            Err(_) => Event::SyncFailed,
+            Err(Error::Auth(e)) => {
+                eprintln!(
+                    "correo-sync: cuenta {}: autenticación rechazada: {e}",
+                    self.account
+                );
+                Event::AuthFailed
+            }
+            Err(e) => {
+                eprintln!(
+                    "correo-sync: cuenta {}: la sincronización falló: {e}",
+                    self.account
+                );
+                Event::SyncFailed
+            }
         }
     }
 

@@ -324,6 +324,30 @@ fn http_client() -> Result<reqwest::Client> {
         .map_err(|e| Error::Network(format!("cliente HTTP: {e}")))
 }
 
+/// Motivo legible de un error de la API (Google: `error.message`/`status`; Graph: `error.message`).
+/// Se recorta para no volcar cuerpos largos en los logs.
+fn api_error_hint(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let err = &v["error"];
+    let message = err["message"].as_str().unwrap_or_default();
+    let reason = err["status"]
+        .as_str()
+        .or_else(|| err["errors"][0]["reason"].as_str())
+        .unwrap_or_default();
+    let disabled = body.contains("SERVICE_DISABLED") || body.contains("accessNotConfigured");
+    let mut out = String::new();
+    if !reason.is_empty() || !message.is_empty() {
+        let short: String = message.chars().take(200).collect();
+        out.push_str(&format!(" ({reason}: {short})"));
+    }
+    if disabled {
+        out.push_str(" — activa la API de contactos en el proyecto de Google Cloud");
+    }
+    out
+}
+
 async fn get_json<T: DeserializeOwned>(
     http: &reqwest::Client,
     token: &str,
@@ -346,8 +370,10 @@ async fn get_json<T: DeserializeOwned>(
         ));
     }
     if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
         return Err(Error::Network(format!(
-            "el proveedor respondió {status} al pedir contactos"
+            "el proveedor respondió {status} al pedir contactos{}",
+            api_error_hint(&detail)
         )));
     }
 
@@ -816,5 +842,29 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name.as_deref(), Some("Ana Pérez"));
+    }
+}
+
+#[cfg(test)]
+mod error_hint_tests {
+    use super::api_error_hint;
+
+    #[test]
+    fn google_disabled_api_explains_how_to_fix_it() {
+        let body = r#"{"error":{"code":403,"message":"People API has not been used in project 123 before or it is disabled.","status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}"#;
+        let hint = api_error_hint(body);
+        assert!(hint.contains("PERMISSION_DENIED"));
+        assert!(hint.contains("activa la API"));
+    }
+
+    #[test]
+    fn insufficient_scope_shows_the_provider_message() {
+        let body = r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED"}}"#;
+        assert!(api_error_hint(body).contains("insufficient authentication scopes"));
+    }
+
+    #[test]
+    fn non_json_bodies_add_nothing() {
+        assert_eq!(api_error_hint("<html>boom</html>"), "");
     }
 }
