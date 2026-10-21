@@ -88,7 +88,7 @@ Yo (orquestador, Sonnet) defino interfaces (traits y tipos en `correo-core`), re
   - Red de pago (`NetworkMonitor::is_network_metered`): no se descargan adjuntos ni imágenes automáticamente.
   - Sin red: se suspende todo y se reanuda al volver (señal `network-changed`), sin reintentos en bucle.
   - Al suspender y reanudar el equipo, resincronización inmediata de la bandeja de entrada.
-- **Objetivos medibles** (se verifican en T14): menos de 60 MB de RSS en reposo con 2 cuentas, 0 % de CPU en reposo, y sin despertares periódicos por debajo de 1 por minuto.
+- **Objetivos medibles** (se verifican en T14): menos de 60 MB de memoria propia (RssAnon, sin contar librerías compartidas de GTK) en reposo con 2 cuentas, 0 % de CPU en reposo, y sin despertares periódicos por debajo de 1 por minuto.
 
 Impacto en tareas: **T6** pasa a incluir IDLE, backoff y política de intervalos (módulo `SyncScheduler` testeable con reloj simulado); **T13** incluye las notificaciones y el modo residente; nueva **T13b** integra `PowerProfileMonitor`/`NetworkMonitor` con el planificador; **T14** incluye la medición de consumo (`powertop`/`perf`).
 

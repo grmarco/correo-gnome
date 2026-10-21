@@ -374,18 +374,30 @@ async fn persist_account(
     tokens: TokenSet,
     oauth: OAuthProvider,
 ) -> Result<Account> {
-    let account_id = {
+    let existing = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        let duplicated = guard
+        guard
             .list_accounts()?
-            .iter()
-            .any(|a| a.email.eq_ignore_ascii_case(&profile.email));
-        if duplicated {
+            .into_iter()
+            .find(|a| a.email.eq_ignore_ascii_case(&profile.email))
+    };
+    match existing {
+        // Misma cuenta: es una reautorización; se conserva su id y su caché.
+        Some(a) if a.provider == provider => {
+            let tokens_store = OAuthTokenProvider::new(OAuthClient::new(oauth)?, token_store()?);
+            tokens_store.save_tokens(a.id, &tokens).await?;
+            return Ok(a);
+        }
+        Some(_) => {
             return Err(Error::Store(format!(
-                "ya existe una cuenta para {}",
+                "ya existe una cuenta para {} con otro proveedor",
                 profile.email
             )));
         }
+        None => {}
+    }
+    let account_id = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         guard.create_account(&Account {
             id: 0,
             provider,

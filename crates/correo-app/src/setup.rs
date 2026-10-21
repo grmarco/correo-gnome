@@ -28,7 +28,7 @@ use correo_core::{AccessToken, AccountId, Error, Provider, Result, TokenAudience
 use correo_store::Store;
 use gtk::glib;
 
-use crate::services::Services;
+use crate::services::{ForgetTokens, Services};
 use config::Config;
 
 /// Identificador de la aplicación en el keyring (atributo `application`).
@@ -50,14 +50,25 @@ pub fn token_store() -> Result<Arc<dyn TokenStore>> {
         .ok_or_else(|| Error::Store("los servicios no están iniciados".into()))
 }
 
-/// Configuración OAuth del proveedor, o `None` si falta su client ID.
+/// Configuración OAuth del proveedor, o `None` si falta su client ID. Si hay client secret
+/// configurado (Google lo suele exigir), se añade a las peticiones de token.
 pub fn oauth_config(provider: Provider) -> Option<OAuthProvider> {
     let cfg = app_config();
     match provider {
-        Provider::Gmail => cfg.google_client_id().map(OAuthProvider::google),
-        Provider::Outlook | Provider::Microsoft365 => {
-            cfg.microsoft_client_id().map(OAuthProvider::microsoft)
-        }
+        Provider::Gmail => cfg.google_client_id().map(|id| {
+            let provider = OAuthProvider::google(id);
+            match cfg.google_client_secret() {
+                Some(secret) => provider.with_client_secret(secret),
+                None => provider,
+            }
+        }),
+        Provider::Outlook | Provider::Microsoft365 => cfg.microsoft_client_id().map(|id| {
+            let provider = OAuthProvider::microsoft(id);
+            match cfg.microsoft_client_secret() {
+                Some(secret) => provider.with_client_secret(secret),
+                None => provider,
+            }
+        }),
         Provider::Imap => None,
     }
 }
@@ -82,19 +93,36 @@ pub fn init_services() -> std::result::Result<Services, Box<dyn StdError>> {
 
     // Segunda conexión a la misma BD: el enrutador de tokens necesita el proveedor de
     // cada cuenta y `Services` toma la suya por valor.
+    let google = oauth_provider_for(oauth_config(Provider::Gmail), &token_store)?;
+    let microsoft = oauth_provider_for(oauth_config(Provider::Microsoft365), &token_store)?;
+    let forget = forget_tokens_hook(Arc::clone(&token_store), google.clone(), microsoft.clone());
     let router = TokenRouter {
         accounts: Mutex::new(Store::open(&db_path)?),
-        google: oauth_provider_for(
-            cfg.google_client_id().map(OAuthProvider::google),
-            &token_store,
-        )?,
-        microsoft: oauth_provider_for(
-            cfg.microsoft_client_id().map(OAuthProvider::microsoft),
-            &token_store,
-        )?,
+        google,
+        microsoft,
     };
 
-    Ok(Services::new(store, Arc::new(router))?)
+    Ok(Services::new(store, Arc::new(router))?.with_forget_tokens(forget))
+}
+
+/// Borra el refresh token de la cuenta en el almacén y su caché en memoria (si hay proveedor
+/// OAuth configurado, el proveedor la limpia; si no, solo el almacén).
+fn forget_tokens_hook(
+    store: Arc<dyn TokenStore>,
+    google: Option<Arc<OAuthTokenProvider>>,
+    microsoft: Option<Arc<OAuthTokenProvider>>,
+) -> ForgetTokens {
+    Arc::new(move |account| {
+        let store = Arc::clone(&store);
+        // Ambos proveedores comparten el almacén; la caché en memoria solo existe en el suyo.
+        let provider = google.clone().or_else(|| microsoft.clone());
+        Box::pin(async move {
+            match provider {
+                Some(p) => p.remove_account(account).await,
+                None => store.delete_refresh_token(account).await,
+            }
+        })
+    })
 }
 
 fn db_path() -> std::io::Result<PathBuf> {

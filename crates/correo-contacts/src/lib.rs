@@ -3,7 +3,7 @@
 //! Cada fuente produce `Contact`s (uno por email). `sync_into_store` los
 //! vuelca en la caché SQLite de `correo-store` para el autocompletado.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,8 @@ use serde::de::DeserializeOwned;
 
 const GOOGLE_BASE: &str = "https://people.googleapis.com";
 const MICROSOFT_BASE: &str = "https://graph.microsoft.com";
+/// Límite de páginas por listado: evita bucles infinitos o servidores que no terminan.
+const MAX_PAGES: usize = 100;
 
 /// Contactos de Google: `people/me/connections` y `otherContacts`.
 pub struct GoogleContacts {
@@ -75,7 +77,9 @@ impl ContactSource for GoogleContacts {
 
         for (url, params) in sources {
             let mut page_token: Option<String> = None;
+            let mut pages = Pagination::default();
             loop {
+                pages.count_page()?;
                 let mut query = params.clone();
                 if let Some(t) = page_token.as_deref() {
                     query.push(("pageToken", t));
@@ -84,6 +88,9 @@ impl ContactSource for GoogleContacts {
                 let next = next_token(page_token.as_deref(), page.next_page_token.take());
                 out.extend(page.into_contacts());
                 match next {
+                    Some(t) if pages.seen_before(&t) => {
+                        return Err(Error::Protocol("paginación de contactos repetida".into()));
+                    }
                     Some(t) => page_token = Some(t),
                     None => break,
                 }
@@ -107,6 +114,8 @@ impl ContactSource for MicrosoftContacts {
 
         let first_url = format!("{base}/v1.0/me/contacts");
         let first_query = [("$select", "displayName,emailAddresses"), ("$top", "999")];
+        let mut pages = Pagination::default();
+        pages.count_page()?;
         let mut page: GraphPage = get_json(&http, &token.0, &first_url, &first_query).await?;
         loop {
             let next = page.next_link.take();
@@ -120,6 +129,10 @@ impl ContactSource for MicrosoftContacts {
                     "enlace de paginación fuera del servidor configurado".into(),
                 ));
             }
+            if pages.seen_before(&next) {
+                return Err(Error::Protocol("paginación de contactos repetida".into()));
+            }
+            pages.count_page()?;
             page = get_json(&http, &token.0, &next, &[]).await?;
         }
 
@@ -271,6 +284,32 @@ fn dedupe(contacts: Vec<Contact>) -> Vec<Contact> {
 /// Siguiente `pageToken`; corta el bucle si el servidor repite el anterior.
 fn next_token(current: Option<&str>, next: Option<String>) -> Option<String> {
     next.filter(|t| !t.is_empty() && Some(t.as_str()) != current)
+}
+
+/// Control de un listado paginado: cuenta páginas y recuerda los enlaces/tokens ya vistos,
+/// para detectar tanto un servidor que no termina como un ciclo de enlaces.
+#[derive(Default)]
+struct Pagination {
+    pages: usize,
+    seen: HashSet<String>,
+}
+
+impl Pagination {
+    /// Registra una página que va a pedirse; error si se supera `MAX_PAGES`.
+    fn count_page(&mut self) -> Result<()> {
+        self.pages += 1;
+        if self.pages > MAX_PAGES {
+            return Err(Error::Protocol(format!(
+                "más de {MAX_PAGES} páginas de contactos"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `true` si este enlace o token ya se había recibido (ciclo).
+    fn seen_before(&mut self, key: &str) -> bool {
+        !self.seen.insert(key.to_owned())
+    }
 }
 
 fn http_client() -> Result<reqwest::Client> {
@@ -663,6 +702,67 @@ mod tests {
         let source = MicrosoftContacts {
             base_url: base,
             ..MicrosoftContacts::new(1, good_token())
+        };
+        assert!(matches!(source.sync().await, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn graph_next_link_cycle_is_rejected() {
+        // Cada página apunta a la misma siguiente: sin detección sería un bucle infinito.
+        let base = fake_server(|base, _| {
+            (
+                200,
+                format!(
+                    r#"{{"value": [], "@odata.nextLink": "{base}/v1.0/me/contacts?$skiptoken=a"}}"#
+                ),
+            )
+        })
+        .await;
+        let source = MicrosoftContacts {
+            base_url: base,
+            ..MicrosoftContacts::new(1, good_token())
+        };
+        assert!(matches!(source.sync().await, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn graph_listing_stops_after_page_limit() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let base = fake_server(move |base, _| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                200,
+                format!(r#"{{"value": [], "@odata.nextLink": "{base}/v1.0/me/contacts?$skiptoken=p{n}"}}"#),
+            )
+        })
+        .await;
+        let source = MicrosoftContacts {
+            base_url: base,
+            ..MicrosoftContacts::new(1, good_token())
+        };
+        assert!(matches!(source.sync().await, Err(Error::Protocol(_))));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_PAGES
+        );
+    }
+
+    #[tokio::test]
+    async fn google_token_cycle_is_rejected() {
+        // a -> b -> a: el token repetido no es el inmediatamente anterior, pero sigue siendo un ciclo.
+        let base = fake_server(|_, target| {
+            let next = if target.contains("pageToken=a") {
+                "b"
+            } else {
+                "a"
+            };
+            (200, format!(r#"{{"nextPageToken": "{next}"}}"#))
+        })
+        .await;
+        let source = GoogleContacts {
+            base_url: base,
+            ..GoogleContacts::new(1, good_token())
         };
         assert!(matches!(source.sync().await, Err(Error::Protocol(_))));
     }

@@ -117,8 +117,12 @@ impl OAuthTokenProvider {
         };
         if let Some(rotated) = tokens.refresh_token.as_deref()
             && rotated != refresh_token
+            && let Err(e) = self.store.save_refresh_token(account, rotated).await
         {
-            self.store.save_refresh_token(account, rotated).await?;
+            // El access token recién obtenido sigue siendo válido: no se descarta por esto.
+            eprintln!(
+                "correo-auth: no se pudo guardar el refresh token rotado de la cuenta {account}: {e}"
+            );
         }
 
         let fresh = CachedToken::from_tokens(&tokens);
@@ -340,5 +344,35 @@ mod tests {
         assert!(!requests[0].contains("graph.microsoft.com"));
         assert!(requests[1].contains("graph.microsoft.com"));
         assert!(!requests[1].contains("outlook.office.com"));
+    }
+
+    /// Almacén que lee bien pero no puede guardar (p. ej. el keyring está bloqueado).
+    struct RotationNotSavedStore {
+        refresh: String,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenStore for RotationNotSavedStore {
+        async fn load_refresh_token(&self, _account: AccountId) -> Result<Option<String>> {
+            Ok(Some(self.refresh.clone()))
+        }
+        async fn save_refresh_token(&self, _account: AccountId, _token: &str) -> Result<()> {
+            Err(Error::Store("almacén bloqueado".into()))
+        }
+        async fn delete_refresh_token(&self, _account: AccountId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn access_token_is_returned_even_if_rotated_refresh_token_cannot_be_saved() {
+        let server = FakeServer::start(vec![(200, token_json("fresh", Some("rt-2"), 3600))]).await;
+        let store = Arc::new(RotationNotSavedStore {
+            refresh: "rt-1".into(),
+        });
+        let mut config = OAuthProvider::google("cid");
+        config.token_url = server.url.clone();
+        let provider = OAuthTokenProvider::new(OAuthClient::new(config).unwrap(), store);
+        assert_eq!(provider.access_token(ACCOUNT).await.unwrap().0, "fresh");
     }
 }

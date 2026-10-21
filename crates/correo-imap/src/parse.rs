@@ -121,6 +121,17 @@ pub fn same_flags(a: &Flags, b: &Flags) -> bool {
     a.seen == b.seen && a.flagged == b.flagged && a.answered == b.answered && a.draft == b.draft
 }
 
+// ----- UIDVALIDITY -------------------------------------------------------
+
+/// Decide si la UIDVALIDITY del servidor invalida la caché de la carpeta.
+///
+/// Solo hay cambio cuando ambos valores existen y difieren: sin valor guardado
+/// no hay nada que invalidar, y sin valor del servidor no se puede comparar.
+/// Si cambió, los UID cacheados ya no apuntan a los mismos mensajes.
+pub fn uid_validity_changed(stored: Option<u32>, server: Option<u32>) -> bool {
+    matches!((stored, server), (Some(old), Some(new)) if old != new)
+}
+
 // ----- Conjuntos de UID y planificación de sync -------------------------
 
 /// Convierte UIDs en un conjunto IMAP compacto, p. ej. `1:3,7,9:10`.
@@ -134,7 +145,7 @@ pub fn uid_set(uids: &[u32]) -> String {
     while i < sorted.len() {
         let start = sorted[i];
         let mut end = start;
-        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+        while i + 1 < sorted.len() && end.checked_add(1) == Some(sorted[i + 1]) {
             i += 1;
             end = sorted[i];
         }
@@ -304,14 +315,20 @@ fn mail_addr(a: &Addr<'_>) -> Option<Address> {
         return None;
     }
     Some(Address {
-        name: a
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(str::to_owned),
+        name: a.name.as_deref().and_then(clean_name),
         email: email.to_owned(),
     })
+}
+
+/// Nombre para mostrar sin caracteres de control (CR/LF incluidos), recortado.
+/// Los caracteres de control se sustituyen por espacio; si queda vacío, `None`.
+pub fn clean_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn fill_from_envelope(h: &mut MessageHeader, env: &Envelope<'_>) {
@@ -336,8 +353,7 @@ fn envelope_addresses(list: Option<&[imap_proto::Address<'_>]>) -> Vec<Address> 
             let name = a
                 .name
                 .as_deref()
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .filter(|n| !n.trim().is_empty());
+                .and_then(|n| clean_name(&String::from_utf8_lossy(n)));
             Some(Address {
                 name,
                 email: format!("{mailbox}@{host}"),
@@ -553,6 +569,39 @@ JVBERi0xLjQK\r\n\
         assert_eq!(uid_set(&[]), "");
         assert_eq!(uid_set(&[5]), "5");
         assert_eq!(uid_set(&[9, 1, 2, 3, 7, 10, 3]), "1:3,7,9:10");
+    }
+
+    #[test]
+    fn uid_set_handles_max_uid_without_overflow() {
+        assert_eq!(uid_set(&[u32::MAX]), "4294967295");
+        assert_eq!(uid_set(&[u32::MAX - 1, u32::MAX]), "4294967294:4294967295");
+        assert_eq!(uid_set(&[0, u32::MAX]), "0,4294967295");
+    }
+
+    #[test]
+    fn uid_validity_change_is_detected_only_when_both_known() {
+        assert!(uid_validity_changed(Some(1), Some(2)));
+        assert!(!uid_validity_changed(Some(7), Some(7)));
+        // Sin valor guardado no hay caché que invalidar.
+        assert!(!uid_validity_changed(None, Some(2)));
+        // Sin valor del servidor no hay nada que comparar.
+        assert!(!uid_validity_changed(Some(1), None));
+        assert!(!uid_validity_changed(None, None));
+    }
+
+    #[test]
+    fn control_chars_in_addresses_are_replaced_and_trimmed() {
+        let a = Addr {
+            name: Some("  Ana\r\nPérez\t".into()),
+            address: Some("ana@example.com".into()),
+        };
+        let got = mail_addr(&a).unwrap();
+        assert_eq!(got.name.as_deref(), Some("Ana  Pérez"));
+        let blank = Addr {
+            name: Some("\r\n ".into()),
+            address: Some("x@example.com".into()),
+        };
+        assert_eq!(mail_addr(&blank).unwrap().name, None);
     }
 
     #[test]

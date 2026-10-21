@@ -9,7 +9,9 @@ mod runner;
 mod scheduler;
 
 pub use clock::{Clock, FakeClock, SystemClock};
-pub use runner::{IdleBackend, NewMessageIds, SIN_IDLE, SyncChannels, SyncReport, SyncRunner};
+pub use runner::{
+    IdleBackend, NewMessageIds, SIN_IDLE, SyncChannels, SyncNotice, SyncReport, SyncRunner,
+};
 pub use scheduler::{
     Action, Conditions, Event, IDLE_MAX, Jitter, Network, Policy, SyncScheduler, backoff_delay,
 };

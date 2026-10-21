@@ -4,6 +4,10 @@
 
 use std::collections::HashSet;
 
+/// Profundidad máxima de cita y de sangría. Acota el número de marcas de cita, la margen del
+/// párrafo y el coste de construir el `TextBuffer` ante mensajes con anidamiento absurdo.
+pub const MAX_LEVEL: u32 = 8;
+
 /// Marcas de formato aplicadas a un fragmento de texto.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Style {
@@ -196,7 +200,7 @@ fn strip_quote(line: &str) -> (u32, &str) {
     if level == 0 {
         return (0, line);
     }
-    (level, rest.strip_prefix(' ').unwrap_or(rest))
+    (level.min(MAX_LEVEL), rest.strip_prefix(' ').unwrap_or(rest))
 }
 
 /// Separa el texto en segmentos, convirtiendo las URL en enlaces.
@@ -420,7 +424,7 @@ struct Converter {
 impl Converter {
     fn style(&self) -> Style {
         let mut s = Style {
-            indent: self.lists.len() as u32,
+            indent: depth(self.lists.len()),
             ..Style::default()
         };
         for open in &self.stack {
@@ -434,7 +438,7 @@ impl Converter {
                     s.heading = true;
                     s.bold = true;
                 }
-                "blockquote" => s.quote += 1,
+                "blockquote" => s.quote = (s.quote + 1).min(MAX_LEVEL),
                 "a" if open.href.is_some() => s.link = open.href.clone(),
                 _ => {}
             }
@@ -536,7 +540,7 @@ impl Converter {
             "• ".to_string()
         };
         let style = Style {
-            indent: self.lists.len() as u32,
+            indent: depth(self.lists.len()),
             ..Style::default()
         };
         self.para.push(Segment::Text {
@@ -564,6 +568,58 @@ impl Converter {
             self.end_para();
         }
     }
+}
+
+fn depth(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX).min(MAX_LEVEL)
+}
+
+/// Host de una URL `http`/`https` en minúsculas (sin usuario, puerto ni ruta).
+pub fn host_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = host_port.split(':').next()?.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Dominio que aparenta el texto visible de un enlace: una URL o un dominio desnudo
+/// (`www.banco.es/x`). Las palabras sueltas, versiones («v2.0») y otros textos dan `None`.
+pub fn shown_host(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return None;
+    }
+    if text.contains("://") {
+        return host_of(text);
+    }
+    let host = text.split(['/', '?', '#']).next()?.trim_end_matches('.');
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last()?;
+    let valid = labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && tld.len() >= 2
+        && tld.chars().all(|c| c.is_ascii_alphabetic());
+    valid.then(|| host.to_ascii_lowercase())
+}
+
+/// `true` si el texto visible aparenta un dominio distinto del destino real del enlace.
+/// Un destino sin host (p. ej. `mailto:`) con texto que parece web también se marca.
+pub fn link_looks_deceptive(shown: &str, href: &str) -> bool {
+    let Some(shown) = shown_host(shown) else {
+        return false;
+    };
+    let Some(target) = host_of(href) else {
+        return true;
+    };
+    !(target == shown
+        || target.ends_with(&format!(".{shown}"))
+        || shown.ends_with(&format!(".{target}")))
 }
 
 fn convert(clean_html: &str) -> Vec<Segment> {
@@ -789,5 +845,100 @@ mod tests {
                 Segment::Paragraph,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod depth_and_link_tests {
+    use super::*;
+
+    #[test]
+    fn plain_quote_depth_is_capped() {
+        let line = format!("{} texto", ">".repeat(100_000));
+        let segs = plain_to_segments(&line);
+        let Segment::Text { style, .. } = &segs[0] else {
+            panic!("se esperaba texto");
+        };
+        assert_eq!(style.quote, MAX_LEVEL);
+    }
+
+    #[test]
+    fn nested_blockquotes_and_lists_are_capped() {
+        let html = "<blockquote>".repeat(50) + "hondo" + &"</blockquote>".repeat(50);
+        let segs = html_to_segments(&html);
+        let quoted = segs
+            .iter()
+            .find_map(|s| match s {
+                Segment::Text { text, style } if text == "hondo" => Some(style.clone()),
+                _ => None,
+            })
+            .expect("texto presente");
+        assert_eq!(quoted.quote, MAX_LEVEL);
+
+        let lists = "<ul><li>".repeat(40) + "x";
+        let segs = html_to_segments(&lists);
+        assert!(segs.iter().all(|s| match s {
+            Segment::Text { style, .. } => style.indent <= MAX_LEVEL,
+            Segment::Paragraph => true,
+        }));
+    }
+
+    #[test]
+    fn host_of_extracts_real_destination() {
+        assert_eq!(
+            host_of("https://User@Evil.Example:8443/x?y=1").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(
+            host_of("HTTP://example.org").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(host_of("mailto:ana@example.org"), None);
+        assert_eq!(host_of("javascript://x"), None);
+    }
+
+    #[test]
+    fn shown_host_recognises_domains_only() {
+        assert_eq!(
+            shown_host("www.banco.es/login").as_deref(),
+            Some("www.banco.es")
+        );
+        assert_eq!(
+            shown_host("https://banco.es/x").as_deref(),
+            Some("banco.es")
+        );
+        assert_eq!(shown_host("aquí"), None);
+        assert_eq!(shown_host("pulsa aquí"), None);
+        assert_eq!(shown_host("v2.0"), None);
+        assert_eq!(shown_host("ana@example.org"), None);
+    }
+
+    #[test]
+    fn deceptive_links_are_detected() {
+        // Texto con dominio distinto del destino.
+        assert!(link_looks_deceptive(
+            "https://www.paypal.com",
+            "https://paypal.com.evil.example/login"
+        ));
+        assert!(link_looks_deceptive("banco.es", "http://phish.example/"));
+        assert!(link_looks_deceptive("https://banco.es", "mailto:x@y.z"));
+        // Mismo dominio o subdominio: no se pregunta.
+        assert!(!link_looks_deceptive(
+            "https://example.org/a",
+            "https://example.org/b"
+        ));
+        assert!(!link_looks_deceptive(
+            "example.org",
+            "https://www.example.org/"
+        ));
+        assert!(!link_looks_deceptive(
+            "secure.example.org",
+            "https://example.org/"
+        ));
+        // Texto normal no es un dominio.
+        assert!(!link_looks_deceptive(
+            "pulsa aquí",
+            "https://phish.example/"
+        ));
     }
 }

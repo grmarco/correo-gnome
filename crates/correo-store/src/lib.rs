@@ -19,7 +19,8 @@ use serde::de::DeserializeOwned;
 /// Migraciones en orden. La versión de esquema es `user_version` = número
 /// de migraciones aplicadas. Nunca editar una migración ya publicada: añadir
 /// una nueva al final.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
     CREATE TABLE accounts (
         id           INTEGER PRIMARY KEY,
         provider     TEXT NOT NULL,
@@ -82,7 +83,70 @@ const MIGRATIONS: &[&str] = &[r#"
         subject, sender, snippet, body,
         tokenize = 'unicode61 remove_diacritics 2'
     );
-"#];
+"#,
+    r#"
+    -- v2: AUTOINCREMENT en accounts, mailboxes y messages para que un id borrado no se
+    -- reutilice (la UI y el FTS guardan ids). Se recrean copiando los datos con sus ids.
+    -- Requiere claves foráneas desactivadas: `migrate` lo hace fuera de la transacción.
+    CREATE TABLE accounts_v2 (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider     TEXT NOT NULL,
+        email        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        display_name TEXT NOT NULL DEFAULT '',
+        sync_days    INTEGER NOT NULL DEFAULT 30
+    );
+    INSERT INTO accounts_v2 (id, provider, email, display_name, sync_days)
+        SELECT id, provider, email, display_name, sync_days FROM accounts;
+    DROP TABLE accounts;
+    ALTER TABLE accounts_v2 RENAME TO accounts;
+
+    CREATE TABLE mailboxes_v2 (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        path         TEXT NOT NULL,
+        role         TEXT NOT NULL,
+        uid_validity INTEGER,
+        unread       INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (account_id, path)
+    );
+    INSERT INTO mailboxes_v2 (id, account_id, path, role, uid_validity, unread)
+        SELECT id, account_id, path, role, uid_validity, unread FROM mailboxes;
+    DROP TABLE mailboxes;
+    ALTER TABLE mailboxes_v2 RENAME TO mailboxes;
+
+    CREATE TABLE messages_v2 (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        mailbox_id      INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+        uid             INTEGER NOT NULL,
+        message_id      TEXT,
+        in_reply_to     TEXT,
+        references_json TEXT NOT NULL DEFAULT '[]',
+        subject         TEXT NOT NULL DEFAULT '',
+        from_json       TEXT NOT NULL DEFAULT '[]',
+        to_json         TEXT NOT NULL DEFAULT '[]',
+        cc_json         TEXT NOT NULL DEFAULT '[]',
+        date            INTEGER NOT NULL,
+        seen            INTEGER NOT NULL DEFAULT 0,
+        flagged         INTEGER NOT NULL DEFAULT 0,
+        answered        INTEGER NOT NULL DEFAULT 0,
+        draft           INTEGER NOT NULL DEFAULT 0,
+        has_attachments INTEGER NOT NULL DEFAULT 0,
+        snippet         TEXT,
+        labels_json     TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (mailbox_id, uid)
+    );
+    INSERT INTO messages_v2 (id, mailbox_id, uid, message_id, in_reply_to, references_json,
+        subject, from_json, to_json, cc_json, date, seen, flagged, answered, draft,
+        has_attachments, snippet, labels_json)
+        SELECT id, mailbox_id, uid, message_id, in_reply_to, references_json,
+        subject, from_json, to_json, cc_json, date, seen, flagged, answered, draft,
+        has_attachments, snippet, labels_json FROM messages;
+    DROP TABLE messages;
+    ALTER TABLE messages_v2 RENAME TO messages;
+    CREATE INDEX messages_by_date ON messages (mailbox_id, date DESC);
+    CREATE INDEX messages_by_message_id ON messages (message_id);
+"#,
+];
 
 /// Columnas de `messages` en el orden que espera `header_from_row`.
 const HEADER_COLS: &str = "id, mailbox_id, uid, message_id, in_reply_to, references_json, \
@@ -192,6 +256,9 @@ impl Store {
     }
 
     /// Borra la cuenta con sus carpetas, cabeceras, cuerpos y entradas FTS.
+    ///
+    /// Solo afecta a la caché: el refresh token de la cuenta vive en el almacén de
+    /// credenciales y lo borra el llamador (p. ej. `Services::remove_account`).
     pub fn delete_account(&self, id: AccountId) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(se)?;
         fts_remove_where(
@@ -590,9 +657,28 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             MIGRATIONS.len()
         )));
     }
+    // Las migraciones que recrean tablas con FK activas borrarían en cascada los datos
+    // hijos. SQLite exige desactivar `foreign_keys` fuera de la transacción.
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(se)?;
+    let applied = apply_migrations(conn, current);
+    conn.pragma_update(None, "foreign_keys", true).map_err(se)?;
+    applied
+}
+
+fn apply_migrations(conn: &mut Connection, current: usize) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
         let tx = conn.transaction().map_err(se)?;
         tx.execute_batch(sql).map_err(se)?;
+        {
+            let mut check = tx.prepare("PRAGMA foreign_key_check").map_err(se)?;
+            if check.exists([]).map_err(se)? {
+                return Err(Error::Store(format!(
+                    "la migración v{} deja claves foráneas inconsistentes",
+                    i + 1
+                )));
+            }
+        }
         tx.pragma_update(None, "user_version", i + 1).map_err(se)?;
         tx.commit().map_err(se)?;
     }
@@ -1388,6 +1474,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// Esquema v1 con datos; `migrate` debe conservar ids, cuerpos y FTS, y los ids
+    /// borrados después de migrar no deben reutilizarse.
+    #[test]
+    fn migration_2_keeps_data_and_ids_and_never_reuses_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, provider, email, display_name, sync_days) VALUES \
+                (1, 'gmail', 'a@example.com', 'A', 30), (2, 'gmail', 'b@example.com', 'B', 30);
+             INSERT INTO mailboxes (id, account_id, path, role) VALUES (5, 1, 'INBOX', 'inbox');
+             INSERT INTO messages (id, mailbox_id, uid, subject, date) \
+                VALUES (9, 5, 1, 'migracion conservada', 1);
+             INSERT INTO bodies (message_id, body_json, search_text) VALUES (9, '{}', '');
+             INSERT INTO messages_fts (rowid, subject, sender, snippet, body) \
+                VALUES (9, 'migracion conservada', '', '', '');",
+        )
+        .unwrap();
+
+        let mut store = Store { conn };
+        migrate(&mut store.conn).unwrap();
+
+        assert_eq!(store.get_account(1).unwrap().email, "a@example.com");
+        assert_eq!(store.get_account(2).unwrap().email, "b@example.com");
+        assert_eq!(store.get_mailbox(5).unwrap().path, "INBOX");
+        assert_eq!(store.search_messages("conservada", 10).unwrap().len(), 1);
+        let fk: i64 = store
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "las FK vuelven a estar activas");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // El id máximo borrado tras migrar no vuelve a asignarse.
+        store.delete_account(2).unwrap();
+        let next = new_account(&store, "c@example.com");
+        assert_eq!(next, 3);
     }
 
     #[test]

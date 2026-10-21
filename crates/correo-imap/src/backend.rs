@@ -20,10 +20,10 @@ use correo_store::Store;
 use futures::TryStreamExt;
 use tokio::sync::{MappedMutexGuard, Mutex as AsyncMutex, MutexGuard};
 
-use crate::conn::{self, Conn, is_network, map_imap_error};
+use crate::conn::{self, Conn, OP_TIMEOUT, imap, is_network, map_imap_error, timeout_error};
 use crate::parse::{
     self, BATCH_SIZE, FetchMeta, attachment_contents, attribute_strings, flags_from, imap_date,
-    mailbox_role, parse_body, plan_sync, same_flags, today_days, uid_set,
+    mailbox_role, parse_body, plan_sync, same_flags, today_days, uid_set, uid_validity_changed,
 };
 
 pub const GMAIL_HOST: &str = "imap.gmail.com";
@@ -32,6 +32,18 @@ pub const IMAPS_PORT: u16 = 993;
 
 /// Duración máxima de una espera IDLE; los servidores suelen cortarla hacia los 29 min.
 pub const IDLE_MAX: Duration = Duration::from_secs(25 * 60);
+
+/// Margen sobre `IDLE_MAX` para el tope externo de toda la espera IDLE
+/// (conexión propia incluida).
+pub const IDLE_GRACE: Duration = Duration::from_secs(30);
+
+/// Ventana máxima de sincronización en días; evita SEARCH con fechas absurdas.
+pub const MAX_SYNC_DAYS: u32 = 3650;
+
+/// Días de ventana efectivos para una cuenta.
+pub fn effective_sync_days(days: u32) -> u32 {
+    days.min(MAX_SYNC_DAYS)
+}
 
 /// Resultado de una espera IDLE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,23 +156,64 @@ impl ImapBackend {
         }
     }
 
+    /// Ejecuta una operación que no se reintenta (APPEND, COPY): si falla por
+    /// red descarta la sesión y devuelve el error tal cual.
+    async fn attempt<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
+        let res = op.await;
+        if matches!(&res, Err(e) if is_network(e)) {
+            self.reset().await;
+        }
+        res
+    }
+
+    /// SELECT de `mailbox` en `conn` con la comprobación de UIDVALIDITY: si el
+    /// servidor cambió la carpeta, la caché se borra y la acción no se ejecuta.
+    async fn select_checked(&self, mailbox: &Mailbox, conn: &mut Conn) -> Result<()> {
+        let selected = imap(OP_TIMEOUT, conn.session.select(&mailbox.path)).await?;
+        self.guard_uid_validity(mailbox, selected.uid_validity)
+    }
+
+    fn guard_uid_validity(&self, mailbox: &Mailbox, server: Option<u32>) -> Result<()> {
+        let stored = self.with_store(|s| s.get_mailbox(mailbox.id))?;
+        if !uid_validity_changed(stored.uid_validity, server) {
+            return Ok(());
+        }
+        self.with_store(|s| s.wipe_mailbox(mailbox.id))?;
+        let state = Mailbox {
+            uid_validity: server,
+            ..stored
+        };
+        self.with_store(|s| s.upsert_mailbox(&state))?;
+        Err(Error::Protocol(
+            "la carpeta cambió; vuelve a sincronizar".into(),
+        ))
+    }
+
     /// Espera IDLE sobre `mailbox` en una conexión propia (IDLE bloquea la sesión
     /// de operaciones). Devuelve al haber cambios o al expirar `max`. La
     /// conexión se descarta al terminar; el planificador decide cuándo reiniciar.
     ///
     /// Si el servidor no anuncia IDLE devuelve `Error::Protocol("sin IDLE")`.
     pub async fn idle_inbox(&self, mailbox: &Mailbox, max: Duration) -> Result<IdleEvent> {
+        let limit = max + IDLE_GRACE;
+        match tokio::time::timeout(limit, self.idle_once(mailbox, max)).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.reset().await;
+                Err(timeout_error(limit))
+            }
+        }
+    }
+
+    async fn idle_once(&self, mailbox: &Mailbox, max: Duration) -> Result<IdleEvent> {
         let mut conn = self.connect().await?;
         if !conn.caps.idle {
             return Err(Error::Protocol("sin IDLE".into()));
         }
-        conn.session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
+        imap(OP_TIMEOUT, conn.session.select(&mailbox.path)).await?;
 
         let mut handle = conn.session.idle();
-        handle.init().await.map_err(map_imap_error)?;
+        imap(OP_TIMEOUT, handle.init()).await?;
 
         let outcome = {
             let (wait, _stop) = handle.wait_with_timeout(max);
@@ -186,16 +239,19 @@ impl ImapBackend {
             .into_iter()
             .find(|m| m.role == MailboxRole::Sent)
             .ok_or_else(|| Error::NotFound(format!("carpeta de Enviados de {}", self.email)))?;
-        self.retry(|| self.append_once(&sent, raw)).await
+        // APPEND no se reintenta: tras un corte no se sabe si el mensaje llegó.
+        self.attempt(self.append_once(&sent, raw)).await
     }
 
     async fn append_once(&self, sent: &Mailbox, raw: &[u8]) -> Result<()> {
         let mut guard = self.conn().await?;
-        guard
-            .session
-            .append(&sent.path, Some("(\\Seen)"), None, raw)
-            .await
-            .map_err(map_imap_error)
+        imap(
+            OP_TIMEOUT,
+            guard
+                .session
+                .append(&sent.path, Some("(\\Seen)"), None, raw),
+        )
+        .await
     }
 
     /// Cabeceras cacheadas de una carpeta, paginando.
@@ -246,6 +302,7 @@ impl correo_core::MailBackend for ImapBackend {
     }
 
     async fn sync_mailbox(&self, mailbox: &Mailbox, days: u32) -> Result<usize> {
+        let days = effective_sync_days(days);
         self.retry(|| self.sync_mailbox_once(mailbox, days)).await
     }
 
@@ -276,7 +333,15 @@ impl correo_core::MailBackend for ImapBackend {
     }
 
     async fn move_to(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()> {
-        self.retry(|| self.move_to_once(mailbox, uid, target)).await
+        // MOVE es reintentable; el fallback COPY+STORE+EXPUNGE no, porque un
+        // reintento tras un corte duplicaría el mensaje en el destino.
+        if self.retry(|| self.supports_move()).await? {
+            self.retry(|| self.uid_move_once(mailbox, uid, target))
+                .await
+        } else {
+            self.attempt(self.copy_move_once(mailbox, uid, target))
+                .await
+        }
     }
 
     async fn delete(&self, mailbox: &Mailbox, uid: u32) -> Result<()> {
@@ -292,15 +357,15 @@ impl correo_core::MailBackend for ImapBackend {
 // ----- Operaciones contra el servidor (una tentativa cada una) ----------
 
 impl ImapBackend {
+    async fn supports_move(&self) -> Result<bool> {
+        Ok(self.conn().await?.caps.mov)
+    }
+
     async fn list_mailboxes_once(&self) -> Result<Vec<Mailbox>> {
         let names: Vec<Name> = {
             let mut guard = self.conn().await?;
-            let stream = guard
-                .session
-                .list(Some(""), Some("*"))
-                .await
-                .map_err(map_imap_error)?;
-            stream.try_collect().await.map_err(map_imap_error)?
+            let stream = imap(OP_TIMEOUT, guard.session.list(Some(""), Some("*"))).await?;
+            imap(OP_TIMEOUT, stream.try_collect()).await?
         };
 
         let existing = self.with_store(|s| s.list_mailboxes(self.account_id))?;
@@ -337,11 +402,7 @@ impl ImapBackend {
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
 
-        let selected = conn
-            .session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
+        let selected = imap(OP_TIMEOUT, conn.session.select(&mailbox.path)).await?;
 
         // UIDVALIDITY: si cambió, la caché de la carpeta ya no sirve.
         let stored = self.with_store(|s| s.get_mailbox(mailbox.id))?;
@@ -358,13 +419,13 @@ impl ImapBackend {
         self.with_store(|s| s.upsert_mailbox(&state))?;
 
         // Servidor: UIDs dentro de la ventana.
-        let server: BTreeSet<u32> = conn
-            .session
-            .uid_search(format!("SINCE {since}"))
-            .await
-            .map_err(map_imap_error)?
-            .into_iter()
-            .collect();
+        let server: BTreeSet<u32> = imap(
+            OP_TIMEOUT,
+            conn.session.uid_search(format!("SINCE {since}")),
+        )
+        .await?
+        .into_iter()
+        .collect();
 
         // Caché: estado actual de la carpeta.
         let cached: Vec<MessageHeader> = if wiped {
@@ -389,16 +450,10 @@ impl ImapBackend {
             self.with_store(|s| s.delete_uid(mailbox.id, *uid))?;
         }
 
-        // Flags de los ya conocidos.
+        // Flags de los ya conocidos (límite por lote).
         for chunk in plan.known_uids.chunks(BATCH_SIZE) {
-            let fetches: Vec<Fetch> = conn
-                .session
-                .uid_fetch(uid_set(chunk), "FLAGS")
-                .await
-                .map_err(map_imap_error)?
-                .try_collect()
-                .await
-                .map_err(map_imap_error)?;
+            let stream = imap(OP_TIMEOUT, conn.session.uid_fetch(uid_set(chunk), "FLAGS")).await?;
+            let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
             for f in &fetches {
                 let Some(uid) = f.uid else { continue };
                 let Some(old) = cached_flags.get(&uid) else {
@@ -421,14 +476,8 @@ impl ImapBackend {
         query.push(')');
 
         for chunk in plan.new_uids.chunks(BATCH_SIZE) {
-            let fetches: Vec<Fetch> = conn
-                .session
-                .uid_fetch(uid_set(chunk), &query)
-                .await
-                .map_err(map_imap_error)?
-                .try_collect()
-                .await
-                .map_err(map_imap_error)?;
+            let stream = imap(OP_TIMEOUT, conn.session.uid_fetch(uid_set(chunk), &query)).await?;
+            let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
 
             let mut headers = Vec::with_capacity(fetches.len());
             for f in &fetches {
@@ -459,18 +508,13 @@ impl ImapBackend {
     async fn fetch_raw_once(&self, mailbox: &Mailbox, uid: u32) -> Result<Vec<u8>> {
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
-        conn.session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
-        let fetches: Vec<Fetch> = conn
-            .session
-            .uid_fetch(uid.to_string(), "BODY.PEEK[]")
-            .await
-            .map_err(map_imap_error)?
-            .try_collect()
-            .await
-            .map_err(map_imap_error)?;
+        self.select_checked(mailbox, conn).await?;
+        let stream = imap(
+            OP_TIMEOUT,
+            conn.session.uid_fetch(uid.to_string(), "BODY.PEEK[]"),
+        )
+        .await?;
+        let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
         fetches
             .iter()
             .find_map(|f| f.body().map(<[u8]>::to_vec))
@@ -480,24 +524,15 @@ impl ImapBackend {
     async fn set_seen_once(&self, mailbox: &Mailbox, uid: u32, seen: bool) -> Result<()> {
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
-        conn.session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
+        self.select_checked(mailbox, conn).await?;
         // Sin .SILENT: el servidor devuelve los FLAGS completos, que van a la caché.
         let op = if seen {
             "+FLAGS (\\Seen)"
         } else {
             "-FLAGS (\\Seen)"
         };
-        let fetches: Vec<Fetch> = conn
-            .session
-            .uid_store(uid.to_string(), op)
-            .await
-            .map_err(map_imap_error)?
-            .try_collect()
-            .await
-            .map_err(map_imap_error)?;
+        let stream = imap(OP_TIMEOUT, conn.session.uid_store(uid.to_string(), op)).await?;
+        let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
         drop(guard);
         if let Some(f) = fetches.iter().find(|f| f.uid == Some(uid)) {
             let flags = flags_from(f.flags());
@@ -506,80 +541,87 @@ impl ImapBackend {
         Ok(())
     }
 
-    async fn move_to_once(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()> {
+    /// UID MOVE (RFC 6851). Solo se llama si el servidor anuncia MOVE.
+    async fn uid_move_once(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()> {
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
-        conn.session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
-        let uid_str = uid.to_string();
-
-        if conn.caps.mov {
-            conn.session
-                .uid_mv(&uid_str, &target.path)
-                .await
-                .map_err(map_imap_error)?;
-        } else {
-            conn.session
-                .uid_copy(&uid_str, &target.path)
-                .await
-                .map_err(map_imap_error)?;
-            mark_deleted_and_expunge(conn, &uid_str).await?;
-        }
+        self.select_checked(mailbox, conn).await?;
+        imap(
+            OP_TIMEOUT,
+            conn.session.uid_mv(uid.to_string(), &target.path),
+        )
+        .await?;
         drop(guard);
         self.with_store(|s| s.delete_uid(mailbox.id, uid))
     }
 
-    /// Marca \Deleted y expunge (solo el uid si hay UIDPLUS) y quita la caché.
+    /// Fallback sin MOVE: UID COPY al destino y luego se marca \Deleted el original.
+    ///
+    /// Nunca hace EXPUNGE global: solo se expurga el UID si hay UIDPLUS. Sin él
+    /// el original queda marcado \Deleted y se devuelve error.
+    async fn copy_move_once(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        self.select_checked(mailbox, conn).await?;
+        let uid_str = uid.to_string();
+        imap(OP_TIMEOUT, conn.session.uid_copy(&uid_str, &target.path)).await?;
+        store_deleted(conn, &uid_str).await?;
+        if !conn.caps.uidplus {
+            return Err(Error::Protocol(format!(
+                "copiado a '{}', pero el servidor no admite UIDPLUS: el original quedó marcado como borrado sin expurgar",
+                target.path
+            )));
+        }
+        uid_expunge(conn, &uid_str).await?;
+        drop(guard);
+        self.with_store(|s| s.delete_uid(mailbox.id, uid))
+    }
+
+    /// Marca \Deleted y expurga solo ese UID (UIDPLUS). Sin UIDPLUS no expurga
+    /// nada: devuelve error y el mensaje queda marcado.
     async fn expunge_uid_once(&self, mailbox: &Mailbox, uid: u32) -> Result<()> {
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
-        conn.session
-            .select(&mailbox.path)
-            .await
-            .map_err(map_imap_error)?;
-        mark_deleted_and_expunge(conn, &uid.to_string()).await?;
+        self.select_checked(mailbox, conn).await?;
+        let uid_str = uid.to_string();
+        store_deleted(conn, &uid_str).await?;
+        if !conn.caps.uidplus {
+            return Err(Error::Protocol(
+                "el servidor no admite UIDPLUS: el mensaje quedó marcado como borrado y no se expurgó".into(),
+            ));
+        }
+        uid_expunge(conn, &uid_str).await?;
         drop(guard);
         self.with_store(|s| s.delete_uid(mailbox.id, uid))
     }
 }
 
-/// STORE +FLAGS.SILENT \Deleted seguido de expunge; con UIDPLUS solo ese UID.
-async fn mark_deleted_and_expunge(conn: &mut Conn, uid_str: &str) -> Result<()> {
-    let _: Vec<Fetch> = conn
-        .session
-        .uid_store(uid_str, "+FLAGS.SILENT (\\Deleted)")
-        .await
-        .map_err(map_imap_error)?
-        .try_collect()
-        .await
-        .map_err(map_imap_error)?;
-    if conn.caps.uidplus {
-        let _: Vec<u32> = conn
-            .session
-            .uid_expunge(uid_str)
-            .await
-            .map_err(map_imap_error)?
-            .try_collect()
-            .await
-            .map_err(map_imap_error)?;
-    } else {
-        let _: Vec<u32> = conn
-            .session
-            .expunge()
-            .await
-            .map_err(map_imap_error)?
-            .try_collect()
-            .await
-            .map_err(map_imap_error)?;
-    }
+/// STORE +FLAGS.SILENT \Deleted sobre un UID.
+async fn store_deleted(conn: &mut Conn, uid_str: &str) -> Result<()> {
+    let stream = imap(
+        OP_TIMEOUT,
+        conn.session.uid_store(uid_str, "+FLAGS.SILENT (\\Deleted)"),
+    )
+    .await?;
+    let _: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
+    Ok(())
+}
+
+/// UID EXPUNGE (UIDPLUS): expurga solo ese UID.
+async fn uid_expunge(conn: &mut Conn, uid_str: &str) -> Result<()> {
+    let stream = imap(OP_TIMEOUT, conn.session.uid_expunge(uid_str)).await?;
+    let _: Vec<u32> = imap(OP_TIMEOUT, stream.try_collect()).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod idle_tests {
     use super::*;
+
+    #[test]
+    fn idle_outer_limit_is_25_min_plus_30_s() {
+        assert_eq!(IDLE_MAX + IDLE_GRACE, Duration::from_secs(25 * 60 + 30));
+    }
 
     /// Compilación: la espera IDLE debe poder lanzarse con `tokio::spawn`.
     #[allow(dead_code)]
@@ -593,5 +635,101 @@ mod idle_tests {
     #[test]
     fn idle_max_is_25_minutes() {
         assert_eq!(IDLE_MAX, Duration::from_secs(25 * 60));
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use correo_core::{AccessToken, Account, Provider};
+    use correo_store::Store;
+
+    struct NoTokens;
+
+    #[async_trait]
+    impl TokenProvider for NoTokens {
+        async fn access_token(&self, _account: AccountId) -> Result<AccessToken> {
+            Err(Error::Auth("sin token en las pruebas".into()))
+        }
+    }
+
+    fn backend_with_inbox(stored_validity: Option<u32>) -> (ImapBackend, Mailbox) {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .create_account(&Account {
+                id: 0,
+                provider: Provider::Gmail,
+                email: "yo@example.com".into(),
+                display_name: "Yo".into(),
+                sync_days: 30,
+            })
+            .unwrap();
+        let id = store
+            .upsert_mailbox(&Mailbox {
+                id: 0,
+                account_id,
+                path: "INBOX".into(),
+                role: MailboxRole::Inbox,
+                uid_validity: stored_validity,
+                unread: 0,
+            })
+            .unwrap();
+        let mailbox = store.get_mailbox(id).unwrap();
+        // Un mensaje cacheado: debe desaparecer si la carpeta cambió.
+        let meta = parse::FetchMeta {
+            mailbox_id: id,
+            uid: 1,
+            flags: Default::default(),
+            internal_date: 0,
+            has_attachments: false,
+            labels: vec![],
+        };
+        let header = parse::build_header(None, None, meta);
+        store.upsert_headers(id, &[header]).unwrap();
+
+        let backend = ImapBackend::new(
+            "imap.example.com",
+            IMAPS_PORT,
+            account_id,
+            "yo@example.com",
+            Arc::new(NoTokens),
+            Arc::new(Mutex::new(store)),
+        );
+        (backend, mailbox)
+    }
+
+    #[test]
+    fn uidvalidity_change_wipes_cache_and_refuses_the_action() {
+        let (backend, mailbox) = backend_with_inbox(Some(1));
+        let err = backend
+            .guard_uid_validity(&mailbox, Some(2))
+            .expect_err("debe rechazar la acción");
+        assert!(
+            matches!(&err, Error::Protocol(m) if m == "la carpeta cambió; vuelve a sincronizar"),
+            "{err:?}"
+        );
+        let cached = backend
+            .with_store(|s| s.list_headers(mailbox.id, 10, 0))
+            .unwrap();
+        assert!(cached.is_empty(), "la caché debe vaciarse");
+        let stored = backend.with_store(|s| s.get_mailbox(mailbox.id)).unwrap();
+        assert_eq!(stored.uid_validity, Some(2));
+    }
+
+    #[test]
+    fn same_uidvalidity_keeps_cache_and_allows_the_action() {
+        let (backend, mailbox) = backend_with_inbox(Some(5));
+        backend.guard_uid_validity(&mailbox, Some(5)).unwrap();
+        let cached = backend
+            .with_store(|s| s.list_headers(mailbox.id, 10, 0))
+            .unwrap();
+        assert_eq!(cached.len(), 1);
+    }
+
+    #[test]
+    fn sync_days_are_capped() {
+        assert_eq!(effective_sync_days(30), 30);
+        assert_eq!(effective_sync_days(MAX_SYNC_DAYS), 3650);
+        assert_eq!(effective_sync_days(u32::MAX), 3650);
     }
 }

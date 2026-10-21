@@ -1,10 +1,11 @@
 //! `SyncRunner`: ejecuta las acciones del planificador contra un `MailBackend`
-//! y devuelve los resultados como eventos. Los mensajes nuevos de la bandeja
-//! salen por un canal de `SyncReport` para las notificaciones.
+//! y devuelve los resultados como eventos. Las sincronizaciones corren en tareas
+//! cancelables: un `Pause` o un `Resumed` las interrumpe aunque el servidor no responda.
+//! Las novedades y los avisos que necesita el usuario salen por un canal de `SyncNotice`.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -40,22 +41,106 @@ pub struct SyncReport {
     pub new_messages: Vec<MessageId>,
 }
 
+/// Avisos que el runner entrega a la aplicación.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncNotice {
+    /// Mensajes nuevos en la bandeja de entrada.
+    NewMessages(SyncReport),
+    /// La cuenta necesita volver a autorizarse. No se reintenta hasta enviar `Event::Reauthorized`.
+    AuthRequired { account: AccountId },
+}
+
 pub struct SyncChannels {
-    /// Eventos externos: `MailboxOpened`, `ConditionsChanged`, `Resumed`...
+    /// Eventos externos: `MailboxOpened`, `ConditionsChanged`, `Resumed`, `Reauthorized`...
     pub events: mpsc::Sender<Event>,
-    pub reports: mpsc::Receiver<SyncReport>,
+    pub reports: mpsc::Receiver<SyncNotice>,
     /// Termina cuando se cierra `events`.
     pub task: JoinHandle<()>,
 }
 
+/// Estado compartido con las tareas de sincronización.
+struct Shared {
+    backend: Arc<dyn MailBackend>,
+    news: Arc<dyn NewMessageIds>,
+    account: AccountId,
+    inbox: MailboxId,
+    sync_days: u32,
+    mailboxes: Mutex<HashMap<MailboxId, Mailbox>>,
+}
+
+impl Shared {
+    fn cache(&self) -> MutexGuard<'_, HashMap<MailboxId, Mailbox>> {
+        self.mailboxes.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Carpeta por id; si no está en caché, recarga la lista de carpetas.
+    async fn mailbox(&self, id: MailboxId) -> Result<Mailbox> {
+        if let Some(mb) = self.cache().get(&id) {
+            return Ok(mb.clone());
+        }
+        let listed = self.backend.list_mailboxes().await?;
+        let mut cache = self.cache();
+        for mb in listed {
+            cache.insert(mb.id, mb);
+        }
+        cache
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("carpeta {id}")))
+    }
+
+    async fn sync_inbox(&self, notices: &mpsc::Sender<SyncNotice>) -> Event {
+        match self.sync_mailbox(self.inbox).await {
+            Ok(changed) => {
+                if changed > 0
+                    && let Ok(ids) = self.news.take_new(self.inbox).await
+                    && !ids.is_empty()
+                {
+                    let _ = notices
+                        .send(SyncNotice::NewMessages(SyncReport {
+                            account: self.account,
+                            new_messages: ids,
+                        }))
+                        .await;
+                }
+                Event::SyncOk {
+                    new_messages: changed,
+                }
+            }
+            Err(Error::Auth(_)) => Event::AuthFailed,
+            Err(_) => Event::SyncFailed,
+        }
+    }
+
+    async fn sync_mailbox(&self, id: MailboxId) -> Result<usize> {
+        let mailbox = self.mailbox(id).await?;
+        self.backend.sync_mailbox(&mailbox, self.sync_days).await
+    }
+
+    /// Ejecuta una acción de sincronización. Devuelve el evento que produce, si lo hay.
+    async fn run(&self, action: Action, notices: &mpsc::Sender<SyncNotice>) -> Option<Event> {
+        match action {
+            Action::SyncInbox(_) => Some(self.sync_inbox(notices).await),
+            // Un fallo en carpetas secundarias no altera el backoff de la bandeja:
+            // se reintenta en el siguiente barrido. Sí cuenta un rechazo de credenciales.
+            Action::SyncMailbox(_, id) => match self.sync_mailbox(id).await {
+                Err(Error::Auth(_)) => Some(Event::AuthFailed),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 pub struct SyncRunner {
     scheduler: SyncScheduler<SystemClock>,
-    backend: Arc<dyn MailBackend>,
+    shared: Arc<Shared>,
     idle: Option<Arc<dyn IdleBackend>>,
-    news: Arc<dyn NewMessageIds>,
-    sync_days: u32,
-    mailboxes: HashMap<MailboxId, Mailbox>,
-    idle_task: Option<JoinHandle<Result<()>>>,
+    /// Sincronizaciones pendientes; se ejecutan de una en una.
+    pending_sync: VecDeque<Action>,
+    sync_task: Option<JoinHandle<Option<Event>>>,
+    /// Resultado: cuánto duró la espera y si terminó bien.
+    idle_task: Option<JoinHandle<(Duration, Result<()>)>>,
     deadline: Option<Instant>,
 }
 
@@ -68,13 +153,20 @@ impl SyncRunner {
         news: Arc<dyn NewMessageIds>,
         sync_days: u32,
     ) -> Self {
+        let shared = Shared {
+            backend,
+            news,
+            account: scheduler.account(),
+            inbox: scheduler.inbox(),
+            sync_days,
+            mailboxes: Mutex::new(HashMap::new()),
+        };
         Self {
             scheduler,
-            backend,
+            shared: Arc::new(shared),
             idle,
-            news,
-            sync_days,
-            mailboxes: HashMap::new(),
+            pending_sync: VecDeque::new(),
+            sync_task: None,
             idle_task: None,
             deadline: None,
         }
@@ -92,50 +184,61 @@ impl SyncRunner {
         }
     }
 
-    async fn run(mut self, mut events: mpsc::Receiver<Event>, reports: mpsc::Sender<SyncReport>) {
+    async fn run(mut self, mut events: mpsc::Receiver<Event>, notices: mpsc::Sender<SyncNotice>) {
         let actions = self.scheduler.start();
-        self.execute(actions, &reports).await;
+        self.execute(actions, &notices).await;
         loop {
+            self.start_next_sync(&notices);
             let deadline = self.deadline;
-            let mut idle_finished = false;
+            let mut sync_done = false;
+            let mut idle_done = false;
             let event = tokio::select! {
                 biased;
                 ev = events.recv() => match ev {
-                    Some(ev) => ev,
+                    Some(ev) => Some(ev),
                     None => break,
                 },
-                joined = join_idle(&mut self.idle_task) => {
-                    idle_finished = true;
-                    match joined {
-                        Ok(Ok(())) => Event::IdleWake,
-                        Ok(Err(Error::Protocol(m))) if m == SIN_IDLE => Event::IdleUnsupported,
-                        _ => Event::SyncFailed,
-                    }
+                joined = join_sync(&mut self.sync_task) => {
+                    sync_done = true;
+                    // Una tarea que terminó en pánico cuenta como fallo de sincronización.
+                    joined.unwrap_or(Some(Event::SyncFailed))
                 }
-                _ = wait_until(deadline) => Event::Tick,
+                joined = join_idle(&mut self.idle_task) => {
+                    idle_done = true;
+                    Some(idle_event(joined))
+                }
+                _ = wait_until(deadline) => Some(Event::Tick),
             };
-            if idle_finished {
+            if sync_done {
+                self.sync_task = None;
+            }
+            if idle_done {
                 self.idle_task = None;
             }
+            let Some(event) = event else {
+                continue;
+            };
+            if event == Event::Resumed {
+                // Vuelta del equipo o de la red: lo que estaba en curso ya no sirve.
+                self.cancel_sync();
+            }
             let actions = self.scheduler.handle(event);
-            self.execute(actions, &reports).await;
+            self.execute(actions, &notices).await;
         }
         self.abort_idle();
+        self.cancel_sync();
     }
 
     /// Ejecuta acciones; los resultados que producen se reinyectan al planificador.
-    async fn execute(&mut self, actions: Vec<Action>, reports: &mpsc::Sender<SyncReport>) {
+    async fn execute(&mut self, actions: Vec<Action>, notices: &mpsc::Sender<SyncNotice>) {
         let mut queue = VecDeque::from(actions);
         while let Some(action) = queue.pop_front() {
             let follow_up = match action {
-                Action::SyncInbox(_) => Some(self.sync_inbox(reports).await),
-                Action::SyncMailbox(_, id) => {
-                    // Un fallo en carpetas secundarias no altera el backoff de la bandeja:
-                    // se reintenta en el siguiente barrido.
-                    let _ = self.sync_folder(id).await;
+                Action::SyncInbox(_) | Action::SyncMailbox(..) => {
+                    self.pending_sync.push_back(action);
                     None
                 }
-                Action::StartIdle(_) => self.start_idle().await,
+                Action::StartIdle(_) => self.start_idle(),
                 Action::Sleep(at) => {
                     self.deadline = Some(at);
                     None
@@ -143,6 +246,11 @@ impl SyncRunner {
                 Action::Pause => {
                     self.deadline = None;
                     self.abort_idle();
+                    self.cancel_sync();
+                    None
+                }
+                Action::AuthRequired(account) => {
+                    let _ = notices.send(SyncNotice::AuthRequired { account }).await;
                     None
                 }
             };
@@ -152,48 +260,44 @@ impl SyncRunner {
         }
     }
 
-    async fn sync_inbox(&mut self, reports: &mpsc::Sender<SyncReport>) -> Event {
-        let inbox = self.scheduler.inbox();
-        let account = self.scheduler.account();
-        let Ok(mailbox) = self.mailbox(inbox).await else {
-            return Event::SyncFailed;
-        };
-        let Ok(changed) = self.backend.sync_mailbox(&mailbox, self.sync_days).await else {
-            return Event::SyncFailed;
-        };
-        if changed > 0
-            && let Ok(ids) = self.news.take_new(inbox).await
-            && !ids.is_empty()
-        {
-            let _ = reports
-                .send(SyncReport {
-                    account,
-                    new_messages: ids,
-                })
-                .await;
+    /// Lanza la siguiente sincronización pendiente si no hay otra en curso.
+    fn start_next_sync(&mut self, notices: &mpsc::Sender<SyncNotice>) {
+        if self.sync_task.is_some() {
+            return;
         }
-        Event::SyncOk {
-            new_messages: changed,
-        }
+        let Some(action) = self.pending_sync.pop_front() else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        let notices = notices.clone();
+        self.sync_task = Some(tokio::spawn(
+            async move { shared.run(action, &notices).await },
+        ));
     }
 
-    async fn sync_folder(&mut self, id: MailboxId) -> Result<usize> {
-        let mailbox = self.mailbox(id).await?;
-        self.backend.sync_mailbox(&mailbox, self.sync_days).await
+    /// Cancela la sincronización en curso y descarta las pendientes.
+    fn cancel_sync(&mut self) {
+        self.pending_sync.clear();
+        if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
     }
 
     /// Relanza la espera IDLE sobre la bandeja en una tarea propia.
-    async fn start_idle(&mut self) -> Option<Event> {
+    /// Devuelve un evento solo si no hay forma de intentarlo.
+    fn start_idle(&mut self) -> Option<Event> {
         self.abort_idle();
         let Some(idle) = self.idle.clone() else {
             return Some(Event::IdleUnsupported);
         };
-        let inbox = self.scheduler.inbox();
-        let Ok(mailbox) = self.mailbox(inbox).await else {
-            return Some(Event::SyncFailed);
-        };
+        let shared = Arc::clone(&self.shared);
         self.idle_task = Some(tokio::spawn(async move {
-            idle.idle_inbox(&mailbox, IDLE_MAX).await
+            let started = Instant::now();
+            let result = match shared.mailbox(shared.inbox).await {
+                Ok(mailbox) => idle.idle_inbox(&mailbox, IDLE_MAX).await,
+                Err(e) => Err(e),
+            };
+            (started.elapsed(), result)
         }));
         None
     }
@@ -203,25 +307,30 @@ impl SyncRunner {
             task.abort();
         }
     }
+}
 
-    /// Carpeta por id; si no está en caché, recarga la lista de carpetas.
-    async fn mailbox(&mut self, id: MailboxId) -> Result<Mailbox> {
-        if let Some(mb) = self.mailboxes.get(&id) {
-            return Ok(mb.clone());
-        }
-        for mb in self.backend.list_mailboxes().await? {
-            self.mailboxes.insert(mb.id, mb);
-        }
-        self.mailboxes
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| Error::NotFound(format!("carpeta {id}")))
+/// Traduce el final de una espera IDLE a un evento del planificador.
+fn idle_event(joined: std::result::Result<(Duration, Result<()>), JoinError>) -> Event {
+    match joined {
+        Ok((lasted, Ok(()))) => Event::IdleWake { lasted },
+        Ok((_, Err(Error::Protocol(m)))) if m == SIN_IDLE => Event::IdleUnsupported,
+        Ok((_, Err(Error::Auth(_)))) => Event::AuthFailed,
+        _ => Event::IdleFailed,
+    }
+}
+
+async fn join_sync(
+    slot: &mut Option<JoinHandle<Option<Event>>>,
+) -> std::result::Result<Option<Event>, JoinError> {
+    match slot {
+        Some(task) => task.await,
+        None => pending().await,
     }
 }
 
 async fn join_idle(
-    slot: &mut Option<JoinHandle<Result<()>>>,
-) -> std::result::Result<Result<()>, JoinError> {
+    slot: &mut Option<JoinHandle<(Duration, Result<()>)>>,
+) -> std::result::Result<(Duration, Result<()>), JoinError> {
     match slot {
         Some(task) => task.await,
         None => pending().await,
@@ -238,7 +347,7 @@ async fn wait_until(at: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use correo_core::{MailboxRole, MessageBody};
@@ -261,10 +370,23 @@ mod tests {
         }
     }
 
+    /// Cuenta las sincronizaciones canceladas: al descartarse la future, el contador sube.
+    struct CancelFlag(Arc<AtomicUsize>);
+
+    impl Drop for CancelFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// Backend falso: cuenta sincronizaciones y devuelve un recuento configurable.
+    /// `hang_next` hace que la siguiente sincronización se cuelgue; `auth_error` que falle con `Auth`.
     struct FakeBackend {
         changed: Mutex<usize>,
         syncs: Mutex<Vec<MailboxId>>,
+        hang_next: AtomicBool,
+        auth_error: AtomicBool,
+        cancelled: Arc<AtomicUsize>,
     }
 
     impl FakeBackend {
@@ -272,6 +394,9 @@ mod tests {
             Arc::new(Self {
                 changed: Mutex::new(changed),
                 syncs: Mutex::new(Vec::new()),
+                hang_next: AtomicBool::new(false),
+                auth_error: AtomicBool::new(false),
+                cancelled: Arc::new(AtomicUsize::new(0)),
             })
         }
 
@@ -299,6 +424,13 @@ mod tests {
         }
         async fn sync_mailbox(&self, mailbox: &Mailbox, _days: u32) -> Result<usize> {
             self.syncs.lock().unwrap().push(mailbox.id);
+            if self.hang_next.swap(false, Ordering::SeqCst) {
+                let _flag = CancelFlag(Arc::clone(&self.cancelled));
+                pending::<()>().await;
+            }
+            if self.auth_error.load(Ordering::SeqCst) {
+                return Err(Error::Auth("token revocado".into()));
+            }
             Ok(*self.changed.lock().unwrap())
         }
         async fn fetch_body(&self, _: &Mailbox, _: u32) -> Result<MessageBody> {
@@ -371,12 +503,19 @@ mod tests {
         )
     }
 
-    async fn eventually(mut check: impl FnMut() -> bool) {
-        for _ in 0..500 {
+    async fn eventually(check: impl FnMut() -> bool) {
+        eventually_within(Duration::from_secs(5), check).await;
+    }
+
+    async fn eventually_within(limit: Duration, mut check: impl FnMut() -> bool) {
+        let step = Duration::from_millis(10);
+        let mut waited = Duration::ZERO;
+        while waited < limit {
             if check() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(step).await;
+            waited += step;
         }
         panic!("la condición no se cumplió a tiempo");
     }
@@ -387,16 +526,16 @@ mod tests {
         let idle = FakeIdle::new(true);
         let mut ch = runner(backend.clone(), Some(idle.clone()), vec![101, 102]).spawn();
 
-        let report = tokio::time::timeout(Duration::from_secs(5), ch.reports.recv())
+        let notice = tokio::time::timeout(Duration::from_secs(5), ch.reports.recv())
             .await
-            .expect("llegó el informe")
+            .expect("llegó el aviso")
             .expect("canal abierto");
         assert_eq!(
-            report,
-            SyncReport {
+            notice,
+            SyncNotice::NewMessages(SyncReport {
                 account: ACCOUNT,
                 new_messages: vec![101, 102]
-            }
+            })
         );
         eventually(|| idle.calls.load(Ordering::SeqCst) == 1).await;
         drop(ch.events);
@@ -423,9 +562,11 @@ mod tests {
         eventually(|| idle.calls.load(Ordering::SeqCst) == 1).await;
         assert_eq!(backend.sync_count(INBOX), 1);
 
-        idle.release.notify_one(); // el servidor anuncia cambios
+        // Un IDLE que vuelve al instante no cuenta como espera real: el reintento llega
+        // tras el backoff de IDLE (5 s con jitter), no de inmediato.
+        idle.release.notify_one();
+        eventually_within(Duration::from_secs(10), || backend.sync_count(INBOX) == 2).await;
         eventually(|| idle.calls.load(Ordering::SeqCst) == 2).await;
-        assert_eq!(backend.sync_count(INBOX), 2);
         drop(ch.events);
         ch.task.await.unwrap();
     }
@@ -478,6 +619,70 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(backend.sync_count(SECONDARY), 0);
         assert_eq!(idle.calls.load(Ordering::SeqCst), 1);
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_cancels_a_sync_that_hangs_on_the_server() {
+        let backend = FakeBackend::new(0);
+        backend.hang_next.store(true, Ordering::SeqCst);
+        let ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.sync_count(INBOX) == 1).await;
+
+        // Con la sincronización colgada, la red cae: el runner debe cancelarla y seguir atendiendo.
+        ch.events
+            .send(Event::ConditionsChanged(crate::Conditions {
+                network: crate::scheduler::Network::Offline,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        eventually(|| backend.cancelled.load(Ordering::SeqCst) == 1).await;
+        drop(ch.events);
+        tokio::time::timeout(Duration::from_secs(5), ch.task)
+            .await
+            .expect("el runner no terminó tras cerrar eventos")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_cancels_a_hung_sync_and_restarts_it() {
+        let backend = FakeBackend::new(0);
+        backend.hang_next.store(true, Ordering::SeqCst);
+        let ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.sync_count(INBOX) == 1).await;
+
+        ch.events.send(Event::Resumed).await.unwrap();
+        eventually(|| backend.cancelled.load(Ordering::SeqCst) == 1).await;
+        // La sincronización nueva ya no se cuelga y completa.
+        eventually(|| backend.sync_count(INBOX) == 2).await;
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_error_notifies_once_and_stops_until_reauthorized() {
+        let backend = FakeBackend::new(0);
+        backend.auth_error.store(true, Ordering::SeqCst);
+        let idle = FakeIdle::new(true);
+        let mut ch = runner(backend.clone(), Some(idle.clone()), vec![]).spawn();
+
+        let notice = tokio::time::timeout(Duration::from_secs(5), ch.reports.recv())
+            .await
+            .expect("llegó el aviso de autorización")
+            .expect("canal abierto");
+        assert_eq!(notice, SyncNotice::AuthRequired { account: ACCOUNT });
+
+        // Ni reintentos de sincronización ni IDLE mientras no se reautorice.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let idle_before = idle.calls.load(Ordering::SeqCst);
+        assert_eq!(backend.sync_count(INBOX), 1);
+
+        backend.auth_error.store(false, Ordering::SeqCst);
+        ch.events.send(Event::Reauthorized).await.unwrap();
+        eventually(|| backend.sync_count(INBOX) == 2).await;
+        eventually(|| idle.calls.load(Ordering::SeqCst) > idle_before).await;
         drop(ch.events);
         ch.task.await.unwrap();
     }

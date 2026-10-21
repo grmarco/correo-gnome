@@ -17,6 +17,12 @@ const POLL_STEPS: [Duration; 4] = [
     Duration::from_secs(8 * 60),
     Duration::from_secs(15 * 60),
 ];
+/// Un IDLE que dura al menos esto cuenta como sano y reinicia el contador de fallos de IDLE.
+const IDLE_HEALTHY: Duration = Duration::from_secs(60);
+/// Fallos de IDLE seguidos antes de degradar a polling.
+const IDLE_FAILURES_TO_DEGRADE: u32 = 3;
+/// Tiempo en polling antes de volver a intentar IDLE.
+const IDLE_RETRY: Duration = Duration::from_secs(60 * 60);
 /// Barrido de carpetas secundarias.
 const SWEEP: Duration = Duration::from_secs(30 * 60);
 const SWEEP_LOW_POWER: Duration = Duration::from_secs(2 * 60 * 60);
@@ -64,8 +70,17 @@ pub struct Policy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// IDLE terminó (cambios del servidor o expiró `IDLE_MAX`).
-    IdleWake,
+    /// IDLE terminó sin error (cambios del servidor o expiró `IDLE_MAX`).
+    /// `lasted` es cuánto duró la espera; una espera corta se trata como fallo.
+    IdleWake {
+        lasted: Duration,
+    },
+    /// La espera IDLE falló (error de red, sesión, carpeta...). No es un fallo de sincronización.
+    IdleFailed,
+    /// El backend rechazó las credenciales: la cuenta no se reintenta hasta `Reauthorized`.
+    AuthFailed,
+    /// La cuenta se ha vuelto a autorizar.
+    Reauthorized,
     /// Venció un deadline devuelto en `Action::Sleep`.
     Tick,
     MailboxOpened(MailboxId),
@@ -91,6 +106,8 @@ pub enum Action {
     Sleep(Instant),
     /// Sin red: cancelar IDLE y no programar nada hasta volver a estar online.
     Pause,
+    /// Hace falta volver a autorizar la cuenta; la aplicación debe avisar al usuario.
+    AuthRequired(AccountId),
 }
 
 /// Jitter determinista (splitmix64) con semilla inyectable.
@@ -133,9 +150,16 @@ pub struct SyncScheduler<C: Clock> {
     idle_unsupported: bool,
     /// Hay una espera IDLE activa (o pendiente de lanzarse) en el runner.
     idle_running: bool,
+    /// Fallos de IDLE seguidos. Solo se reinicia con un IDLE sano, nunca con `SyncOk`.
+    idle_failures: u32,
+    /// Cuándo reintentar IDLE tras haberlo degradado a polling por fallos.
+    idle_retry_at: Option<Instant>,
     paused: bool,
+    /// Estado terminal: credenciales inválidas hasta `Reauthorized`.
+    auth_required: bool,
     /// Índice en `POLL_STEPS` del intervalo de polling siguiente.
     poll_step: usize,
+    /// Fallos de sincronización seguidos (backoff de reintentos).
     failures: u32,
     next_inbox_at: Option<Instant>,
     next_sweep_at: Option<Instant>,
@@ -155,7 +179,10 @@ impl<C: Clock> SyncScheduler<C> {
             jitter: Jitter::new(jitter_seed),
             idle_unsupported: false,
             idle_running: false,
+            idle_failures: 0,
+            idle_retry_at: None,
             paused: false,
+            auth_required: false,
             poll_step: 0,
             failures: 0,
             next_inbox_at: None,
@@ -201,6 +228,22 @@ impl<C: Clock> SyncScheduler<C> {
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         let now = self.clock.now();
         let mut out = Vec::new();
+        if self.auth_required {
+            // Estado terminal: solo la reautorización reanuda el trabajo.
+            match event {
+                Event::Reauthorized => {
+                    self.auth_required = false;
+                    if self.online() {
+                        self.resume(now, &mut out);
+                    } else {
+                        self.go_offline(&mut out);
+                    }
+                }
+                Event::ConditionsChanged(cond) => self.cond = cond,
+                _ => {}
+            }
+            return self.finish(out);
+        }
         match event {
             Event::ConditionsChanged(cond) => {
                 self.cond = cond;
@@ -216,12 +259,36 @@ impl<C: Clock> SyncScheduler<C> {
                     self.resume(now, &mut out);
                 }
             }
-            Event::IdleWake => {
+            Event::IdleWake { lasted } => {
                 if !self.paused {
                     self.idle_running = false;
-                    self.inbox_wake(&mut out);
+                    if lasted >= IDLE_HEALTHY {
+                        self.idle_failures = 0;
+                        self.inbox_wake(&mut out);
+                    } else {
+                        // Un IDLE que termina al instante no es una espera real: cuenta como fallo
+                        // para no entrar en un bucle sin pausas.
+                        self.idle_failed(now);
+                    }
                 }
             }
+            Event::IdleFailed => {
+                if !self.paused {
+                    self.idle_failed(now);
+                }
+            }
+            Event::AuthFailed => {
+                if !self.paused {
+                    self.auth_required = true;
+                    self.idle_running = false;
+                    self.next_inbox_at = None;
+                    self.next_sweep_at = None;
+                    self.idle_retry_at = None;
+                    out.push(Action::AuthRequired(self.account));
+                    out.push(Action::Pause);
+                }
+            }
+            Event::Reauthorized => {}
             Event::MailboxOpened(id) => {
                 if !self.paused {
                     if id == self.inbox {
@@ -235,6 +302,13 @@ impl<C: Clock> SyncScheduler<C> {
             }
             Event::Tick => {
                 if !self.paused {
+                    if self.idle_retry_at.is_some_and(|at| at <= now) {
+                        // Reintento de IDLE tras la degradación: se da una nueva oportunidad.
+                        self.idle_retry_at = None;
+                        self.idle_unsupported = false;
+                        self.idle_failures = 0;
+                        self.ensure_idle(&mut out);
+                    }
                     if self.next_inbox_at.is_some_and(|at| at <= now) {
                         self.inbox_wake(&mut out);
                     }
@@ -254,6 +328,7 @@ impl<C: Clock> SyncScheduler<C> {
             }
             Event::SyncOk { new_messages } => {
                 if !self.paused {
+                    // Solo reinicia el backoff de sincronización; los fallos de IDLE son independientes.
                     self.failures = 0;
                     if self.idle_unsupported {
                         if new_messages > 0 {
@@ -311,6 +386,21 @@ impl<C: Clock> SyncScheduler<C> {
         out.push(Action::Pause);
     }
 
+    /// Fallo de IDLE: reintento con backoff y, tras varios seguidos, degradación a polling.
+    fn idle_failed(&mut self, now: Instant) {
+        self.idle_running = false;
+        self.idle_failures = self.idle_failures.saturating_add(1);
+        if self.idle_failures >= IDLE_FAILURES_TO_DEGRADE {
+            self.idle_unsupported = true;
+            self.idle_retry_at = Some(now + IDLE_RETRY);
+            self.poll_step = 0;
+            self.next_inbox_at = Some(now + self.poll_interval());
+        } else {
+            let delay = backoff_delay(self.idle_failures - 1, &mut self.jitter);
+            self.next_inbox_at = Some(now + delay);
+        }
+    }
+
     /// Vuelta a la red o al foreground: sincronización inmediata, sin esperar backoff.
     fn resume(&mut self, now: Instant, out: &mut Vec<Action>) {
         self.failures = 0;
@@ -352,10 +442,10 @@ impl<C: Clock> SyncScheduler<C> {
 
     /// Añade el `Sleep` con el próximo deadline (si no hay pausa).
     fn finish(&self, mut out: Vec<Action>) -> Vec<Action> {
-        if self.paused {
+        if self.paused || self.auth_required {
             return out;
         }
-        let next = [self.next_inbox_at, self.next_sweep_at]
+        let next = [self.next_inbox_at, self.next_sweep_at, self.idle_retry_at]
             .into_iter()
             .flatten()
             .min();
@@ -368,6 +458,8 @@ impl<C: Clock> SyncScheduler<C> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::clock::FakeClock;
 
@@ -490,7 +582,7 @@ mod tests {
             s.handle(Event::ConditionsChanged(metered_offline))
                 .is_empty()
         );
-        assert!(s.handle(Event::IdleWake).is_empty());
+        assert!(s.handle(Event::IdleWake { lasted: MIN }).is_empty());
         assert!(s.handle(Event::Tick).is_empty());
         assert!(s.handle(Event::SyncFailed).is_empty());
         assert!(s.handle(Event::SyncOk { new_messages: 4 }).is_empty());
@@ -545,7 +637,7 @@ mod tests {
         s.start();
         clock.advance(25 * MIN);
         assert_eq!(
-            s.handle(Event::IdleWake),
+            s.handle(Event::IdleWake { lasted: 25 * MIN }),
             vec![
                 Action::StartIdle(ACCOUNT),
                 Action::SyncInbox(ACCOUNT),
@@ -887,5 +979,158 @@ mod tests {
             assert!(actions.is_empty(), "{actions:?}");
             assert!(without_sleep(s.handle(Event::SyncOk { new_messages: 0 })).is_empty());
         }
+    }
+
+    /// Simula el runner con un IDLE que falla al instante y una sincronización que va bien.
+    /// Avanza el reloj hasta el siguiente `Sleep` mientras no pase de `window`.
+    /// Devuelve (arranques de IDLE, sincronizaciones de la bandeja).
+    fn simulate_failing_idle(window: Duration) -> (usize, usize) {
+        let (clock, mut s) = setup();
+        let end = clock.now() + window;
+        let (mut idle_starts, mut inbox_syncs) = (0, 0);
+        let mut pending = s.start();
+        for _ in 0..10_000 {
+            let mut deadline = None;
+            let mut queue = VecDeque::from(pending);
+            while let Some(action) = queue.pop_front() {
+                match action {
+                    Action::StartIdle(_) => {
+                        idle_starts += 1;
+                        queue.extend(s.handle(Event::IdleFailed));
+                    }
+                    Action::SyncInbox(_) => {
+                        inbox_syncs += 1;
+                        queue.extend(s.handle(Event::SyncOk { new_messages: 0 }));
+                    }
+                    Action::Sleep(at) => deadline = Some(at),
+                    _ => {}
+                }
+            }
+            match deadline {
+                Some(at) if at <= end => {
+                    clock.advance(at.saturating_duration_since(clock.now()));
+                    pending = s.handle(Event::Tick);
+                }
+                _ => break,
+            }
+        }
+        (idle_starts, inbox_syncs)
+    }
+
+    #[test]
+    fn failing_idle_with_healthy_sync_is_bounded_in_ten_minutes() {
+        // Sin contador separado (el bug original) habría ~120 arranques de IDLE a 5 s.
+        let (idle_starts, inbox_syncs) = simulate_failing_idle(10 * MIN);
+        assert!(idle_starts <= 3, "arranques de IDLE: {idle_starts}");
+        assert!(
+            inbox_syncs <= 5,
+            "sincronizaciones de bandeja: {inbox_syncs}"
+        );
+    }
+
+    #[test]
+    fn sync_ok_does_not_reset_idle_failures() {
+        let (_clock, mut s) = setup();
+        s.start();
+        s.handle(Event::IdleFailed);
+        s.handle(Event::SyncOk { new_messages: 0 });
+        s.handle(Event::IdleFailed);
+        s.handle(Event::SyncOk { new_messages: 0 });
+        assert!(!s.idle_unsupported);
+        assert_eq!(s.idle_failures, 2);
+        s.handle(Event::IdleFailed);
+        assert!(
+            s.idle_unsupported,
+            "tres fallos seguidos degradan a polling"
+        );
+    }
+
+    #[test]
+    fn healthy_idle_resets_the_failure_counter() {
+        let (_clock, mut s) = setup();
+        s.start();
+        s.handle(Event::IdleFailed);
+        s.handle(Event::IdleFailed);
+        s.handle(Event::IdleWake { lasted: IDLE_MAX });
+        s.handle(Event::IdleFailed);
+        s.handle(Event::IdleFailed);
+        assert!(!s.idle_unsupported);
+        s.handle(Event::IdleFailed);
+        assert!(s.idle_unsupported);
+    }
+
+    #[test]
+    fn idle_that_returns_immediately_counts_as_failure() {
+        let (_clock, mut s) = setup();
+        s.start();
+        for _ in 0..3 {
+            s.handle(Event::IdleWake {
+                lasted: Duration::ZERO,
+            });
+        }
+        assert!(s.idle_unsupported);
+    }
+
+    #[test]
+    fn degraded_idle_is_retried_exactly_one_hour_later() {
+        let (clock, mut s) = setup();
+        s.start();
+        let mut actions = Vec::new();
+        for _ in 0..IDLE_FAILURES_TO_DEGRADE {
+            actions = s.handle(Event::IdleFailed);
+        }
+        let degraded_at = clock.now();
+        for _ in 0..1000 {
+            let due = sleep_of(&actions).expect("debe haber un despertar programado");
+            clock.advance(due.saturating_duration_since(clock.now()));
+            actions = s.handle(Event::Tick);
+            if actions.contains(&Action::StartIdle(ACCOUNT)) {
+                break;
+            }
+        }
+        assert!(actions.contains(&Action::StartIdle(ACCOUNT)));
+        assert_eq!(clock.now() - degraded_at, IDLE_RETRY);
+    }
+
+    #[test]
+    fn auth_failure_is_terminal_until_reauthorized() {
+        let (clock, mut s) = setup();
+        s.start();
+        assert_eq!(
+            s.handle(Event::AuthFailed),
+            vec![Action::AuthRequired(ACCOUNT), Action::Pause]
+        );
+        clock.advance(10 * 3600 * Duration::from_secs(1));
+        let noise = [
+            Event::Tick,
+            Event::SyncFailed,
+            Event::SyncOk { new_messages: 3 },
+            Event::IdleWake { lasted: IDLE_MAX },
+            Event::IdleFailed,
+            Event::IdleUnsupported,
+            Event::MailboxOpened(SECONDARY),
+            Event::Resumed,
+            Event::ConditionsChanged(Conditions::default()),
+        ];
+        for event in noise {
+            assert!(
+                s.handle(event).is_empty(),
+                "{event:?} no debía producir acciones"
+            );
+        }
+        assert_eq!(
+            without_sleep(s.handle(Event::Reauthorized)),
+            vec![Action::StartIdle(ACCOUNT), Action::SyncInbox(ACCOUNT)]
+        );
+    }
+
+    #[test]
+    fn reauthorized_while_offline_stays_paused() {
+        let (_clock, mut s) = setup();
+        s.start();
+        s.handle(Event::AuthFailed);
+        assert!(s.handle(Event::ConditionsChanged(offline())).is_empty());
+        assert_eq!(s.handle(Event::Reauthorized), vec![Action::Pause]);
+        assert!(s.handle(Event::Tick).is_empty());
     }
 }

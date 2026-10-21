@@ -16,17 +16,23 @@ const FALLBACK_DOMAIN: &str = "localhost";
 
 static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Sustituye los caracteres de control (CR, LF, tabulador...) por un espacio y
+/// recorta. Evita que un valor de usuario rompa las cabeceras MIME o haga
+/// fallar el formateo del mensaje.
+fn clean(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 fn mailbox(address: &Address) -> Result<Mailbox> {
     let email = address
         .email
         .parse::<lettre::Address>()
         .map_err(|e| Error::Protocol(format!("dirección inválida '{}': {e}", address.email)))?;
-    let name = address
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(str::to_owned);
+    let name = address.name.as_deref().map(clean).filter(|n| !n.is_empty());
     Ok(Mailbox::new(name, email))
 }
 
@@ -52,23 +58,23 @@ fn message_id(from: &Address) -> String {
 
 /// Normaliza un identificador de mensaje a la forma `<...>`.
 fn angle(id: &str) -> String {
-    let id = id.trim();
+    let id = clean(id);
     if id.starts_with('<') && id.ends_with('>') {
-        id.to_owned()
+        id
     } else {
         format!("<{id}>")
     }
 }
 
 fn content_type(mime: &str) -> ContentType {
-    ContentType::parse(mime)
+    ContentType::parse(&clean(mime))
         .unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("MIME válido"))
 }
 
 fn assemble(draft: &Draft, keep_bcc: bool) -> Result<Message> {
     let mut builder = Message::builder()
         .from(mailbox(&draft.from)?)
-        .subject(draft.subject.clone())
+        .subject(clean(&draft.subject))
         .message_id(Some(message_id(&draft.from)))
         .date_now();
 
@@ -128,7 +134,7 @@ fn assemble(draft: &Draft, keep_bcc: bool) -> Result<Message> {
         None => MultiPart::mixed().singlepart(SinglePart::plain(draft.text.clone())),
     };
     for (name, mime, data) in &draft.attachments {
-        let part = Attachment::new(name.clone()).body(data.clone(), content_type(mime));
+        let part = Attachment::new(clean(name)).body(data.clone(), content_type(mime));
         mixed = mixed.singlepart(part);
     }
     builder.multipart(mixed).map_err(body_error)
@@ -420,6 +426,56 @@ mod tests {
         let raw = text(&build_message(&d).unwrap());
         assert!(!raw.contains("presupuesto año"));
         assert!(raw.contains("application/pdf"));
+    }
+
+    /// Cabeceras (antes de la línea vacía) de un mensaje formateado.
+    fn header_section(raw: &str) -> &str {
+        raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(raw)
+    }
+
+    /// Ninguna línea de cabecera puede quedar huérfana (sin `Nombre:` ni plegado).
+    fn assert_no_stray_header_lines(raw: &str) {
+        for line in header_section(raw).split("\r\n") {
+            assert!(
+                line.starts_with(' ') || line.starts_with('\t') || line.contains(':'),
+                "línea de cabecera suelta: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_chars_in_names_and_subject_do_not_panic_or_break_headers() {
+        let mut d = base_draft();
+        d.from = addr(Some("A\r\nB"), "yo@example.com");
+        d.to = vec![addr(Some("C\r\nD"), "ana@example.org")];
+        d.cc = vec![addr(Some("E\nF"), "cc@example.org")];
+        d.subject = "Hola\r\nAdios".into();
+        d.in_reply_to = Some("abc@example.org\r\nBcc: x@example.net".into());
+        d.attachments.push((
+            "informe\r\n.pdf".into(),
+            "application/pdf\r\nX-Evil: 1".into(),
+            vec![1, 2, 3],
+        ));
+        d.html = Some("<p>Hola</p>".into());
+
+        let built = text(&build_message(&d).expect("build_message no debe fallar"));
+        let stored =
+            String::from_utf8(raw_message(&d).expect("raw_message no debe fallar")).expect("UTF-8");
+
+        for raw in [&built, &stored] {
+            assert_no_stray_header_lines(raw);
+            assert!(raw.contains("Subject: Hola  Adios"), "{raw}");
+            assert!(!raw.contains("X-Evil"), "{raw}");
+            assert!(!header_section(raw).contains("\r\nBcc: x@example.net"));
+        }
+    }
+
+    #[test]
+    fn mailbox_names_are_sanitized() {
+        let mb = mailbox(&addr(Some("  A\r\nB\t "), "yo@example.com")).unwrap();
+        assert_eq!(mb.name.as_deref(), Some("A  B"));
+        let blank = mailbox(&addr(Some("\r\n"), "yo@example.com")).unwrap();
+        assert_eq!(blank.name, None);
     }
 
     #[test]

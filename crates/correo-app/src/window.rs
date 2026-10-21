@@ -48,11 +48,21 @@ pub fn present(app: &adw::Application, services: Rc<Services>) {
     // Con CORREO_DEMO no se toca la red: la base es ficticia.
     if !demo_mode() {
         let weak = shell.weak.clone();
-        let handle = setup::start_sync(shell.services.clone(), app, move |account, ids| {
-            if let Some(s) = weak.upgrade() {
-                s.on_new_messages(account, &ids);
-            }
-        });
+        let weak_auth = shell.weak.clone();
+        let handle = setup::start_sync(
+            shell.services.clone(),
+            app,
+            move |account, ids| {
+                if let Some(s) = weak.upgrade() {
+                    s.on_new_messages(account, &ids);
+                }
+            },
+            move |account| {
+                if let Some(s) = weak_auth.upgrade() {
+                    s.on_auth_required(&account);
+                }
+            },
+        );
         *shell.sync.borrow_mut() = Some(handle);
         for account in shell.services.accounts().unwrap_or_default() {
             shell.sync_contacts(&account);
@@ -704,10 +714,28 @@ impl Shell {
 
         self.fresh_accounts.borrow_mut().push(account.id);
         if let Some(sync) = self.sync.borrow().as_ref() {
-            sync.start_account(account.clone());
+            sync.account_reauthorized(account.clone());
         }
         self.sync_contacts(&account);
         self.toast(format!("Cuenta añadida: {}", account.email));
+    }
+
+    /// El proveedor rechazó las credenciales (token revocado o caducado): la
+    /// sincronización de esa cuenta queda parada hasta que se vuelva a autorizar.
+    fn on_auth_required(self: &Rc<Self>, account: &Account) {
+        let toast = adw::Toast::new(&format!(
+            "{}: hay que volver a iniciar sesión",
+            account.email
+        ));
+        toast.set_button_label(Some("Reautorizar"));
+        toast.set_timeout(0);
+        let w = self.weak.clone();
+        toast.connect_button_clicked(move |_| {
+            if let Some(s) = w.upgrade() {
+                s.add_account();
+            }
+        });
+        self.toasts.add_toast(toast);
     }
 
     /// Descarga los contactos de la cuenta para el autocompletado del compositor. Un

@@ -136,9 +136,16 @@ pub struct Draft {
     pub attachments: Vec<(String, String, Vec<u8>)>,
 }
 
-/// Credencial para IMAP/SMTP XOAUTH2.
-#[derive(Debug, Clone)]
+/// Credencial para IMAP/SMTP XOAUTH2. No implementa `Debug` con el valor: un `{:?}` en un
+/// log no debe filtrar el token.
+#[derive(Clone)]
 pub struct AccessToken(pub String);
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessToken(<redacted>)")
+    }
+}
 
 /// Recurso para el que se pide el token. En Microsoft un token solo vale para un recurso:
 /// el correo (IMAP/SMTP) y Graph (contactos, perfil) necesitan tokens distintos.
@@ -183,4 +190,19 @@ pub trait ContactSource: Send + Sync {
 #[async_trait::async_trait]
 pub trait Sender: Send + Sync {
     async fn send(&self, draft: &Draft) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccessToken;
+
+    #[test]
+    fn access_token_debug_redacts_secret() {
+        let token = AccessToken("ya29.supersecreto".into());
+        let shown = format!("{token:?}");
+        assert!(!shown.contains("supersecreto"));
+        assert!(shown.contains("<redacted>"));
+        // El valor sigue accesible para XOAUTH2.
+        assert_eq!(token.0, "ya29.supersecreto");
+    }
 }

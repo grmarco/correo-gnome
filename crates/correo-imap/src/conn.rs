@@ -1,11 +1,14 @@
 //! Conexión IMAP sobre TLS (rustls + webpki-roots) y autenticación XOAUTH2.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_imap::{Authenticator, Client, Session};
 use correo_core::{Error, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -13,6 +16,17 @@ use tokio_rustls::client::TlsStream;
 use crate::parse::xoauth2_initial_response;
 
 pub type ImapSession = Session<TlsStream<TcpStream>>;
+
+/// Límite para TCP + TLS + saludo.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Límite para el login XOAUTH2.
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Límite para cada operación IMAP (en los FETCH de sincronización, por lote).
+pub const OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Keepalive TCP: primera sonda tras 60 s de inactividad, luego cada 20 s.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Capacidades del servidor relevantes para este backend.
 #[derive(Debug, Clone, Copy, Default)]
@@ -29,11 +43,38 @@ pub struct Conn {
     pub caps: Caps,
 }
 
-/// Abre TCP + TLS, lee el saludo, autentica con XOAUTH2 y consulta CAPABILITY.
-pub async fn connect(host: &str, port: u16, email: &str, access_token: &str) -> Result<Conn> {
+/// Error de red por tiempo agotado. El llamador debe descartar la sesión.
+pub fn timeout_error(limit: Duration) -> Error {
+    Error::Network(format!("tiempo de espera agotado ({} s)", limit.as_secs()))
+}
+
+/// Acota una operación IMAP con `limit`. Al expirar devuelve `Error::Network`.
+pub async fn imap<T>(
+    limit: Duration,
+    fut: impl Future<Output = async_imap::error::Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r.map_err(map_imap_error),
+        Err(_) => Err(timeout_error(limit)),
+    }
+}
+
+/// Activa TCP keepalive para detectar conexiones muertas sin esperar al timeout.
+fn set_keepalive(tcp: &TcpStream) -> Result<()> {
+    let params = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    SockRef::from(tcp)
+        .set_tcp_keepalive(&params)
+        .map_err(|e| Error::Network(format!("keepalive TCP: {e}")))
+}
+
+/// TCP (con keepalive) + TLS + saludo IMAP.
+async fn open(host: &str, port: u16) -> Result<Client<TlsStream<TcpStream>>> {
     let tcp = TcpStream::connect((host, port))
         .await
         .map_err(|e| Error::Network(format!("conectando a {host}:{port}: {e}")))?;
+    set_keepalive(&tcp)?;
 
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|e| Error::Network(format!("nombre de servidor no válido: {e}")))?;
@@ -48,27 +89,32 @@ pub async fn connect(host: &str, port: u16, email: &str, access_token: &str) -> 
         .await
         .map_err(|e| Error::Network(format!("saludo IMAP: {e}")))?
         .ok_or_else(|| Error::Network("el servidor cerró antes del saludo".into()))?;
+    Ok(client)
+}
+
+/// Abre TCP + TLS (con los límites de tiempo), autentica con XOAUTH2 y consulta CAPABILITY.
+pub async fn connect(host: &str, port: u16, email: &str, access_token: &str) -> Result<Conn> {
+    let client = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port))
+        .await
+        .map_err(|_| timeout_error(CONNECT_TIMEOUT))??;
 
     let auth = XOAuth2::new(xoauth2_initial_response(email, access_token));
-    let mut session =
-        client
-            .authenticate("XOAUTH2", auth)
-            .await
-            .map_err(|(e, _client)| match e {
-                async_imap::error::Error::No(m) | async_imap::error::Error::Bad(m) => {
-                    Error::Auth(format!("XOAUTH2 rechazado: {m}"))
-                }
-                other => map_imap_error(other),
-            })?;
-
-    let caps = {
-        let c = session.capabilities().await.map_err(map_imap_error)?;
-        Caps {
-            mov: c.has_str("MOVE"),
-            uidplus: c.has_str("UIDPLUS"),
-            gmail_labels: c.has_str("X-GM-EXT-1"),
-            idle: c.has_str("IDLE"),
+    let login = tokio::time::timeout(LOGIN_TIMEOUT, client.authenticate("XOAUTH2", auth))
+        .await
+        .map_err(|_| timeout_error(LOGIN_TIMEOUT))?;
+    let mut session = login.map_err(|(e, _client)| match e {
+        async_imap::error::Error::No(m) | async_imap::error::Error::Bad(m) => {
+            Error::Auth(format!("XOAUTH2 rechazado: {m}"))
         }
+        other => map_imap_error(other),
+    })?;
+
+    let c = imap(OP_TIMEOUT, session.capabilities()).await?;
+    let caps = Caps {
+        mov: c.has_str("MOVE"),
+        uidplus: c.has_str("UIDPLUS"),
+        gmail_labels: c.has_str("X-GM-EXT-1"),
+        idle: c.has_str("IDLE"),
     };
     Ok(Conn { session, caps })
 }
@@ -156,5 +202,37 @@ mod tests {
     #[test]
     fn tls_config_builds_with_ring_provider() {
         assert!(tls_config().is_ok());
+    }
+
+    #[tokio::test]
+    async fn imap_helper_turns_expired_limit_into_network_error() {
+        let limit = Duration::from_millis(5);
+        let got: Result<()> = imap(
+            limit,
+            std::future::pending::<async_imap::error::Result<()>>(),
+        )
+        .await;
+        assert!(is_network(&got.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn imap_helper_keeps_server_results_and_maps_errors() {
+        let ok = imap(OP_TIMEOUT, async { Ok::<_, async_imap::error::Error>(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+        let no = imap(OP_TIMEOUT, async {
+            Err::<(), _>(async_imap::error::Error::No("cuota".into()))
+        })
+        .await;
+        assert!(matches!(no, Err(Error::Protocol(m)) if m == "cuota"));
+    }
+
+    #[tokio::test]
+    async fn keepalive_is_set_on_a_real_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp, _peer) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let tcp = tcp.unwrap();
+        set_keepalive(&tcp).unwrap();
+        assert!(SockRef::from(&tcp).keepalive().unwrap());
     }
 }

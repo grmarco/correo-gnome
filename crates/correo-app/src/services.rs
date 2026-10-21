@@ -1,17 +1,29 @@
 //! Capa de servicios compartida por la interfaz: caché, tokens y backends por cuenta.
 //! La UI vive en el hilo principal de GTK; el trabajo de red va al runtime de tokio.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use correo_core::{Account, ContactSource, MailBackend, Provider, Result, Sender, TokenProvider};
+use correo_core::{
+    Account, AccountId, ContactSource, MailBackend, Provider, Result, Sender, TokenProvider,
+};
 use correo_imap::ImapBackend;
 use correo_store::Store;
+
+/// Future que borra los tokens de una cuenta (memoria y almacén seguro).
+pub type ForgetTokensFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+/// Hook que aporta la app para olvidar los tokens de una cuenta.
+pub type ForgetTokens = Arc<dyn Fn(AccountId) -> ForgetTokensFuture + Send + Sync>;
 
 pub struct Services {
     pub store: Arc<Mutex<Store>>,
     pub tokens: Arc<dyn TokenProvider>,
     runtime: tokio::runtime::Runtime,
+    /// Backend IMAP por cuenta: conserva su conexión TLS+sesión entre operaciones.
+    backends: Mutex<HashMap<AccountId, Arc<ImapBackend>>>,
+    forget_tokens: Option<ForgetTokens>,
 }
 
 impl Services {
@@ -26,7 +38,15 @@ impl Services {
             store: Arc::new(Mutex::new(store)),
             tokens,
             runtime,
+            backends: Mutex::new(HashMap::new()),
+            forget_tokens: None,
         })
+    }
+
+    /// Hook para borrar los tokens de una cuenta al eliminarla (lo aporta `setup`).
+    pub fn with_forget_tokens(mut self, forget: ForgetTokens) -> Self {
+        self.forget_tokens = Some(forget);
+        self
     }
 
     /// Ejecuta un future en el runtime de tokio y devuelve su resultado.
@@ -40,8 +60,23 @@ impl Services {
         async move { handle.await.expect("tarea de tokio cancelada") }
     }
 
+    /// Backend de correo de la cuenta, reutilizado entre llamadas. Tras cambiar el proveedor
+    /// o el correo de una cuenta, llamar antes a `forget_backend`.
     pub fn backend(&self, account: &Account) -> Arc<dyn MailBackend> {
-        Arc::new(self.imap(account))
+        let mut backends = self.backends.lock().unwrap_or_else(|p| p.into_inner());
+        let backend = backends
+            .entry(account.id)
+            .or_insert_with(|| Arc::new(self.imap(account)));
+        Arc::clone(backend) as Arc<dyn MailBackend>
+    }
+
+    /// Descarta el backend cacheado de la cuenta (cierra su conexión al liberarse).
+    #[allow(dead_code)] // lo usa `remove_account`, aún sin llamador en la UI.
+    pub fn forget_backend(&self, account: AccountId) {
+        self.backends
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&account);
     }
 
     /// Backend IMAP concreto (para operaciones fuera de `MailBackend`, p. ej. IDLE o
@@ -73,5 +108,27 @@ impl Services {
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
         self.store.lock().expect("store envenenado").list_accounts()
+    }
+
+    /// Elimina la cuenta de la caché y sus tokens. La BD se borra primero (si la cuenta no
+    /// existe, no se toca ningún token). El borrado de tokens va en segundo plano y sus
+    /// errores se registran en stderr.
+    #[allow(dead_code)] // pendiente de que la UI de eliminar cuenta lo llame.
+    pub fn remove_account(&self, account: AccountId) -> Result<()> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_account(account)?;
+        self.forget_backend(account);
+        if let Some(forget) = self.forget_tokens.clone() {
+            self.runtime.spawn(async move {
+                if let Err(e) = forget(account).await {
+                    eprintln!(
+                        "correo: no se pudieron borrar los tokens de la cuenta {account}: {e}"
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 }

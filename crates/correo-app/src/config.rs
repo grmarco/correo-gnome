@@ -10,6 +10,8 @@ use serde::Deserialize;
 pub const DEFAULT_SYNC_DAYS: u32 = 14;
 pub const ENV_GOOGLE_CLIENT_ID: &str = "CORREO_GOOGLE_CLIENT_ID";
 pub const ENV_MICROSOFT_CLIENT_ID: &str = "CORREO_MICROSOFT_CLIENT_ID";
+pub const ENV_GOOGLE_CLIENT_SECRET: &str = "CORREO_GOOGLE_CLIENT_SECRET";
+pub const ENV_MICROSOFT_CLIENT_SECRET: &str = "CORREO_MICROSOFT_CLIENT_SECRET";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -22,10 +24,26 @@ pub struct Config {
     pub microsoft: ProviderConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProviderConfig {
     pub client_id: Option<String>,
+    /// Necesario en la práctica para Google (aplicación de escritorio). En apps de escritorio
+    /// el secreto no es confidencial; ver docs/OAUTH.md.
+    pub client_secret: Option<String>,
+}
+
+/// El secreto no aparece nunca en los logs ni en `{:?}`.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -54,6 +72,12 @@ impl Config {
         if let Some(id) = var(ENV_MICROSOFT_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
             self.microsoft.client_id = Some(id.trim().to_owned());
         }
+        if let Some(secret) = var(ENV_GOOGLE_CLIENT_SECRET).filter(|v| !v.trim().is_empty()) {
+            self.google.client_secret = Some(secret.trim().to_owned());
+        }
+        if let Some(secret) = var(ENV_MICROSOFT_CLIENT_SECRET).filter(|v| !v.trim().is_empty()) {
+            self.microsoft.client_secret = Some(secret.trim().to_owned());
+        }
     }
 
     /// Client ID de Google, si está configurado y no está vacío.
@@ -64,6 +88,16 @@ impl Config {
     /// Client ID de Microsoft, si está configurado y no está vacío.
     pub fn microsoft_client_id(&self) -> Option<&str> {
         non_empty(self.microsoft.client_id.as_deref())
+    }
+
+    /// Client secret de Google, si está configurado y no está vacío.
+    pub fn google_client_secret(&self) -> Option<&str> {
+        non_empty(self.google.client_secret.as_deref())
+    }
+
+    /// Client secret de Microsoft, si está configurado y no está vacío.
+    pub fn microsoft_client_secret(&self) -> Option<&str> {
+        non_empty(self.microsoft.client_secret.as_deref())
     }
 }
 
@@ -147,6 +181,43 @@ mod tests {
         let mut config = Config::default();
         config.apply_env(|name| (name == ENV_MICROSOFT_CLIENT_ID).then(|| "ms-id".to_owned()));
         assert_eq!(config.microsoft_client_id(), Some("ms-id"));
+    }
+
+    #[test]
+    fn parses_client_secrets_and_treats_blank_as_absent() {
+        let config = Config::parse(
+            r#"
+            [google]
+            client_id = "g"
+            client_secret = "GOCSPX-abc"
+
+            [microsoft]
+            client_secret = "   "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.google_client_secret(), Some("GOCSPX-abc"));
+        assert_eq!(config.microsoft_client_secret(), None);
+    }
+
+    #[test]
+    fn env_sets_client_secrets_and_overrides_file() {
+        let mut config = Config::parse("[google]\nclient_secret = \"from-file\"\n").unwrap();
+        config.apply_env(|name| match name {
+            ENV_GOOGLE_CLIENT_SECRET => Some(" from-env ".into()),
+            ENV_MICROSOFT_CLIENT_SECRET => Some("ms-secret".into()),
+            _ => None,
+        });
+        assert_eq!(config.google_client_secret(), Some("from-env"));
+        assert_eq!(config.microsoft_client_secret(), Some("ms-secret"));
+    }
+
+    #[test]
+    fn debug_output_redacts_client_secret() {
+        let config = Config::parse("[google]\nclient_secret = \"GOCSPX-supersecreto\"\n").unwrap();
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("supersecreto"));
+        assert!(shown.contains("<redacted>"));
     }
 
     #[test]

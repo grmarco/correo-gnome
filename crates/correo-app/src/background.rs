@@ -16,8 +16,8 @@ use correo_core::{
 use correo_imap::ImapBackend;
 use correo_store::Store;
 use correo_sync::{
-    backoff_delay, Event, IdleBackend, Jitter, NewMessageIds, SyncChannels, SyncReport, SyncRunner,
-    SyncScheduler, SystemClock,
+    backoff_delay, Event, IdleBackend, Jitter, NewMessageIds, SyncChannels, SyncNotice, SyncReport,
+    SyncRunner, SyncScheduler, SystemClock,
 };
 use gtk::glib;
 use tokio::sync::mpsc;
@@ -37,6 +37,7 @@ type Senders = Rc<RefCell<HashMap<AccountId, mpsc::Sender<Event>>>>;
 pub struct SyncHandle {
     services: Rc<Services>,
     on_new: Rc<dyn Fn(Account, Vec<MessageId>)>,
+    on_auth: Rc<dyn Fn(Account)>,
     senders: Senders,
     power: Rc<PowerWatcher>,
     _resume: Option<ResumeWatch>,
@@ -53,6 +54,17 @@ impl SyncHandle {
         self.send(account, Event::MailboxOpened(mailbox));
     }
 
+    /// La cuenta se ha vuelto a autorizar: reanuda su runner, o lo arranca si nunca llegó
+    /// a empezar (p. ej. el primer intento falló por credenciales revocadas).
+    pub fn account_reauthorized(&self, account: Account) {
+        let running = self.senders.borrow().contains_key(&account.id);
+        if running {
+            self.send(account.id, Event::Reauthorized);
+        } else {
+            self.start_account(account);
+        }
+    }
+
     /// Empieza a sincronizar una cuenta (las cuentas existentes al arrancar y las nuevas
     /// tras `add_account_dialog`).
     pub fn start_account(&self, account: Account) {
@@ -64,10 +76,22 @@ impl SyncHandle {
         });
         let senders = Rc::clone(&self.senders);
         let on_new = Rc::clone(&self.on_new);
+        let on_auth = Rc::clone(&self.on_auth);
         let power = Rc::clone(&self.power);
         glib::MainContext::default().spawn_local(async move {
             match job.await {
-                Ok(channels) => attach(account, channels, &senders, &on_new, power.conditions()),
+                Ok(channels) => attach(
+                    account,
+                    channels,
+                    &senders,
+                    &on_new,
+                    &on_auth,
+                    power.conditions(),
+                ),
+                Err(Error::Auth(e)) => {
+                    eprintln!("correo: {}: requiere reautorización ({e})", account.email);
+                    on_auth(account);
+                }
                 Err(e) => eprintln!("correo: no se pudo iniciar la sincronización: {e}"),
             }
         });
@@ -89,6 +113,7 @@ pub fn start_sync(
     services: Rc<Services>,
     app: &adw::Application,
     on_new: impl Fn(Account, Vec<MessageId>) + 'static,
+    on_auth_required: impl Fn(Account) + 'static,
 ) -> SyncHandle {
     if super::app_config().run_in_background {
         // Modo residente: el guard vive lo que la app. Se olvida a propósito para que
@@ -116,6 +141,7 @@ pub fn start_sync(
     let handle = SyncHandle {
         services: Rc::clone(&services),
         on_new: Rc::new(on_new),
+        on_auth: Rc::new(on_auth_required),
         senders,
         power: Rc::new(power),
         _resume: resume,
@@ -136,6 +162,7 @@ fn attach(
     channels: SyncChannels,
     senders: &Senders,
     on_new: &Rc<dyn Fn(Account, Vec<MessageId>)>,
+    on_auth: &Rc<dyn Fn(Account)>,
     conditions: correo_sync::Conditions,
 ) {
     let SyncChannels {
@@ -147,9 +174,15 @@ fn attach(
     senders.borrow_mut().insert(account.id, events);
 
     let on_new = Rc::clone(on_new);
+    let on_auth = Rc::clone(on_auth);
     glib::MainContext::default().spawn_local(async move {
-        while let Some(SyncReport { new_messages, .. }) = reports.recv().await {
-            on_new(account.clone(), new_messages);
+        while let Some(notice) = reports.recv().await {
+            match notice {
+                SyncNotice::NewMessages(SyncReport { new_messages, .. }) => {
+                    on_new(account.clone(), new_messages)
+                }
+                SyncNotice::AuthRequired { .. } => on_auth(account.clone()),
+            }
         }
     });
 }
@@ -183,6 +216,7 @@ async fn inbox_with_retry(backend: &ImapBackend, account: &Account) -> Result<Ma
                         Error::NotFound(format!("bandeja de entrada de {}", account.email))
                     });
             }
+            Err(e @ Error::Auth(_)) => return Err(e),
             Err(e) => {
                 let delay = backoff_delay(attempt, &mut jitter);
                 eprintln!(

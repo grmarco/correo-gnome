@@ -13,7 +13,7 @@ mod reader_web_policy;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -22,11 +22,31 @@ use gtk::{gio, glib};
 
 use crate::services::Services;
 use crate::ui_types::ComposeMode;
-use reader_html::{count_images, html_to_segments, plain_to_segments, Segment, Style};
+use reader_html::{
+    count_images, html_to_segments, link_looks_deceptive, plain_to_segments, Segment, Style,
+    MAX_LEVEL,
+};
 
 type ComposeFn = Box<dyn Fn(ComposeMode)>;
 
 const BANNER_NORMAL: &str = "Imágenes bloqueadas para proteger tu privacidad";
+/// Cuerpos mayores que esto se truncan: la conversión corre en el hilo de GTK.
+const BODY_LIMIT: usize = 200 * 1024;
+#[cfg(feature = "webkit")]
+const TRUNCATED_NOTICE: &str = "Mensaje truncado, usa Ver original";
+#[cfg(not(feature = "webkit"))]
+const TRUNCATED_NOTICE: &str = "Mensaje truncado: no se muestra el contenido completo";
+/// Longitud máxima (en caracteres) de un nombre de adjunto al guardarlo.
+const MAX_NAME_CHARS: usize = 200;
+/// Carpeta bajo `$XDG_RUNTIME_DIR` donde se abren los adjuntos (0700).
+const ATTACHMENTS_DIR: &str = "correo-adjuntos";
+/// Extensiones que pueden ejecutar código o cargar contenido activo: se pide confirmación.
+const RISKY_EXTENSIONS: &[&str] = &[
+    "html", "htm", "shtml", "xhtml", "xht", "svg", "svgz", "js", "mjs", "vbs", "wsf", "hta", "sh",
+    "bash", "zsh", "desktop", "exe", "msi", "bat", "cmd", "com", "scr", "ps1", "reg", "lnk", "jar",
+    "py", "pl", "rb", "php", "appimage", "run", "bin", "deb", "rpm", "flatpak", "dll", "so",
+    "docm", "xlsm", "pptm", "dotm", "xltm", "ppsm",
+];
 #[cfg(feature = "webkit")]
 const ORIGINAL_LABEL: &str = "Ver original";
 
@@ -37,6 +57,13 @@ struct Current {
     mailbox: Option<Mailbox>,
     header: Option<MessageHeader>,
     body: Option<MessageBody>,
+}
+
+/// Enlace del cuerpo: destino real y texto visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkTarget {
+    href: String,
+    shown: String,
 }
 
 /// Acciones que modifican el mensaje en el servidor.
@@ -52,8 +79,8 @@ struct Inner {
     /// Se incrementa en cada `show`/`clear`: descarta respuestas de peticiones obsoletas.
     generation: Cell<u64>,
     current: RefCell<Current>,
-    /// URLs de los enlaces del cuerpo actual; el tag `link-N` apunta a `links[N]`.
-    links: RefCell<Vec<String>>,
+    /// Enlaces del cuerpo actual; el tag `link-N` apunta a `links[N]`.
+    links: RefCell<Vec<LinkTarget>>,
     compose: RefCell<Option<ComposeFn>>,
     /// Se avisa tras cambios que afectan a la lista (archivar, borrar, leer o no leer).
     changed: RefCell<Option<Rc<dyn Fn()>>>,
@@ -284,6 +311,7 @@ impl MessageView {
         connect_action_button(&inner, &delete, Action::Delete);
         connect_action_button(&inner, &mark_unread, Action::MarkUnread);
         connect_link_clicks(&inner);
+        connect_link_tooltips(&inner);
 
         let retry = gtk::Button::with_label("Reintentar");
         retry.set_halign(gtk::Align::Center);
@@ -377,7 +405,19 @@ fn connect_action_button(inner: &Rc<Inner>, button: &gtk::Button, action: Action
     });
 }
 
-/// Clic en un enlace del cuerpo: abre la URL con el lanzador de GTK.
+/// Enlace bajo la posición (coordenadas del widget), si la hay.
+fn link_at(inner: &Inner, view: &gtk::TextView, x: i32, y: i32) -> Option<LinkTarget> {
+    let (bx, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x, y);
+    let iter = view.iter_at_location(bx, by)?;
+    let links = inner.links.borrow();
+    iter.tags().iter().find_map(|tag| {
+        let name = tag.name()?;
+        let idx: usize = name.strip_prefix("link-")?.parse().ok()?;
+        links.get(idx).cloned()
+    })
+}
+
+/// Clic en un enlace del cuerpo: si el texto parece otro dominio, pide confirmación.
 fn connect_link_clicks(inner: &Rc<Inner>) {
     let click = gtk::GestureClick::new();
     let weak = Rc::downgrade(inner);
@@ -389,26 +429,67 @@ fn connect_link_clicks(inner: &Rc<Inner>) {
         else {
             return;
         };
-        let (bx, by) =
-            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let Some(iter) = view.iter_at_location(bx, by) else {
-            return;
-        };
-        let url = iter.tags().iter().find_map(|tag| {
-            let name = tag.name()?;
-            let idx: usize = name.strip_prefix("link-")?.parse().ok()?;
-            inner.links.borrow().get(idx).cloned()
-        });
-        if let Some(url) = url {
-            let parent = view.root().and_then(|r| r.downcast::<gtk::Window>().ok());
-            gtk::UriLauncher::new(&url).launch(parent.as_ref(), None::<&gio::Cancellable>, |res| {
-                if let Err(e) = res {
-                    eprintln!("no se pudo abrir el enlace: {e}");
-                }
-            });
+        if let Some(link) = link_at(&inner, &view, x as i32, y as i32) {
+            open_link(&view, &link);
         }
     });
     inner.text_view.add_controller(click);
+}
+
+/// Muestra el destino real del enlace al pasar el ratón por encima.
+fn connect_link_tooltips(inner: &Rc<Inner>) {
+    inner.text_view.set_has_tooltip(true);
+    let weak = Rc::downgrade(inner);
+    inner
+        .text_view
+        .connect_query_tooltip(move |view, x, y, _keyboard, tooltip| {
+            let Some(inner) = weak.upgrade() else {
+                return false;
+            };
+            match link_at(&inner, view, x, y) {
+                Some(link) => {
+                    tooltip.set_text(Some(&link.href));
+                    true
+                }
+                None => false,
+            }
+        });
+}
+
+/// Abre el enlace con el lanzador de GTK. Si el texto visible aparenta otro dominio
+/// (posible suplantación), antes pide confirmación.
+fn open_link(widget: &impl IsA<gtk::Widget>, link: &LinkTarget) {
+    if !link_looks_deceptive(&link.shown, &link.href) {
+        launch_url(widget, &link.href);
+        return;
+    }
+    let body = format!(
+        "El texto del enlace parece «{}», pero apunta a {}. Comprueba la dirección antes de abrirla.",
+        link.shown, link.href
+    );
+    let dialog = adw::AlertDialog::new(Some("¿Abrir este enlace?"), Some(&body));
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("open", "Abrir");
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let target = widget.clone().upcast::<gtk::Widget>();
+    let href = link.href.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "open" {
+            launch_url(&target, &href);
+        }
+    });
+    dialog.present(Some(widget));
+}
+
+fn launch_url(widget: &impl IsA<gtk::Widget>, url: &str) {
+    let parent = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+    gtk::UriLauncher::new(url).launch(parent.as_ref(), None::<&gio::Cancellable>, |res| {
+        if let Err(e) = res {
+            eprintln!("no se pudo abrir el enlace: {e}");
+        }
+    });
 }
 
 fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: MessageHeader) {
@@ -660,17 +741,41 @@ fn format_addresses(addresses: &[Address]) -> String {
         .join(", ")
 }
 
+/// Recorta `text` a `BODY_LIMIT` bytes en un límite de carácter. Devuelve si hubo recorte.
+fn limit_body(text: &str) -> (&str, bool) {
+    if text.len() <= BODY_LIMIT {
+        return (text, false);
+    }
+    let mut end = BODY_LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
 fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
-    let (segments, remote_images) = match body.html.as_deref().filter(|h| !h.trim().is_empty()) {
-        Some(html) => (html_to_segments(html), count_images(html)),
+    let html = body.html.as_deref().filter(|h| !h.trim().is_empty());
+    let (segments, remote_images, truncated) = match html {
+        Some(html) => {
+            let (html, truncated) = limit_body(html);
+            (html_to_segments(html), count_images(html), truncated)
+        }
         None => match body.text.as_deref() {
-            Some(text) => (plain_to_segments(text), 0),
-            None => (Vec::new(), 0),
+            Some(text) => {
+                let (text, truncated) = limit_body(text);
+                (plain_to_segments(text), 0, truncated)
+            }
+            None => (Vec::new(), 0, false),
         },
     };
-    inner.banner.set_revealed(remote_images > 0);
+    if truncated {
+        inner.banner.set_title(TRUNCATED_NOTICE);
+        inner.banner.set_revealed(true);
+    } else {
+        inner.banner.set_revealed(remote_images > 0);
+    }
 
-    let mut links = Vec::new();
+    let mut links: Vec<LinkTarget> = Vec::new();
     let buffer = if segments.is_empty() {
         let b = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
         b.set_text("Este mensaje no tiene contenido.");
@@ -682,9 +787,7 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     inner.text_view.set_buffer(Some(&buffer));
     inner.stack.set_visible_child_name("content");
     #[cfg(feature = "webkit")]
-    inner
-        .original
-        .set_visible(body.html.as_deref().is_some_and(|h| !h.trim().is_empty()));
+    inner.original.set_visible(html.is_some());
 
     populate_attachments(inner, body);
 }
@@ -783,7 +886,11 @@ fn populate_attachments(inner: &Rc<Inner>, body: &MessageBody) {
     for (index, att) in body.attachments.iter().enumerate() {
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&att.filename).as_str())
-            .subtitle(format!("{} · {}", att.mime_type, human_size(att.size)))
+            .subtitle(glib::markup_escape_text(&format!(
+                "{} · {}",
+                att.mime_type,
+                human_size(att.size)
+            )))
             .build();
         let save = gtk::Button::from_icon_name("document-save-symbolic");
         save.set_tooltip_text(Some("Guardar"));
@@ -851,45 +958,84 @@ fn save_attachment(inner: &Rc<Inner>, btn: &gtk::Button, att: AttachmentRef) {
     });
 }
 
-fn open_attachment(inner: &Rc<Inner>, btn: &gtk::Button, att: AttachmentRef) {
-    let dir = std::env::temp_dir().join("correo-adjuntos");
-    let path = dir.join(safe_file_name(&att.filename));
-    let parent = btn.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+/// Abre el adjunto desde una carpeta privada por apertura. Los tipos que pueden ejecutar
+/// código o cargar contenido activo piden confirmación antes.
+fn open_attachment(inner: &Rc<Inner>, _btn: &gtk::Button, att: AttachmentRef) {
+    let name = safe_file_name(&att.filename);
+    let risky = is_risky_extension(&name);
     let weak = Rc::downgrade(inner);
-    let p = path.clone();
-    let on_done = move |result: Result<(), String>| {
-        let Some(inner) = weak.upgrade() else { return };
-        match result {
-            Ok(()) => {
-                let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&p)));
-                launcher.launch(parent.as_ref(), None::<&gio::Cancellable>, |res| {
-                    if let Err(e) = res {
-                        eprintln!("no se pudo abrir el adjunto: {e}");
-                    }
-                });
+    fetch_attachment_to(
+        inner,
+        att,
+        move |bytes| {
+            write_private_attachment(&attachments_dir(), &name, &bytes).map_err(|e| e.to_string())
+        },
+        move |result| {
+            let Some(inner) = weak.upgrade() else { return };
+            match result {
+                Ok(path) if risky => confirm_open(&inner.root, path),
+                Ok(path) => launch_file(&inner.root, &path),
+                Err(e) => alert(&inner.root, "No se pudo descargar el adjunto", &e),
             }
-            Err(e) => alert(&inner.root, "No se pudo descargar el adjunto", &e),
+        },
+    );
+}
+
+/// Pregunta antes de abrir un adjunto de tipo activo o ejecutable.
+fn confirm_open(widget: &gtk::Box, path: PathBuf) {
+    let dialog = adw::AlertDialog::new(
+        Some("¿Abrir este archivo?"),
+        Some("Puede ejecutar código o cargar contenido activo. Ábrelo solo si confías en el remitente."),
+    );
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("open", "Abrir");
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let target = widget.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "open" {
+            launch_file(&target, &path);
         }
-    };
-    fetch_attachment_to(inner, att, path, on_done);
+    });
+    dialog.present(Some(widget));
+}
+
+fn launch_file(widget: &impl IsA<gtk::Widget>, path: &Path) {
+    let parent = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+    gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
+        parent.as_ref(),
+        None::<&gio::Cancellable>,
+        |res| {
+            if let Err(e) = res {
+                eprintln!("no se pudo abrir el adjunto: {e}");
+            }
+        },
+    );
 }
 
 /// Descarga el adjunto en `dest` (solo guardar; errores en un diálogo).
 fn download_to(inner: &Rc<Inner>, att: AttachmentRef, dest: PathBuf) {
     let weak = Rc::downgrade(inner);
-    fetch_attachment_to(inner, att, dest, move |result| {
-        if let (Err(e), Some(inner)) = (result, weak.upgrade()) {
-            alert(&inner.root, "No se pudo guardar el adjunto", &e);
-        }
-    });
+    fetch_attachment_to(
+        inner,
+        att,
+        move |bytes| std::fs::write(&dest, bytes).map_err(|e| e.to_string()),
+        move |result| {
+            if let (Err(e), Some(inner)) = (result, weak.upgrade()) {
+                alert(&inner.root, "No se pudo guardar el adjunto", &e);
+            }
+        },
+    );
 }
 
-/// Pide los bytes al backend y los escribe en `dest` fuera del hilo de GTK.
-fn fetch_attachment_to(
+/// Pide los bytes al backend y los entrega a `write` fuera del hilo de GTK; `on_done` se
+/// ejecuta en el hilo de GTK con el resultado.
+fn fetch_attachment_to<T: Send + 'static>(
     inner: &Rc<Inner>,
     att: AttachmentRef,
-    dest: PathBuf,
-    on_done: impl FnOnce(Result<(), String>) + 'static,
+    write: impl FnOnce(Vec<u8>) -> Result<T, String> + Send + 'static,
+    on_done: impl FnOnce(Result<T, String>) + 'static,
 ) {
     let backend = inner.services.backend(&att.account);
     let handle = inner.services.spawn(async move {
@@ -897,14 +1043,84 @@ fn fetch_attachment_to(
             .fetch_attachment(&att.mailbox, att.uid, att.index)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&dest, bytes).map_err(|e| e.to_string())
+        write(bytes)
     });
     glib::MainContext::default().spawn_local(async move {
         on_done(handle.await);
     });
+}
+
+/// Carpeta de los adjuntos abiertos: `$XDG_RUNTIME_DIR/correo-adjuntos` (o la equivalente de
+/// GLib). Es del usuario y de uso temporal.
+fn attachments_dir() -> PathBuf {
+    glib::user_runtime_dir().join(ATTACHMENTS_DIR)
+}
+
+/// Escribe el adjunto en un subdirectorio nuevo y aleatorio de `base` (0700), con el fichero
+/// creado en exclusiva con modo 0600 y sin seguir enlaces simbólicos. Si el nombre ya existe
+/// en ese subdirectorio, añade un sufijo `(n)`.
+fn write_private_attachment(base: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(base)?;
+    std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))?;
+    let dir = base.join(glib::uuid_string_random().as_str());
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+
+    let mut n = 1;
+    loop {
+        let path = dir.join(numbered_name(name, n));
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path);
+        match opened {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Nombre para el intento `n` (1 = el original): `informe (2).pdf`, `archivo (2)`.
+fn numbered_name(name: &str, n: u32) -> String {
+    if n == 1 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// Borra la carpeta de adjuntos abiertos (best-effort).
+fn cleanup_attachments() {
+    let _ = std::fs::remove_dir_all(attachments_dir());
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        cleanup_attachments();
+    }
+}
+
+/// `true` si la extensión del nombre puede ejecutar código o cargar contenido activo.
+fn is_risky_extension(name: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => RISKY_EXTENSIONS
+            .iter()
+            .any(|risky| ext.eq_ignore_ascii_case(risky)),
+        _ => false,
+    }
 }
 
 fn alert(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str) {
@@ -913,14 +1129,31 @@ fn alert(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str) {
     dialog.present(Some(parent));
 }
 
-/// Nombre de fichero seguro: sin rutas ni caracteres de control, nunca vacío ni oculto.
+/// Caracteres de control de dirección bidi (RLO, LRI…): disfrazan la extensión real.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Nombre de fichero seguro: sin rutas, caracteres de control ni bidi, nunca vacío ni oculto.
 fn safe_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .map(|c| if c.is_control() { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || is_bidi_control(c) || matches!(c, '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
-    let cleaned = cleaned.trim().trim_start_matches('.');
+    let cleaned: String = cleaned
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim();
     if cleaned.is_empty() {
         "adjunto".into()
     } else {
@@ -940,7 +1173,7 @@ fn human_size(bytes: u64) -> String {
 
 /// Construye el `TextBuffer` con etiquetas a partir de los segmentos.
 /// Las URL de los enlaces se guardan en `links` (tag `link-N` -> `links[N]`).
-fn build_buffer(segments: &[Segment], links: &mut Vec<String>) -> gtk::TextBuffer {
+fn build_buffer(segments: &[Segment], links: &mut Vec<LinkTarget>) -> gtk::TextBuffer {
     let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
     let mut style_tags: HashMap<String, gtk::TextTag> = HashMap::new();
     let mut para_tags: HashMap<String, gtk::TextTag> = HashMap::new();
@@ -982,7 +1215,10 @@ fn build_buffer(segments: &[Segment], links: &mut Vec<String>) -> gtk::TextBuffe
                     tag.set_foreground(Some("#1c71d8"));
                     tag.set_underline(gtk::pango::Underline::Single);
                     buffer.tag_table().add(&tag);
-                    links.push(url.clone());
+                    links.push(LinkTarget {
+                        href: url.clone(),
+                        shown: text.clone(),
+                    });
                     tags.push(tag);
                 }
                 let mut end = buffer.end_iter();
@@ -1056,7 +1292,9 @@ fn para_tag(
         return tag.clone();
     }
     let tag = gtk::TextTag::new(None);
-    tag.set_left_margin(16 * (quote as i32 + indent as i32));
+    // Acotado por `MAX_LEVEL`: la margen nunca desborda.
+    let depth = quote.min(MAX_LEVEL) + indent.min(MAX_LEVEL);
+    tag.set_left_margin(16 * depth as i32);
     tag.set_pixels_below_lines(8);
     buffer.tag_table().add(&tag);
     cache.insert(key, tag.clone());
@@ -1074,6 +1312,76 @@ mod tests {
         assert_eq!(safe_file_name(".bashrc"), "bashrc");
         assert_eq!(safe_file_name(""), "adjunto");
         assert_eq!(safe_file_name("a\nb.txt"), "a_b.txt");
+    }
+
+    #[test]
+    fn safe_file_name_removes_bidi_controls_and_limits_length() {
+        // RLO (U+202E) oculta la extensión real: se sustituye.
+        assert_eq!(safe_file_name("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
+        assert_eq!(safe_file_name("a\u{2066}b\u{2069}.txt"), "a_b_.txt");
+        assert_eq!(safe_file_name("..\\..\\x"), "x");
+        assert_eq!(
+            safe_file_name(&"a".repeat(500)).chars().count(),
+            MAX_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn risky_extensions_are_detected() {
+        assert!(is_risky_extension("pagina.HTML"));
+        assert!(is_risky_extension("setup.exe"));
+        assert!(is_risky_extension("script.tar.sh"));
+        assert!(is_risky_extension("app.AppImage"));
+        assert!(!is_risky_extension("foto.jpg"));
+        assert!(!is_risky_extension("informe.pdf"));
+        assert!(!is_risky_extension("sin_extension"));
+        assert!(
+            !is_risky_extension(".html"),
+            "un fichero oculto sin nombre no cuenta"
+        );
+    }
+
+    #[test]
+    fn numbered_names_keep_extension() {
+        assert_eq!(numbered_name("informe.pdf", 1), "informe.pdf");
+        assert_eq!(numbered_name("informe.pdf", 2), "informe (2).pdf");
+        assert_eq!(numbered_name("a.tar.gz", 3), "a.tar (3).gz");
+        assert_eq!(numbered_name("LEEME", 2), "LEEME (2)");
+    }
+
+    #[test]
+    fn private_attachment_is_0600_inside_0700_dir_and_dedupes() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("correo-test-{}", std::process::id()));
+        let first = write_private_attachment(&base, "nota.txt", b"uno").unwrap();
+        let second = write_private_attachment(&base, "nota.txt", b"dos").unwrap();
+        assert_ne!(
+            first.parent(),
+            second.parent(),
+            "cada apertura tiene su carpeta"
+        );
+        let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(first.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        // Dentro de una misma carpeta, un nombre repetido recibe sufijo.
+        let again = write_private_attachment(first.parent().unwrap(), "nota.txt", b"x");
+        assert!(again.is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn oversized_bodies_are_cut_on_char_boundary() {
+        let text = "ñ".repeat(BODY_LIMIT);
+        let (cut, truncated) = limit_body(&text);
+        assert!(truncated);
+        assert!(cut.len() <= BODY_LIMIT);
+        assert!(text.starts_with(cut));
+        assert_eq!(limit_body("corto"), ("corto", false));
     }
 
     #[test]
