@@ -11,6 +11,7 @@ use correo_store::Store;
 use gtk::{gdk, glib};
 
 use super::composer_mail::{display_name, parse_recipient};
+use crate::ui_style;
 
 const SUGGESTIONS: usize = 8;
 const SEPARATORS: [char; 2] = [',', ';'];
@@ -22,7 +23,7 @@ struct Chip {
 }
 
 struct Inner {
-    flow: gtk::FlowBox,
+    flow: adw::WrapBox,
     entry: gtk::Entry,
     chips: RefCell<Vec<Chip>>,
     next_id: Cell<u64>,
@@ -51,19 +52,27 @@ fn upgrade(weak: &Weak<Inner>) -> Option<RecipientField> {
 impl RecipientField {
     /// `on_change` se llama cuando cambian los destinatarios o el texto escrito.
     pub fn new(store: Arc<Mutex<Store>>, on_change: Rc<dyn Fn()>) -> Self {
-        let flow = gtk::FlowBox::new();
-        flow.set_selection_mode(gtk::SelectionMode::None);
-        flow.set_activate_on_single_click(false);
-        flow.set_homogeneous(false);
+        let flow = adw::WrapBox::new();
         flow.set_hexpand(true);
-        flow.set_column_spacing(4);
-        flow.set_row_spacing(4);
+        flow.set_child_spacing(2);
+        flow.set_line_spacing(0);
+        flow.add_css_class("correo-recipients");
 
         let entry = gtk::Entry::new();
         entry.set_has_frame(false);
-        entry.set_hexpand(true);
-        entry.set_width_chars(16);
+        entry.set_width_chars(14);
+        entry.add_css_class("correo-compose-entry");
+        entry.set_valign(gtk::Align::Center);
         flow.append(&entry);
+        // Pulsar en cualquier hueco de la fila lleva el foco a la entrada.
+        let click = gtk::GestureClick::new();
+        {
+            let entry = entry.clone();
+            click.connect_released(move |_, _, _, _| {
+                entry.grab_focus();
+            });
+        }
+        flow.add_controller(click);
 
         // Las sugerencias no toman el foco: así la entrada no pierde el foco al pulsar una.
         let list = gtk::ListBox::new();
@@ -147,7 +156,7 @@ impl RecipientField {
         }
     }
 
-    pub fn widget(&self) -> gtk::FlowBox {
+    pub fn widget(&self) -> adw::WrapBox {
         self.inner.flow.clone()
     }
 
@@ -378,13 +387,20 @@ impl Inner {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
 
-        let label = gtk::Label::new(Some(display_name(&addr)));
+        let name = display_name(&addr);
+        let avatar = adw::Avatar::new(22, Some(name), true);
+        ui_style::set_tone(&avatar, &ui_style::sender_class(&addr.email));
+        let label = gtk::Label::new(Some(name));
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         label.set_max_width_chars(30);
         let remove = gtk::Button::from_icon_name("window-close-symbolic");
         remove.add_css_class("flat");
         remove.add_css_class("circular");
         remove.set_tooltip_text(Some("Quitar destinatario"));
+        remove.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Quitar a {}",
+            addr.email
+        ))]);
         let weak = Rc::downgrade(self);
         remove.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
@@ -393,18 +409,17 @@ impl Inner {
         });
 
         let chip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        chip.add_css_class("card");
-        chip.set_margin_start(2);
-        chip.set_margin_end(2);
-        chip.set_margin_top(2);
-        chip.set_margin_bottom(2);
+        chip.add_css_class("correo-chip");
+        chip.set_valign(gtk::Align::Center);
         chip.set_tooltip_text(Some(&addr.email));
+        chip.append(&avatar);
         chip.append(&label);
         chip.append(&remove);
 
         // La entrada es el último hijo del flujo; los chips van justo antes.
-        let position = self.chips.borrow().len() as i32;
-        self.flow.insert(&chip, position);
+        let previous = self.chips.borrow().last().map(|c| c.widget.clone());
+        self.flow.insert_child_after(&chip, previous.as_ref());
+        ui_style::enter(&chip, "correo-chip-enter", "correo-chip-enter-active");
         self.chips.borrow_mut().push(Chip {
             id,
             addr,
@@ -417,10 +432,19 @@ impl Inner {
         let mut chips = self.chips.borrow_mut();
         if let Some(pos) = chips.iter().position(|c| c.id == id) {
             let chip = chips.remove(pos);
-            if let Some(child) = chip.widget.parent() {
-                self.flow.remove(&child);
-            }
             drop(chips);
+            // Salida breve: se atenúa y se retira al terminar (sin animaciones, al instante).
+            let flow = self.flow.clone();
+            let widget = chip.widget;
+            if ui_style::animations_enabled(&widget) {
+                widget.set_sensitive(false);
+                widget.add_css_class("correo-chip-leave");
+                glib::timeout_add_local_once(std::time::Duration::from_millis(110), move || {
+                    flow.remove(&widget);
+                });
+            } else {
+                flow.remove(&widget);
+            }
             (self.on_change)();
         }
     }

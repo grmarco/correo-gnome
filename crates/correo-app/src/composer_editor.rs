@@ -53,12 +53,15 @@ impl Editor {
     pub fn new() -> Self {
         let view = gtk::TextView::new();
         view.set_wrap_mode(gtk::WrapMode::WordChar);
-        view.set_left_margin(12);
-        view.set_right_margin(12);
-        view.set_top_margin(8);
-        view.set_bottom_margin(8);
+        view.set_left_margin(20);
+        view.set_right_margin(20);
+        view.set_top_margin(14);
+        view.set_bottom_margin(14);
+        view.set_pixels_inside_wrap(3);
+        view.set_pixels_below_lines(4);
         view.set_vexpand(true);
         view.add_css_class("composer-body");
+        view.add_css_class("correo-editor");
 
         let inner = Rc::new(Inner {
             view: view.clone(),
@@ -343,11 +346,8 @@ impl Inner {
 
 fn toolbar(inner: &Rc<Inner>) -> gtk::Box {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    bar.set_margin_start(6);
-    bar.set_margin_end(6);
-    bar.set_margin_top(4);
-    bar.set_margin_bottom(4);
     bar.add_css_class("toolbar");
+    bar.add_css_class("correo-format-bar");
 
     // Los botones usan `Weak` por la misma razón que las señales del editor.
     let weak = Rc::downgrade(inner);
@@ -380,6 +380,7 @@ fn toolbar(inner: &Rc<Inner>) -> gtk::Box {
             }
         },
     );
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     tool_button(&bar, "view-list-bullet-symbolic", "Lista con viñetas", {
         let weak = weak.clone();
         move || with_inner(&weak, |i| i.toggle_bullets())
@@ -388,6 +389,7 @@ fn toolbar(inner: &Rc<Inner>) -> gtk::Box {
         let weak = weak.clone();
         move || with_inner(&weak, |i| i.toggle_quote())
     });
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     tool_button(&bar, "insert-link-symbolic", "Enlace (Ctrl+K)", move || {
         with_inner(&weak, |i| i.insert_link())
     });
@@ -404,6 +406,9 @@ fn with_inner(weak: &Weak<Inner>, f: impl FnOnce(&Rc<Inner>)) {
 fn tool_button(bar: &gtk::Box, icon: &str, tip: &str, action: impl Fn() + 'static) {
     let button = gtk::Button::from_icon_name(icon);
     button.set_tooltip_text(Some(tip));
+    // Etiqueta accesible sin el atajo entre paréntesis.
+    let label = tip.split(" (").next().unwrap_or(tip);
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
     button.add_css_class("flat");
     button.connect_clicked(move |_| action());
     bar.append(&button);

@@ -55,9 +55,8 @@ impl Attachments {
             notify,
         });
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        widget.set_margin_start(12);
-        widget.set_margin_end(12);
-        widget.set_margin_bottom(8);
+        widget.add_css_class("correo-attachments-box");
+        widget.set_visible(false);
         widget.append(&summary);
         widget.append(&list);
         Self { inner, widget }
@@ -65,9 +64,15 @@ impl Attachments {
 
     /// Botón «Adjuntar…» que abre el selector de archivos nativo.
     pub fn attach_button(&self, window: &gtk::Window, services: Rc<Services>) -> gtk::Button {
-        let button = gtk::Button::with_label("Adjuntar…");
-        button.set_icon_name("mail-attachment-symbolic");
+        let button = gtk::Button::new();
+        button.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("mail-attachment-symbolic")
+                .label("Adjuntar…")
+                .build(),
+        ));
         button.add_css_class("flat");
+        button.set_tooltip_text(Some("Adjuntar archivos"));
         let me = self.clone();
         let window = window.clone();
         button.connect_clicked(move |_| {
@@ -180,8 +185,7 @@ impl Inner {
         let items = self.items.borrow();
         for item in items.iter() {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.set_margin_top(2);
-            row.set_margin_bottom(2);
+            row.add_css_class("correo-attach-chip");
             let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
             let name = gtk::Label::new(Some(&item.name));
             name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -192,7 +196,12 @@ impl Inner {
             size.add_css_class("dim-label");
             let remove = gtk::Button::from_icon_name("window-close-symbolic");
             remove.add_css_class("flat");
+            remove.add_css_class("circular");
             remove.set_tooltip_text(Some("Quitar adjunto"));
+            remove.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Quitar {}",
+                item.name
+            ))]);
             // `Weak`: la fila pertenece a `Inner`; un `Rc` aquí sería un ciclo.
             let weak = Rc::downgrade(self);
             let id = item.id;
@@ -208,6 +217,9 @@ impl Inner {
             self.list.append(&row);
         }
         self.list.set_visible(!items.is_empty());
+        if let Some(parent) = self.list.parent() {
+            parent.set_visible(!items.is_empty());
+        }
         let total: u64 = items.iter().map(|i| i.data.len() as u64).sum();
         self.summary.set_text(&if items.is_empty() {
             String::new()

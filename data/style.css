@@ -30,14 +30,14 @@
 
 /* Clases para tintar avatares (adw::Avatar), puntos de cuenta y chips de etiqueta.
  * GTK CSS no admite selectores de atributo: una regla explícita por tono. */
-avatar.correo-acct-1 { background: @correo_acct_1; color: white; font-weight: 700; }
-avatar.correo-acct-2 { background: @correo_acct_2; color: white; font-weight: 700; }
-avatar.correo-acct-3 { background: @correo_acct_3; color: white; font-weight: 700; }
-avatar.correo-acct-4 { background: @correo_acct_4; color: white; font-weight: 700; }
-avatar.correo-acct-5 { background: @correo_acct_5; color: white; font-weight: 700; }
-avatar.correo-acct-6 { background: @correo_acct_6; color: white; font-weight: 700; }
-avatar.correo-acct-7 { background: @correo_acct_7; color: white; font-weight: 700; }
-avatar.correo-acct-8 { background: @correo_acct_8; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-1 avatar { background-image: none; background-color: @correo_acct_1; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-2 avatar { background-image: none; background-color: @correo_acct_2; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-3 avatar { background-image: none; background-color: @correo_acct_3; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-4 avatar { background-image: none; background-color: @correo_acct_4; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-5 avatar { background-image: none; background-color: @correo_acct_5; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-6 avatar { background-image: none; background-color: @correo_acct_6; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-7 avatar { background-image: none; background-color: @correo_acct_7; color: white; font-weight: 700; }
+.correo-avatar.correo-acct-8 avatar { background-image: none; background-color: @correo_acct_8; color: white; font-weight: 700; }
 
 /* Punto de color de la cuenta (junto al nombre en la barra lateral). */
 .correo-acct-dot { min-width: 8px; min-height: 8px; border-radius: 99px; background: @accent_bg_color; }
@@ -101,6 +101,14 @@ list.correo-sidebar > row:selected image { color: @accent_color; }
 list.correo-sidebar > row:selected:hover {
   background: color-mix(in srgb, @accent_bg_color 22%, transparent);
 }
+
+/* Botón de opciones de la cuenta: aparece al pasar el ratón o al enfocar. */
+button.correo-account-more { opacity: 0; margin: 0; transition: opacity 120ms ease-out; min-width: 26px; min-height: 26px; }
+row.correo-account-header:hover button.correo-account-more,
+button.correo-account-more:focus-visible,
+button.correo-account-more:checked { opacity: 1; }
+row.correo-account-header label.heading { font-size: 0.92rem; }
+row.correo-account-header { padding-top: 2px; padding-bottom: 2px; }
 
 /* Contador de no leídos: píldora discreta; solo la bandeja de entrada usa acento. */
 .correo-badge {
@@ -260,25 +268,22 @@ listview.correo-thread-list > row:focus-visible {
 .correo-reader-meta { font-size: 0.86rem; opacity: 0.68; }
 .correo-reader-date { font-size: 0.82rem; opacity: 0.62; font-feature-settings: "tnum"; }
 
-/* Barra de acciones agrupadas (gtk::Box.linked con botones .flat) */
-box.correo-actions { padding: 2px; border-radius: 10px; background: alpha(currentColor, 0.06); }
-box.correo-actions > button {
-  min-height: 30px;
-  min-width: 34px;
-  border-radius: 8px;
-}
-box.correo-actions > button.correo-danger:hover {
+/* Acciones del mensaje (en la cabecera de la ventana) */
+box.correo-actions > button { min-height: 32px; min-width: 34px; }
+button.correo-danger:hover {
   background: alpha(@destructive_bg_color, 0.18);
   color: @destructive_color;
 }
+button.correo-danger:focus-visible { color: @destructive_color; }
 
 /* Cuerpo del mensaje: ancho de lectura cómodo y tipografía algo mayor */
 .correo-reader-body {
   font-size: 1.04rem;
-  line-height: 1.55;
+  line-height: 1.4;
   padding: 8px 24px 32px 24px;
 }
-textview.correo-reader-body text { background: transparent; }
+textview.correo-reader-body, textview.correo-reader-body text { background: transparent; }
+.correo-attachments-scroll { margin: 0 24px 12px 24px; }
 
 /* Citas plegables: botón «···» que revela la cita (gtk::Revealer) */
 .correo-quote-toggle {
@@ -319,17 +324,18 @@ banner.correo-privacy > revealer > widget { border-radius: 0; }
 /* ---------------------------------------------------------------------------------------
  * Redactor
  * ------------------------------------------------------------------------------------- */
-.correo-compose-form { padding: 4px 16px; }
+.correo-compose-form { padding: 0 20px; }
 .correo-compose-row {
-  min-height: 40px;
+  min-height: 44px;
   border-bottom: 1px solid @borders;
 }
-.correo-compose-row:last-child { border-bottom: none; }
 .correo-compose-label {
-  min-width: 56px;
+  min-width: 52px;
+  padding-top: 12px;
   font-size: 0.9rem;
   opacity: 0.6;
 }
+.correo-compose-row dropdown > button { background: none; box-shadow: none; padding-left: 0; }
 /* Entradas integradas en la fila: sin marco ni fondo */
 entry.correo-compose-entry,
 entry.correo-compose-entry:focus {
@@ -338,13 +344,16 @@ entry.correo-compose-entry:focus {
   outline: none;
   border-radius: 0;
   min-height: 36px;
+  padding-left: 4px;
 }
 entry.correo-compose-subject { font-weight: 700; font-size: 1.05rem; }
+button.correo-compose-link { font-size: 0.85rem; min-height: 28px; margin-top: 8px; padding: 0 8px; }
+.correo-recipients { padding: 5px 0; }
 
 /* Chip de destinatario: píldora con avatar de iniciales */
 .correo-chip {
-  margin: 3px 2px;
-  padding: 1px 2px 1px 3px;
+  margin: 2px 2px;
+  padding: 2px 3px 2px 3px;
   border-radius: 99px;
   background: color-mix(in srgb, @accent_bg_color 14%, transparent);
   color: @window_fg_color;
@@ -376,7 +385,7 @@ entry.correo-compose-subject { font-weight: 700; font-size: 1.05rem; }
 }
 
 /* Barra de formato: botones planos agrupados por función */
-box.correo-format-bar { padding: 4px 10px; border-top: 1px solid @borders; }
+box.correo-format-bar { padding: 4px 14px; border-bottom: 1px solid @borders; }
 box.correo-format-bar > button.toggle { border-radius: 8px; min-width: 32px; min-height: 32px; }
 box.correo-format-bar > button.toggle:checked {
   background: color-mix(in srgb, @accent_bg_color 20%, transparent);
@@ -390,7 +399,8 @@ textview.correo-editor, textview.correo-editor text {
   font-size: 1.04rem;
   line-height: 1.5;
 }
-.correo-editor-pad { padding: 12px 20px; }
+.correo-attach-bar { padding: 4px 12px; border-top: 1px solid @borders; }
+.correo-attachments-box { padding: 4px 16px 10px 16px; }
 
 /* Adjuntos del redactor */
 .correo-attach-chip {

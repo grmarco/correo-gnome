@@ -51,7 +51,7 @@ struct Ctx {
     attachments: Attachments,
     banner: adw::Banner,
     toasts: adw::ToastOverlay,
-    spinner: gtk::Spinner,
+    spinner: adw::Spinner,
     send_button: gtk::Button,
     title: adw::WindowTitle,
     sending: Cell<bool>,
@@ -136,23 +136,31 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
 
     let cc_button = gtk::Button::with_label("Cc");
     let bcc_button = gtk::Button::with_label("Cco");
-    for b in [&cc_button, &bcc_button] {
+    for (b, tip) in [
+        (&cc_button, "Añadir copia"),
+        (&bcc_button, "Añadir copia oculta"),
+    ] {
         b.add_css_class("flat");
+        b.add_css_class("correo-compose-link");
+        b.set_valign(gtk::Align::Start);
+        b.set_tooltip_text(Some(tip));
     }
-    let to_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let to_line = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     to_line.append(&to.widget());
     to_line.append(&cc_button);
     to_line.append(&bcc_button);
-    let cc_row = labeled_row("Cc:", &cc.widget());
-    let bcc_row = labeled_row("Cco:", &bcc.widget());
-    cc_row.set_visible(false);
-    bcc_row.set_visible(false);
+    // Cc y Cco aparecen con una transición corta de altura.
+    let cc_row = reveal(labeled_row("Cc", &cc.widget()));
+    let bcc_row = reveal(labeled_row("Cco", &bcc.widget()));
 
     let subject = gtk::Entry::new();
     subject.set_placeholder_text(Some("Asunto"));
     subject.set_hexpand(true);
+    subject.set_has_frame(false);
+    subject.add_css_class("correo-compose-entry");
+    subject.add_css_class("correo-compose-subject");
     subject.set_text(&subject_for(&mode));
-    let subject_row = labeled_row("Asunto:", &subject);
+    let subject_row = labeled_row("Asunto", &subject);
 
     // Destinatarios iniciales (Responder / Responder a todos).
     let recipients = initial_recipients(&mode, &account.email);
@@ -163,7 +171,7 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
         cc.add_address(addr);
     }
     if !cc.addresses().is_empty() {
-        cc_row.set_visible(true);
+        cc_row.set_reveal_child(true);
         cc_button.set_visible(false);
     }
 
@@ -175,9 +183,7 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
 
     let attachments = Attachments::new(on_change.clone(), notify.clone());
     let attach_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    attach_bar.set_margin_start(12);
-    attach_bar.set_margin_end(12);
-    attach_bar.set_margin_bottom(4);
+    attach_bar.add_css_class("correo-attach-bar");
     attach_bar.append(&attachments.attach_button(window.upcast_ref(), services.clone()));
 
     editor.buffer().connect_changed({
@@ -189,13 +195,10 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
         move |_| on_change()
     });
 
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    form.set_margin_start(12);
-    form.set_margin_end(12);
-    form.set_margin_top(8);
-    form.set_margin_bottom(8);
-    form.append(&labeled_row("De:", &from_widget));
-    form.append(&labeled_row_box("Para:", &to_line));
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    form.add_css_class("correo-compose-form");
+    form.append(&labeled_row("De", &from_widget));
+    form.append(&labeled_row_box("Para", &to_line));
     form.append(&cc_row);
     form.append(&bcc_row);
     form.append(&subject_row);
@@ -206,19 +209,26 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     body.append(&banner);
     body.append(&form);
-    body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     body.append(&editor.widget);
-    body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     body.append(&attach_bar);
     body.append(&attachments.widget);
     attachments.install_drop_target(&body, services.clone());
     toasts.set_child(Some(&body));
 
     let title = adw::WindowTitle::new(title_text, "");
-    let spinner = gtk::Spinner::new();
+    let spinner = adw::Spinner::new();
     spinner.set_visible(false);
-    let send_button = gtk::Button::with_label("Enviar");
+    let send_button = gtk::Button::new();
+    send_button.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("mail-send-symbolic")
+            .label("Enviar")
+            .build(),
+    ));
     send_button.add_css_class("suggested-action");
+    send_button.add_css_class("correo-compose-button");
+    send_button.set_tooltip_text(Some("Enviar (Ctrl+Intro)"));
+    send_button.update_property(&[gtk::accessible::Property::Label("Enviar")]);
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
     header.pack_end(&send_button);
@@ -260,7 +270,7 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
         #[weak]
         cc_button,
         move |_| {
-            cc_row.set_visible(true);
+            cc_row.set_reveal_child(true);
             cc_button.set_visible(false);
         }
     ));
@@ -270,7 +280,7 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
         #[weak]
         bcc_button,
         move |_| {
-            bcc_row.set_visible(true);
+            bcc_row.set_reveal_child(true);
             bcc_button.set_visible(false);
         }
     ));
@@ -331,9 +341,19 @@ fn accounts_for(services: &Services, account: &Account) -> Vec<Account> {
 /// Fila «etiqueta: campo» con un widget.
 fn labeled_row(label: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("correo-compose-row");
     row.append(&row_label(label));
     row.append(child);
     row
+}
+
+/// Envuelve una fila en un `Revealer` oculto que la despliega hacia abajo.
+fn reveal(row: gtk::Box) -> gtk::Revealer {
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(160);
+    revealer.set_child(Some(&row));
+    revealer
 }
 
 fn labeled_row_box(label: &str, child: &gtk::Box) -> gtk::Box {
@@ -342,9 +362,9 @@ fn labeled_row_box(label: &str, child: &gtk::Box) -> gtk::Box {
 
 fn row_label(text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
-    label.add_css_class("dim-label");
-    label.set_width_chars(8);
-    label.set_xalign(1.0);
+    label.add_css_class("correo-compose-label");
+    label.set_valign(gtk::Align::Start);
+    label.set_xalign(0.0);
     label
 }
 
@@ -367,11 +387,6 @@ impl Ctx {
     fn set_sending(&self, on: bool) {
         self.sending.set(on);
         self.spinner.set_visible(on);
-        if on {
-            self.spinner.start();
-        } else {
-            self.spinner.stop();
-        }
         self.send_button.set_sensitive(!on);
         self.title.set_subtitle(if on { "Enviando…" } else { "" });
         if on {

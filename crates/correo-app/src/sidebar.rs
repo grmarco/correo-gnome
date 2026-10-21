@@ -8,6 +8,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use correo_core::{Account, AccountId, Mailbox, MailboxId, MailboxRole};
+use gtk::gio;
+
+use crate::ui_style;
 
 /// Destino seleccionable en la barra lateral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub struct Sidebar {
     owners: Rc<RefCell<Vec<Option<AccountId>>>>,
     /// Menú «Eliminar cuenta», con un único popover reutilizado para todas las cuentas.
     menu: gtk::Popover,
+    /// Cuenta a la que apunta el menú abierto.
+    menu_account: Rc<Cell<Option<AccountId>>>,
 }
 
 impl Sidebar {
@@ -36,9 +41,11 @@ impl Sidebar {
     pub fn new(
         on_select: impl Fn(Target) + 'static,
         on_remove: impl Fn(AccountId) + 'static,
+        on_activate: impl Fn() + 'static,
     ) -> Self {
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
+        list.add_css_class("correo-sidebar");
         list.set_selection_mode(gtk::SelectionMode::Single);
 
         let targets: Rc<RefCell<Vec<Option<Target>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -56,6 +63,40 @@ impl Sidebar {
             });
         }
 
+        {
+            // Pulsar una carpeta (aunque ya estuviera elegida) abre su lista en modo estrecho.
+            // Se usa el clic en la lista y no `row-activated`: elegir una carpeta reconstruye
+            // las filas, y la fila pulsada ya no existiría al soltar el botón.
+            let on_activate: Rc<dyn Fn()> = Rc::new(on_activate);
+            let is_folder = {
+                let targets = targets.clone();
+                move |row: &gtk::ListBoxRow| {
+                    let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
+                    targets.borrow().get(index).copied().flatten().is_some()
+                }
+            };
+            {
+                let on_activate = on_activate.clone();
+                let is_folder = is_folder.clone();
+                list.connect_row_activated(move |_, row| {
+                    if is_folder(row) {
+                        on_activate();
+                    }
+                });
+            }
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let list_for_rows = list.clone();
+            click.connect_released(move |_, _, _, y| {
+                if let Some(row) = list_for_rows.row_at_y(y as i32) {
+                    if is_folder(&row) {
+                        on_activate();
+                    }
+                }
+            });
+            list.add_controller(click);
+        }
+
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -67,9 +108,16 @@ impl Sidebar {
         let menu = gtk::Popover::new();
         menu.set_has_arrow(false);
         menu.set_parent(&scroller);
-        let remove = gtk::Button::with_label("Eliminar cuenta");
+        menu.add_css_class("menu");
+        let remove = gtk::Button::new();
+        remove.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("user-trash-symbolic")
+                .label("Eliminar cuenta…")
+                .build(),
+        ));
         remove.add_css_class("flat");
-        remove.add_css_class("destructive-action");
+        remove.add_css_class("correo-danger");
         menu.set_child(Some(&remove));
         {
             let menu = menu.clone();
@@ -112,8 +160,19 @@ impl Sidebar {
 
         let add_button = gtk::Button::from_icon_name("list-add-symbolic");
         add_button.set_tooltip_text(Some("Añadir cuenta"));
+        add_button.update_property(&[gtk::accessible::Property::Label("Añadir cuenta")]);
+        let main_menu = gio::Menu::new();
+        main_menu.append(Some("Acerca de Correo"), Some("app.about"));
+        main_menu.append(Some("Salir"), Some("app.quit"));
+        let menu_button = gtk::MenuButton::new();
+        menu_button.set_icon_name("open-menu-symbolic");
+        menu_button.set_menu_model(Some(&main_menu));
+        menu_button.set_primary(true);
+        menu_button.set_tooltip_text(Some("Menú principal (F10)"));
+        menu_button.update_property(&[gtk::accessible::Property::Label("Menú principal")]);
         let header = adw::HeaderBar::new();
         header.pack_start(&add_button);
+        header.pack_end(&menu_button);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&scroller));
@@ -126,6 +185,7 @@ impl Sidebar {
             targets,
             owners,
             menu,
+            menu_account,
         }
     }
 
@@ -157,15 +217,16 @@ impl Sidebar {
             .sum();
         rows.push(target_row(
             "mail-unread-symbolic",
-            "Todas las bandejas de entrada",
+            "Todas las entradas",
             unified_unread,
+            true,
         ));
         targets.push(Some(Target::Unified));
         owners.push(None);
 
-        for (account, boxes) in accounts {
+        for (index, (account, boxes)) in accounts.iter().enumerate() {
             // El email es el título: dos cuentas pueden tener el mismo nombre visible.
-            rows.push(header_row(&account.email));
+            rows.push(self.header_row(account, index));
             targets.push(None);
             owners.push(Some(account.id));
 
@@ -176,7 +237,12 @@ impl Sidebar {
                     .then_with(|| a.path.cmp(&b.path))
             });
             for m in sorted {
-                rows.push(target_row(role_icon(m.role), &mailbox_label(m), m.unread));
+                rows.push(target_row(
+                    role_icon(m.role),
+                    &mailbox_label(m),
+                    m.unread,
+                    matches!(m.role, MailboxRole::Inbox | MailboxRole::Drafts),
+                ));
                 targets.push(Some(Target::Mailbox(m.id)));
                 owners.push(None);
             }
@@ -200,13 +266,13 @@ impl Sidebar {
     }
 }
 
-fn target_row(icon: &str, label: &str, unread: u32) -> gtk::ListBoxRow {
+fn target_row(icon: &str, label: &str, unread: u32, accent: bool) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     hbox.set_margin_start(8);
     hbox.set_margin_end(8);
-    hbox.set_margin_top(6);
-    hbox.set_margin_bottom(6);
+    hbox.set_margin_top(4);
+    hbox.set_margin_bottom(4);
 
     hbox.append(&gtk::Image::from_icon_name(icon));
     let name = gtk::Label::new(Some(label));
@@ -215,31 +281,75 @@ fn target_row(icon: &str, label: &str, unread: u32) -> gtk::ListBoxRow {
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     hbox.append(&name);
 
+    let mut description = label.to_string();
     if unread > 0 {
         let badge = gtk::Label::new(Some(&unread.to_string()));
-        badge.add_css_class("numeric");
-        badge.add_css_class("accent");
+        badge.add_css_class("correo-badge");
+        if accent {
+            badge.add_css_class("correo-badge-accent");
+        }
         hbox.append(&badge);
+        description = format!("{label}, {unread} sin leer");
     }
     row.set_child(Some(&hbox));
+    row.update_property(&[gtk::accessible::Property::Label(&description)]);
     row
 }
 
-fn header_row(title: &str) -> gtk::ListBoxRow {
-    let label = gtk::Label::new(Some(title));
-    label.set_xalign(0.0);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_margin_start(8);
-    label.set_margin_top(12);
-    label.set_margin_bottom(4);
-    label.add_css_class("heading");
-    label.add_css_class("dim-label");
+impl Sidebar {
+    /// Cabecera de una cuenta: avatar de su color, email y botón de menú (alternativa por
+    /// teclado y táctil al clic derecho).
+    fn header_row(&self, account: &Account, index: usize) -> gtk::ListBoxRow {
+        let avatar = adw::Avatar::new(24, Some(&account.email), true);
+        ui_style::set_tone(&avatar, &ui_style::account_class(index));
 
-    let row = gtk::ListBoxRow::new();
-    row.set_selectable(false);
-    row.set_activatable(false);
-    row.set_child(Some(&label));
-    row
+        let label = gtk::Label::new(Some(&account.email));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.add_css_class("heading");
+
+        let more = gtk::Button::from_icon_name("view-more-symbolic");
+        more.add_css_class("flat");
+        more.add_css_class("circular");
+        more.add_css_class("correo-account-more");
+        more.set_tooltip_text(Some("Opciones de la cuenta"));
+        more.update_property(&[gtk::accessible::Property::Label("Opciones de la cuenta")]);
+        {
+            let menu = self.menu.clone();
+            let menu_account = Rc::clone(&self.menu_account);
+            let id = account.id;
+            more.connect_clicked(move |button| {
+                let Some(parent) = menu.parent() else { return };
+                let Some(bounds) = button.compute_bounds(&parent) else {
+                    return;
+                };
+                menu_account.set(Some(id));
+                menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                    bounds.x() as i32,
+                    bounds.y() as i32,
+                    bounds.width() as i32,
+                    bounds.height() as i32,
+                )));
+                menu.popup();
+            });
+        }
+
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(2);
+        hbox.append(&avatar);
+        hbox.append(&label);
+        hbox.append(&more);
+
+        let row = gtk::ListBoxRow::new();
+        row.add_css_class("correo-account-header");
+        row.set_selectable(false);
+        row.set_activatable(false);
+        row.set_focusable(false);
+        row.set_child(Some(&hbox));
+        row
+    }
 }
 
 fn role_rank(role: MailboxRole) -> u8 {
@@ -256,10 +366,10 @@ fn role_rank(role: MailboxRole) -> u8 {
 
 fn role_icon(role: MailboxRole) -> &'static str {
     match role {
-        MailboxRole::Inbox => "mail-unread-symbolic",
+        MailboxRole::Inbox => ui_style::icon_or("mail-inbox-symbolic", "mail-unread-symbolic"),
         MailboxRole::Drafts => "document-edit-symbolic",
         MailboxRole::Sent => "mail-send-symbolic",
-        MailboxRole::Archive => "folder-symbolic",
+        MailboxRole::Archive => ui_style::icon_or("mail-archive-symbolic", "folder-symbolic"),
         MailboxRole::Spam => "mail-mark-junk-symbolic",
         MailboxRole::Trash => "user-trash-symbolic",
         MailboxRole::Other => "folder-symbolic",

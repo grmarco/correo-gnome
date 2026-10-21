@@ -95,6 +95,10 @@ Notas sobre la medida:
 - El RSS está dominado por las bibliotecas compartidas de GTK4 y libadwaita (`RssFile`). Son páginas compartidas con el resto del sistema. La memoria privada (`RssAnon`, 20 MB) es la cifra más representativa del coste propio de la app.
 - El objetivo del `PLAN.md` (menos de 60 MB de RSS con dos cuentas) no se verifica con esta medida: se hizo sin cuentas ni sincronización. Repetir la medida con dos cuentas reales o con datos de demo en depuración.
 
+## Versión mínima de libadwaita
+
+La interfaz usa `adw::WrapBox` (libadwaita 1.7) y `adw::Spinner` (1.6), por lo que `correo-app` compila con la feature `v1_7` de `libadwaita-rs`. El runtime GNOME 50 trae libadwaita 1.9 y GTK 4.22, de sobra. La hoja de estilos `data/style.css` usa `color-mix()` (GTK >= 4.16) y se incrusta en el binario con `include_str!`, así que no hay fichero que instalar.
+
 ## Pendiente
 
 - Verificar la versión del runtime (`50`) en Flathub y construir el manifiesto con `flatpak-builder`.

@@ -21,6 +21,7 @@ use correo_core::{Account, Address, Flags, Mailbox, MailboxRole, MessageBody, Me
 use gtk::{gio, glib};
 
 use crate::services::{flatten, Services};
+use crate::ui_style;
 use crate::ui_types::ComposeMode;
 use reader_html::{
     count_images, html_to_segments, link_looks_deceptive, plain_to_segments, Segment, Style,
@@ -86,6 +87,7 @@ struct Inner {
     changed: RefCell<Option<Rc<dyn Fn()>>>,
 
     root: gtk::Box,
+    avatar: adw::Avatar,
     subject: gtk::Label,
     from: gtk::Label,
     to: gtk::Label,
@@ -103,6 +105,7 @@ struct Inner {
     stack: gtk::Stack,
     text_view: gtk::TextView,
     error_page: adw::StatusPage,
+    error_detail: gtk::Label,
     /// Alterna entre el texto y la vista original (solo con la feature `webkit`).
     #[cfg(feature = "webkit")]
     original: gtk::Button,
@@ -113,91 +116,117 @@ struct Inner {
 
 pub struct MessageView {
     widget: gtk::Widget,
+    /// Acciones del mensaje: viven en la cabecera de la ventana, no en el lector.
+    actions: gtk::Box,
     inner: Rc<Inner>,
 }
 
 impl MessageView {
     pub fn new(services: Rc<Services>) -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        root.set_margin_top(12);
-        root.set_margin_bottom(12);
-        root.set_margin_start(16);
-        root.set_margin_end(16);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+        // Cabecera: avatar del remitente, remitente, destinatarios y fecha.
+        let avatar = adw::Avatar::new(44, None, true);
+        avatar.set_valign(gtk::Align::Start);
+        let from = gtk::Label::new(None);
+        from.set_xalign(0.0);
+        from.set_hexpand(true);
+        from.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        from.set_selectable(true);
+        from.add_css_class("correo-reader-from");
+        let date = gtk::Label::new(None);
+        date.set_valign(gtk::Align::Start);
+        date.add_css_class("correo-reader-date");
+        let first_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        first_line.append(&from);
+        first_line.append(&date);
+        let meta = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        meta.set_hexpand(true);
+        meta.append(&first_line);
+        let to = meta_label(&meta);
+        let cc = meta_label(&meta);
+        let sender_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        sender_row.append(&avatar);
+        sender_row.append(&meta);
 
         let subject = gtk::Label::new(None);
-        subject.add_css_class("title-2");
+        subject.add_css_class("correo-reader-subject");
         subject.set_halign(gtk::Align::Start);
         subject.set_xalign(0.0);
         subject.set_wrap(true);
+        subject.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         subject.set_selectable(true);
-        root.append(&subject);
 
-        let meta = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        let from = meta_label(&meta);
-        let to = meta_label(&meta);
-        let cc = meta_label(&meta);
-        let date = meta_label(&meta);
-        date.add_css_class("dim-label");
-        root.append(&meta);
+        let header_box = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        header_box.add_css_class("correo-reader-header");
+        header_box.append(&subject);
+        header_box.append(&sender_row);
+        root.append(&header_box);
 
-        let reply = action_button(
-            "Responder",
-            "mail-reply-sender-symbolic",
-            "Responder al remitente",
-        );
+        let reply = action_button("Responder", "mail-reply-sender-symbolic", "Responder");
         let reply_all = action_button(
             "Responder a todos",
             "mail-reply-all-symbolic",
             "Responder a todos",
         );
-        let forward = action_button("Reenviar", "mail-forward-symbolic", "Reenviar el mensaje");
-        let archive = action_button(
-            "Archivar",
-            "mail-archive-symbolic",
-            "Mover a la carpeta de archivo",
-        );
-        let delete = action_button("Borrar", "user-trash-symbolic", "Borrar el mensaje");
-        let mark_unread = action_button(
-            "Marcar no leído",
-            "mail-unread-symbolic",
-            "Marcar como no leído",
-        );
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        for b in [
-            &reply,
-            &reply_all,
-            &forward,
-            &archive,
-            &delete,
-            &mark_unread,
-        ] {
-            actions.append(b);
-        }
+        let forward = action_button("Reenviar", "mail-forward-symbolic", "Reenviar");
+        let archive = action_button("Archivar", "mail-archive-symbolic", "Archivar (Ctrl+E)");
+        let delete = action_button("Borrar", "user-trash-symbolic", "Borrar (Ctrl+Supr)");
+        delete.add_css_class("correo-danger");
+        // Acciones secundarias dentro de un menú «Más».
+        let mark_unread = menu_item("Marcar como no leído");
         #[cfg(feature = "webkit")]
-        let original = action_button(
-            ORIGINAL_LABEL,
-            "web-browser-symbolic",
-            "Ver el HTML original en una vista aislada (sin scripts ni red)",
-        );
+        let original = menu_item(ORIGINAL_LABEL);
+        let more_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        more_box.append(&mark_unread);
         #[cfg(feature = "webkit")]
         {
             original.set_visible(false);
-            actions.append(&original);
+            more_box.append(&original);
         }
-        let actions_scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_height(true)
-            .child(&actions)
-            .build();
-        root.append(&actions_scroll);
+        let more_popover = gtk::Popover::new();
+        more_popover.add_css_class("menu");
+        more_popover.set_child(Some(&more_box));
+        let more = gtk::MenuButton::new();
+        more.set_icon_name("view-more-symbolic");
+        more.set_popover(Some(&more_popover));
+        more.set_tooltip_text(Some("Más acciones"));
+        more.update_property(&[gtk::accessible::Property::Label("Más acciones")]);
+        {
+            let popover = more_popover.clone();
+            let buttons: Vec<gtk::Button> = {
+                #[allow(unused_mut)]
+                let mut v = vec![mark_unread.clone()];
+                #[cfg(feature = "webkit")]
+                v.push(original.clone());
+                v
+            };
+            for b in buttons {
+                let popover = popover.clone();
+                b.connect_clicked(move |_| popover.popdown());
+            }
+        }
+        let reply_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        reply_group.add_css_class("linked");
+        for b in [&reply, &reply_all, &forward] {
+            reply_group.append(b);
+        }
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        actions.add_css_class("correo-actions");
+        actions.set_visible(false);
+        actions.append(&reply_group);
+        actions.append(&archive);
+        actions.append(&delete);
+        actions.append(&more);
 
         let banner = adw::Banner::new(BANNER_NORMAL);
         banner.set_revealed(false);
+        banner.add_css_class("correo-privacy");
         root.append(&banner);
 
         let attachments = gtk::ListBox::new();
         attachments.add_css_class("boxed-list");
+        attachments.add_css_class("correo-attachments");
         attachments.set_selection_mode(gtk::SelectionMode::None);
         let attachments_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -206,6 +235,7 @@ impl MessageView {
             .visible(false)
             .child(&attachments)
             .build();
+        attachments_scroll.add_css_class("correo-attachments-scroll");
         root.append(&attachments_scroll);
 
         let stack = gtk::Stack::new();
@@ -213,36 +243,40 @@ impl MessageView {
 
         let empty = adw::StatusPage::builder()
             .icon_name("mail-read-symbolic")
-            .title("Selecciona un mensaje")
+            .title("Ningún mensaje seleccionado")
+            .description("Elige un mensaje de la lista para leerlo.")
             .build();
+        empty.add_css_class("correo-empty");
         stack.add_named(&empty, Some("empty"));
 
-        let spinner = gtk::Spinner::new();
-        spinner.set_size_request(32, 32);
-        spinner.set_spinning(true);
-        spinner.set_halign(gtk::Align::Center);
-        spinner.set_valign(gtk::Align::Center);
-        spinner.set_hexpand(true);
-        spinner.set_vexpand(true);
-        stack.add_named(&spinner, Some("loading"));
+        stack.add_named(&skeleton(), Some("loading"));
 
         let error_page = adw::StatusPage::builder()
             .icon_name("dialog-error-symbolic")
-            .title("No se pudo cargar el mensaje")
+            .title("No se pudo abrir el mensaje")
             .build();
+        error_page.add_css_class("correo-empty");
+        error_page.add_css_class("correo-error");
         stack.add_named(&error_page, Some("error"));
 
         let text_view = gtk::TextView::new();
         text_view.set_editable(false);
         text_view.set_cursor_visible(false);
         text_view.set_wrap_mode(gtk::WrapMode::WordChar);
-        text_view.set_left_margin(4);
-        text_view.set_right_margin(4);
+        text_view.add_css_class("correo-reader-body");
+        text_view.set_left_margin(0);
+        text_view.set_right_margin(0);
+        text_view.set_top_margin(4);
+        text_view.set_bottom_margin(24);
+        text_view.set_pixels_inside_wrap(0);
+        text_view.set_pixels_below_lines(8);
         let body_scroll = gtk::ScrolledWindow::builder()
             .child(&text_view)
             .vexpand(true)
             .build();
         stack.add_named(&body_scroll, Some("content"));
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.set_transition_duration(160);
         stack.set_visible_child_name("empty");
         root.append(&stack);
 
@@ -256,6 +290,7 @@ impl MessageView {
         ] {
             b.set_sensitive(false);
         }
+        let error_detail = gtk::Label::new(None);
 
         let inner = Rc::new(Inner {
             services,
@@ -265,6 +300,7 @@ impl MessageView {
             compose: RefCell::new(None),
             changed: RefCell::new(None),
             root: root.clone(),
+            avatar,
             subject,
             from,
             to,
@@ -282,6 +318,7 @@ impl MessageView {
             stack,
             text_view,
             error_page,
+            error_detail: error_detail.clone(),
             #[cfg(feature = "webkit")]
             original: original.clone(),
             #[cfg(feature = "webkit")]
@@ -325,10 +362,31 @@ impl MessageView {
                 }
             }
         });
-        inner.error_page.set_child(Some(&retry));
+        // Detalle técnico plegado: el mensaje principal es legible para cualquiera.
+        error_detail.set_wrap(true);
+        error_detail.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        error_detail.set_selectable(true);
+        error_detail.set_xalign(0.0);
+        error_detail.add_css_class("monospace");
+        error_detail.add_css_class("caption");
+        let expander = gtk::Expander::new(Some("Detalles"));
+        expander.set_child(Some(&error_detail));
+        let error_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        error_box.append(&retry);
+        error_box.append(&expander);
+        inner.error_page.set_child(Some(&error_box));
+
+        // Ancho de lectura cómodo en pantallas anchas.
+        let clamp = adw::Clamp::builder()
+            .maximum_size(780)
+            .tightening_threshold(560)
+            .child(&root)
+            .build();
+        clamp.set_vexpand(true);
 
         Self {
-            widget: root.upcast(),
+            widget: clamp.upcast(),
+            actions,
             inner,
         }
     }
@@ -337,12 +395,19 @@ impl MessageView {
         &self.widget
     }
 
+    /// Botones de acción del mensaje, para colocarlos en la cabecera de la ventana.
+    pub fn actions(&self) -> &gtk::Box {
+        &self.actions
+    }
+
     /// Muestra el mensaje: descarga el cuerpo bajo demanda y marca como leído.
     pub fn show(&self, account: Account, mailbox: Mailbox, header: MessageHeader) {
+        self.actions.set_visible(true);
         show_inner(&self.inner, account, mailbox, header);
     }
 
     pub fn clear(&self) {
+        self.actions.set_visible(false);
         clear_view(&self.inner);
     }
 
@@ -362,19 +427,51 @@ fn meta_label(parent: &gtk::Box) -> gtk::Label {
     let label = gtk::Label::new(None);
     label.set_halign(gtk::Align::Start);
     label.set_xalign(0.0);
-    label.set_wrap(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_selectable(true);
-    label.add_css_class("caption");
+    label.add_css_class("correo-reader-meta");
     parent.append(&label);
     label
 }
 
+/// Botón solo de icono, con tooltip y etiqueta accesible (el lector de pantalla dice `label`).
 fn action_button(label: &str, icon: &str, tooltip: &str) -> gtk::Button {
-    gtk::Button::builder()
-        .label(label)
+    let button = gtk::Button::builder()
         .icon_name(icon)
         .tooltip_text(tooltip)
-        .build()
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+    button
+}
+
+/// Entrada de texto de un menú emergente.
+fn menu_item(label: &str) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("flat");
+    if let Some(child) = button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+        child.set_xalign(0.0);
+    }
+    button
+}
+
+/// Esqueleto del mensaje mientras se descarga el cuerpo.
+fn skeleton() -> gtk::Box {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    column.set_margin_top(8);
+    column.set_valign(gtk::Align::Start);
+    column.set_accessible_role(gtk::AccessibleRole::Presentation);
+    for width in [-1, 520, -1, 440, 300] {
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        bar.add_css_class("correo-skeleton");
+        bar.set_size_request(width.max(0), 14);
+        bar.set_halign(if width < 0 {
+            gtk::Align::Fill
+        } else {
+            gtk::Align::Start
+        });
+        column.append(&bar);
+    }
+    column
 }
 
 fn connect_compose_button(
@@ -690,9 +787,10 @@ fn clear_view(inner: &Rc<Inner>) {
 }
 
 fn show_error(inner: &Rc<Inner>, detail: &str) {
-    inner.error_page.set_description(Some(&format!(
-        "Comprueba la conexión e inténtalo de nuevo.\n{detail}"
-    )));
+    inner
+        .error_page
+        .set_description(Some("Comprueba la conexión e inténtalo de nuevo."));
+    inner.error_detail.set_text(detail);
     inner.stack.set_visible_child_name("error");
 }
 
@@ -711,22 +809,54 @@ fn set_header_labels(inner: &Inner, header: &MessageHeader) {
     } else {
         &header.subject
     });
+    let sender = header.from.first();
+    let name = sender.map_or_else(|| "(sin remitente)".to_string(), short_name);
+    let email = sender.map_or("", |a| a.email.as_str());
+    inner.from.set_markup(&format!(
+        "{}  <span alpha=\"60%\" weight=\"normal\" size=\"small\">{}</span>",
+        glib::markup_escape_text(&name),
+        glib::markup_escape_text(email)
+    ));
     inner
         .from
-        .set_text(&format!("De: {}", format_addresses(&header.from)));
+        .set_tooltip_text(Some(&format_addresses(&header.from)));
+    inner.avatar.set_text(Some(&name));
+    ui_style::set_tone(&inner.avatar, &ui_style::sender_class(email));
+
+    let recipients = |list: &[Address]| list.iter().map(short_name).collect::<Vec<_>>().join(", ");
+    inner.to.set_text(&format!(
+        "Para: {}",
+        if header.to.is_empty() {
+            "(nadie)".to_string()
+        } else {
+            recipients(&header.to)
+        }
+    ));
     inner
         .to
-        .set_text(&format!("Para: {}", format_addresses(&header.to)));
+        .set_tooltip_text(Some(&format_addresses(&header.to)));
     inner.cc.set_visible(!header.cc.is_empty());
     inner
         .cc
-        .set_text(&format!("CC: {}", format_addresses(&header.cc)));
+        .set_text(&format!("Cc: {}", recipients(&header.cc)));
+    inner
+        .cc
+        .set_tooltip_text(Some(&format_addresses(&header.cc)));
     let date = glib::DateTime::from_unix_local(header.date)
         .ok()
-        .and_then(|d| d.format("%d/%m/%Y %H:%M").ok())
+        .and_then(|d| d.format("%-d %b %Y, %H:%M").ok())
         .map(|s| s.to_string())
         .unwrap_or_default();
     inner.date.set_text(&date);
+}
+
+/// Nombre visible de una dirección: su nombre, o el email si no lo tiene.
+fn short_name(a: &Address) -> String {
+    a.name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map_or_else(|| a.email.clone(), str::to_string)
 }
 
 fn format_addresses(addresses: &[Address]) -> String {
@@ -896,12 +1026,19 @@ fn populate_attachments(inner: &Rc<Inner>, body: &MessageBody) {
                 human_size(att.size)
             )))
             .build();
+        row.add_prefix(&{
+            let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+            icon.add_css_class("dim-label");
+            icon
+        });
         let save = gtk::Button::from_icon_name("document-save-symbolic");
         save.set_tooltip_text(Some("Guardar"));
+        save.update_property(&[gtk::accessible::Property::Label("Guardar adjunto")]);
         save.set_valign(gtk::Align::Center);
         save.add_css_class("flat");
         let open = gtk::Button::from_icon_name("document-open-symbolic");
         open.set_tooltip_text(Some("Abrir"));
+        open.update_property(&[gtk::accessible::Property::Label("Abrir adjunto")]);
         open.set_valign(gtk::Align::Center);
         open.add_css_class("flat");
 

@@ -125,7 +125,10 @@ pub struct Shell {
     /// Cuentas recién añadidas cuyo primer informe de sincronización aún no ha llegado.
     fresh_accounts: RefCell<Vec<correo_core::AccountId>>,
     inner: adw::NavigationSplitView,
+    outer: adw::NavigationSplitView,
     reader_stack: gtk::Stack,
+    /// Cabecera del panel del lector: aloja las acciones del mensaje.
+    reader_header: adw::HeaderBar,
     reader_box: gtk::Box,
     /// Se crea al primer mensaje abierto, para no construir el lector sin uso.
     reader: RefCell<Option<MessageView>>,
@@ -147,6 +150,14 @@ impl Shell {
                     move |id| {
                         if let Some(s) = w_remove.upgrade() {
                             s.confirm_remove_account(id);
+                        }
+                    },
+                    {
+                        let w = weak.clone();
+                        move || {
+                            if let Some(s) = w.upgrade() {
+                                s.outer.set_show_content(true);
+                            }
                         }
                     },
                 )
@@ -171,8 +182,8 @@ impl Shell {
             let window = adw::ApplicationWindow::builder()
                 .application(app)
                 .title("Correo")
-                .default_width(1100)
-                .default_height(720)
+                .default_width(1180)
+                .default_height(760)
                 .build();
             window.connect_close_request(|win| {
                 if resident() {
@@ -187,16 +198,32 @@ impl Shell {
             let search = gtk::SearchEntry::builder()
                 .placeholder_text("Buscar correo")
                 .hexpand(true)
-                .width_request(240)
+                .build();
+            search.add_css_class("correo-search");
+            let search_clamp = adw::Clamp::builder()
+                .maximum_size(340)
+                .tightening_threshold(240)
+                .child(&search)
                 .build();
             let sync_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-            sync_btn.set_tooltip_text(Some("Sincronizar"));
-            let compose_btn = gtk::Button::with_label("Redactar");
+            sync_btn.add_css_class("correo-sync");
+            sync_btn.set_tooltip_text(Some("Sincronizar (Ctrl+R)"));
+            sync_btn.update_property(&[gtk::accessible::Property::Label("Sincronizar")]);
+            // Botón con icono y texto; en ventanas estrechas solo queda el icono.
+            let compose_content = adw::ButtonContent::builder()
+                .icon_name("mail-message-new-symbolic")
+                .label("Redactar")
+                .build();
+            let compose_btn = gtk::Button::new();
+            compose_btn.set_child(Some(&compose_content));
             compose_btn.add_css_class("suggested-action");
+            compose_btn.add_css_class("correo-compose-button");
+            compose_btn.set_tooltip_text(Some("Redactar un mensaje nuevo (Ctrl+N)"));
+            compose_btn.update_property(&[gtk::accessible::Property::Label("Redactar")]);
             let list_header = adw::HeaderBar::new();
             list_header.pack_start(&sync_btn);
             list_header.pack_end(&compose_btn);
-            list_header.set_title_widget(Some(&search));
+            list_header.set_title_widget(Some(&search_clamp));
             let list_toolbar = adw::ToolbarView::new();
             list_toolbar.add_top_bar(&list_header);
             list_toolbar.set_content(Some(list.widget()));
@@ -204,27 +231,37 @@ impl Shell {
 
             // Lector: placeholder hasta que se abre un mensaje.
             let reader_empty = adw::StatusPage::new();
+            reader_empty.add_css_class("correo-empty");
             reader_empty.set_icon_name(Some("mail-read-symbolic"));
-            reader_empty.set_title("Selecciona un mensaje");
+            reader_empty.set_title("Ningún mensaje seleccionado");
+            reader_empty.set_description(Some("Elige un mensaje de la lista para leerlo."));
             let reader_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
             reader_box.set_hexpand(true);
             reader_box.set_vexpand(true);
             let reader_stack = gtk::Stack::new();
             reader_stack.add_named(&reader_empty, Some("empty"));
             reader_stack.add_named(&reader_box, Some("reader"));
+            reader_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+            reader_stack.set_transition_duration(160);
             reader_stack.set_visible_child_name("empty");
             let reader_toolbar = adw::ToolbarView::new();
-            reader_toolbar.add_top_bar(&adw::HeaderBar::new());
+            let reader_header = adw::HeaderBar::new();
+            reader_header.set_title_widget(Some(&gtk::Label::new(None)));
+            reader_toolbar.add_top_bar(&reader_header);
             reader_toolbar.set_content(Some(&reader_stack));
             let reader_page = adw::NavigationPage::new(&reader_toolbar, "Mensaje");
 
             let inner = adw::NavigationSplitView::new();
-            inner.set_min_sidebar_width(320.0);
+            inner.set_min_sidebar_width(340.0);
+            inner.set_max_sidebar_width(440.0);
+            inner.set_sidebar_width_fraction(0.32);
             inner.set_sidebar(Some(&list_page));
             inner.set_content(Some(&reader_page));
 
             let outer = adw::NavigationSplitView::new();
-            outer.set_min_sidebar_width(220.0);
+            outer.set_min_sidebar_width(250.0);
+            outer.set_max_sidebar_width(300.0);
+            outer.set_sidebar_width_fraction(0.21);
             outer.set_sidebar(Some(sidebar.page()));
             let inner_page = adw::NavigationPage::new(&inner, "Correo");
             outer.set_content(Some(&inner_page));
@@ -232,12 +269,14 @@ impl Shell {
             // Estado vacío: sin cuentas.
             let empty_header = adw::HeaderBar::new();
             let empty_status = adw::StatusPage::new();
+            empty_status.add_css_class("correo-empty");
             empty_status.set_icon_name(Some("mail-unread-symbolic"));
-            empty_status.set_title("Añade tu primera cuenta");
+            empty_status.set_title("Bienvenido a Correo");
             empty_status.set_description(Some(
-                "Correo funciona con Gmail, Outlook.com y Microsoft 365.",
+                "Añade una cuenta de Gmail, Outlook.com o Microsoft 365 para empezar.",
             ));
             let add_btn = gtk::Button::with_label("Añadir cuenta");
+            add_btn.set_halign(gtk::Align::Center);
             add_btn.add_css_class("pill");
             add_btn.add_css_class("suggested-action");
             {
@@ -254,6 +293,8 @@ impl Shell {
             empty_toolbar.set_content(Some(&empty_status));
 
             let root = gtk::Stack::new();
+            root.set_transition_type(gtk::StackTransitionType::Crossfade);
+            root.set_transition_duration(200);
             root.add_named(&outer, Some("main"));
             root.add_named(&empty_toolbar, Some("empty"));
 
@@ -261,15 +302,30 @@ impl Shell {
             toasts.set_child(Some(&root));
             window.set_content(Some(&toasts));
 
-            // Puntos de corte: a 720 px se colapsa la barra lateral; a 1000 px, la lista.
-            for (condition, split) in [("max-width: 720sp", &outer), ("max-width: 1000sp", &inner)]
-            {
+            // Puntos de corte. libadwaita aplica solo el último que cumple su condición, así
+            // que cada uno repite los ajustes de los anteriores: a 1000 px se colapsa la lista;
+            // a 720 px, también la barra lateral; a 560 px, además se compacta la cabecera.
+            let compact_window = |max_width: &str, outer_collapsed: bool, compact: bool| {
                 let bp = adw::Breakpoint::new(
-                    adw::BreakpointCondition::parse(condition).expect("condición de breakpoint"),
+                    adw::BreakpointCondition::parse(max_width).expect("condición de breakpoint"),
                 );
-                bp.add_setter(split, "collapsed", Some(&true.to_value()));
+                bp.add_setter(&inner, "collapsed", Some(&true.to_value()));
+                if outer_collapsed {
+                    bp.add_setter(&outer, "collapsed", Some(&true.to_value()));
+                }
+                if compact {
+                    // El botón Redactar se reduce a su icono.
+                    bp.add_setter(&compose_content, "label", Some(&"".to_value()));
+                    let win = window.clone();
+                    bp.connect_apply(move |_| win.add_css_class("correo-compact"));
+                    let win = window.clone();
+                    bp.connect_unapply(move |_| win.remove_css_class("correo-compact"));
+                }
                 window.add_breakpoint(bp);
-            }
+            };
+            compact_window("max-width: 1000sp", false, false);
+            compact_window("max-width: 720sp", true, false);
+            compact_window("max-width: 560sp", true, true);
 
             // Sincronizar, redactar y búsqueda.
             {
@@ -328,7 +384,9 @@ impl Shell {
                 search,
                 sync_btn,
                 inner,
+                outer,
                 reader_stack,
+                reader_header,
                 reader_box,
                 reader: RefCell::new(None),
                 sync: RefCell::new(None),
@@ -362,6 +420,27 @@ impl Shell {
     /// Acciones de aplicación: las usan las notificaciones (`app.open-message`,
     /// `app.mark-read`, `app.archive`) y funcionan aunque la ventana esté oculta.
     fn install_app_actions(self: &Rc<Self>, app: &adw::Application) {
+        let about = gio::SimpleAction::new("about", None);
+        let w = self.weak.clone();
+        about.connect_activate(move |_, _| {
+            if let Some(s) = w.upgrade() {
+                let dialog = adw::AboutDialog::builder()
+                    .application_name("Correo")
+                    .application_icon(crate::APP_ID)
+                    .developer_name("Guillermo Marco Remón")
+                    .version(env!("CARGO_PKG_VERSION"))
+                    .comments("Cliente de correo nativo para GNOME")
+                    .build();
+                dialog.present(Some(&s.window));
+            }
+        });
+        app.add_action(&about);
+        let quit = gio::SimpleAction::new("quit", None);
+        let a = app.clone();
+        quit.connect_activate(move |_, _| a.quit());
+        app.add_action(&quit);
+        app.set_accels_for_action("app.quit", &["<Primary>q"]);
+
         let ty = glib::VariantTy::new(MESSAGE_TARGET).expect("tipo de acción válido");
         type MessageAction = fn(&Rc<Shell>, MailboxId, u32);
         let entries: [(&str, MessageAction); 3] = [
@@ -620,6 +699,7 @@ impl Shell {
     }
 
     fn refresh_rows(&self) {
+        self.list.set_empty_for_query(&self.state.borrow().query);
         let rows = thread_rows(&self.state.borrow().headers);
         self.list.set_rows(&rows);
     }
@@ -685,6 +765,7 @@ impl Shell {
                 s.on_reader_changed();
             }
         });
+        self.reader_header.pack_end(view.actions());
         self.reader_box.append(view.widget());
         *self.reader.borrow_mut() = Some(view);
     }
@@ -1015,6 +1096,7 @@ impl Shell {
             .collect();
 
         self.sync_btn.set_sensitive(false);
+        self.sync_btn.add_css_class("correo-syncing");
         let w = self.weak.clone();
         glib::MainContext::default().spawn_local(async move {
             let mut new_messages = 0;
@@ -1029,6 +1111,7 @@ impl Shell {
             }
             let Some(s) = w.upgrade() else { return };
             s.sync_btn.set_sensitive(true);
+            s.sync_btn.remove_css_class("correo-syncing");
             if let Err(e) = s.reload_model() {
                 s.toast(format!("Error al leer la caché: {e}"));
             }
@@ -1272,7 +1355,10 @@ pub fn demo_services() -> Result<Services, Box<dyn std::error::Error>> {
     }
 
     let store = Store::open_in_memory()?;
-    seed_demo(&store);
+    // `CORREO_DEMO_EMPTY`: base vacía, para ver el estado «sin cuentas».
+    if std::env::var_os("CORREO_DEMO_EMPTY").is_none() {
+        seed_demo(&store);
+    }
     Ok(Services::new(store, Arc::new(NoTokens))?)
 }
 
@@ -1318,8 +1404,35 @@ pub fn seed_demo(store: &Store) {
     let people = [
         ("Ana Ruiz", "ana@ejemplo.com"),
         ("Luis Gómez", "luis@ejemplo.org"),
-        ("Soporte", "soporte@ejemplo.net"),
+        ("Soporte técnico", "soporte@ejemplo.net"),
         ("Marta Solé", "marta@ejemplo.com"),
+        ("Javier Ortega", "javier@ejemplo.es"),
+        ("Carmen Vidal", "carmen@ejemplo.org"),
+        ("Equipo de Facturación", "facturas@ejemplo.net"),
+        ("Pablo", "pablo@ejemplo.com"),
+    ];
+    // Un asunto, un extracto y una antigüedad (en horas) por hilo, para tener variedad.
+    let topics = [
+        (
+            "Presupuesto del trimestre",
+            "Hola, te envío la revisión del documento con las cifras actualizadas.",
+            0.4,
+        ),
+        (
+            "Reunión del jueves: orden del día",
+            "Os dejo los puntos que quiero tratar; avisadme si falta algo importante.",
+            5.0,
+        ),
+        (
+            "Tu factura de octubre ya está disponible",
+            "Adjuntamos el PDF con el detalle de tu consumo del último periodo.",
+            30.0,
+        ),
+        (
+            "Fotos del fin de semana",
+            "Por fin he conseguido pasar las fotos, ¡hay alguna que te va a encantar!",
+            100.0,
+        ),
     ];
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1358,18 +1471,15 @@ pub fn seed_demo(store: &Store) {
             let thread = i / 3;
             let root_id = format!("<demo{index}-{}@ejemplo.com>", thread * 3);
             let mid = format!("<demo{index}-{i}@ejemplo.com>");
+            let topic = topics[thread as usize % topics.len()];
             let (in_reply_to, references, subject) = if i % 3 == 0 {
-                (
-                    None,
-                    Vec::new(),
-                    format!("Tema {}: presupuesto del trimestre", thread + 1),
-                )
+                (None, Vec::new(), topic.0.to_string())
             } else {
                 let prev = format!("<demo{index}-{}@ejemplo.com>", i - 1);
                 (
                     Some(prev.clone()),
                     vec![root_id.clone(), prev],
-                    format!("Re: Tema {}: presupuesto del trimestre", thread + 1),
+                    format!("Re: {}", topic.0),
                 )
             };
             let (name, sender) = people[(thread as usize + index) % people.len()];
@@ -1394,21 +1504,70 @@ pub fn seed_demo(store: &Store) {
                     email: email.into(),
                 }],
                 cc: Vec::new(),
-                date: now - i64::from(12 - i) * 7_200 - index as i64 * 600,
+                date: now
+                    - (topic.2 * 3_600.0) as i64
+                    - i64::from(2 - i % 3) * 900
+                    - index as i64 * 600,
                 flags: Flags {
                     seen,
                     ..Flags::default()
                 },
-                has_attachments: i % 5 == 0,
-                snippet: Some(format!(
-                    "Hola, te envío la revisión número {i} del documento."
-                )),
-                labels: Vec::new(),
+                has_attachments: (i + index as u32).is_multiple_of(5),
+                snippet: Some(topic.1.to_string()),
+                labels: if i % 6 == 1 {
+                    vec!["Trabajo".to_string()]
+                } else {
+                    Vec::new()
+                },
             });
         }
         store
             .upsert_headers(inbox, &headers)
             .expect("cabeceras demo");
+        // Cuerpos en la caché, para que el lector se pueda ver sin red.
+        for h in &headers {
+            let Ok(Some(message_id)) = store.message_id(inbox, h.uid) else {
+                continue;
+            };
+            let sender = h
+                .from
+                .first()
+                .and_then(|a| a.name.clone())
+                .unwrap_or_default();
+            let text = format!(
+                "Hola:\n\n{}\n\nQuedo pendiente de tus comentarios; si te viene bien, lo \
+                 repasamos juntos esta semana y lo cerramos antes del viernes.\n\n\
+                 Un abrazo,\n{sender}\n\n> El mensaje anterior decía:\n> Gracias por la \
+                 revisión, me parece bien el enfoque.\n> Un saludo.\n",
+                h.snippet.clone().unwrap_or_default()
+            );
+            let attachments = if h.uid % 6 == 3 {
+                vec![
+                    correo_core::Attachment {
+                        filename: "Presupuesto-T4.pdf".into(),
+                        mime_type: "application/pdf".into(),
+                        size: 248_000,
+                        content_id: None,
+                    },
+                    correo_core::Attachment {
+                        filename: "cifras.xlsx".into(),
+                        mime_type: "application/vnd.ms-excel".into(),
+                        size: 56_400,
+                        content_id: None,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let _ = store.save_body(
+                message_id,
+                &correo_core::MessageBody {
+                    text: Some(text),
+                    html: None,
+                    attachments,
+                },
+            );
+        }
         store
             .upsert_mailbox(&mailbox(inbox_path, MailboxRole::Inbox, unread))
             .expect("contador demo");
