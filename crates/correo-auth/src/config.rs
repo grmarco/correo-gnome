@@ -81,6 +81,24 @@ impl OAuthProvider {
         }
     }
 
+    /// Usa un tenant concreto en vez de `common` (GUID, dominio, `organizations` o
+    /// `consumers`). Hace falta si la app está registrada como de un solo inquilino, p. ej.
+    /// dentro del tenant de una organización. Un valor con caracteres no válidos se ignora.
+    pub fn with_tenant(mut self, tenant: &str) -> Self {
+        let tenant = tenant.trim();
+        let valid = !tenant.is_empty()
+            && tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if valid {
+            self.authorization_url = self
+                .authorization_url
+                .replace("/common/", &format!("/{tenant}/"));
+            self.token_url = self.token_url.replace("/common/", &format!("/{tenant}/"));
+        }
+        self
+    }
+
     /// Añade un client secret (solo para aplicaciones confidenciales).
     pub fn with_client_secret(mut self, secret: impl Into<String>) -> Self {
         self.client_secret = Some(secret.into());
@@ -105,5 +123,31 @@ impl fmt::Debug for OAuthProvider {
             )
             .field("callback_timeout", &self.callback_timeout)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::OAuthProvider;
+
+    #[test]
+    fn tenant_replaces_common_in_both_endpoints() {
+        let p = OAuthProvider::microsoft("cid").with_tenant("contoso.onmicrosoft.com");
+        assert!(
+            p.authorization_url
+                .contains("/contoso.onmicrosoft.com/oauth2/v2.0/authorize")
+        );
+        assert!(
+            p.token_url
+                .contains("/contoso.onmicrosoft.com/oauth2/v2.0/token")
+        );
+    }
+
+    #[test]
+    fn invalid_tenant_is_ignored() {
+        let p = OAuthProvider::microsoft("cid").with_tenant("evil.com/../x?y=1");
+        assert!(p.token_url.contains("/common/"));
+        let p = OAuthProvider::microsoft("cid").with_tenant("  ");
+        assert!(p.token_url.contains("/common/"));
     }
 }

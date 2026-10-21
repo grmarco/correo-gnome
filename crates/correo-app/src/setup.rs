@@ -57,7 +57,10 @@ pub fn oauth_config(provider: Provider) -> Option<OAuthProvider> {
             }
         }),
         Provider::Outlook | Provider::Microsoft365 => cfg.microsoft_client_id().map(|id| {
-            let provider = OAuthProvider::microsoft(id);
+            let provider = match cfg.microsoft_tenant() {
+                Some(tenant) => OAuthProvider::microsoft(id).with_tenant(tenant),
+                None => OAuthProvider::microsoft(id),
+            };
             match cfg.microsoft_client_secret() {
                 Some(secret) => provider.with_client_secret(secret),
                 None => provider,

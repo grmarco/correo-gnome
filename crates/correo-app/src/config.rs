@@ -12,6 +12,7 @@ pub const ENV_GOOGLE_CLIENT_ID: &str = "CORREO_GOOGLE_CLIENT_ID";
 pub const ENV_MICROSOFT_CLIENT_ID: &str = "CORREO_MICROSOFT_CLIENT_ID";
 pub const ENV_GOOGLE_CLIENT_SECRET: &str = "CORREO_GOOGLE_CLIENT_SECRET";
 pub const ENV_MICROSOFT_CLIENT_SECRET: &str = "CORREO_MICROSOFT_CLIENT_SECRET";
+pub const ENV_MICROSOFT_TENANT: &str = "CORREO_MICROSOFT_TENANT";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -31,6 +32,9 @@ pub struct ProviderConfig {
     /// Necesario en la práctica para Google (aplicación de escritorio). En apps de escritorio
     /// el secreto no es confidencial; ver docs/OAUTH.md.
     pub client_secret: Option<String>,
+    /// Solo Microsoft: tenant de la organización (GUID o dominio) si la app se registró como
+    /// de un solo inquilino. Por defecto `common`.
+    pub tenant: Option<String>,
 }
 
 /// El secreto no aparece nunca en los logs ni en `{:?}`.
@@ -42,6 +46,7 @@ impl std::fmt::Debug for ProviderConfig {
                 "client_secret",
                 &self.client_secret.as_ref().map(|_| "<redacted>"),
             )
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -72,6 +77,9 @@ impl Config {
         if let Some(id) = var(ENV_MICROSOFT_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
             self.microsoft.client_id = Some(id.trim().to_owned());
         }
+        if let Some(tenant) = var(ENV_MICROSOFT_TENANT).filter(|v| !v.trim().is_empty()) {
+            self.microsoft.tenant = Some(tenant.trim().to_owned());
+        }
         if let Some(secret) = var(ENV_GOOGLE_CLIENT_SECRET).filter(|v| !v.trim().is_empty()) {
             self.google.client_secret = Some(secret.trim().to_owned());
         }
@@ -91,6 +99,10 @@ impl Config {
     }
 
     /// Client secret de Google, si está configurado y no está vacío.
+    pub fn microsoft_tenant(&self) -> Option<&str> {
+        non_empty(self.microsoft.tenant.as_deref())
+    }
+
     pub fn google_client_secret(&self) -> Option<&str> {
         non_empty(self.google.client_secret.as_deref())
     }
