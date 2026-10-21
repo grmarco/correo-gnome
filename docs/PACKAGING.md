@@ -78,7 +78,7 @@ No hay acceso al home. Si se quiere eliminar `xdg-download`, guardar adjuntos co
 
 Permisos Flatpak: ninguno nuevo. `--share=network` (ya concedido) solo se usa para las imágenes https que el usuario pida cargar; el filtro de contenido bloquea el resto de la red. No hace falta `--device=dri` extra: el `WebView` desactiva la aceleración por hardware (`HardwareAccelerationPolicy::Never`). El filtro de contenido compilado se guarda en `$XDG_RUNTIME_DIR/correo-webkit-filtros` (disponible en el sandbox). Los procesos auxiliares de WebKit (`WebKitWebProcess`, `WebKitNetworkProcess`) se lanzan dentro del sandbox de la aplicación; el sandbox propio de WebKit usa el portal de Flatpak y no requiere permisos adicionales. **No verificado**: `flatpak` no está instalado en la máquina de desarrollo, así que no se ha construido ni ejecutado la vista completa dentro de Flatpak.
 
-Variables y ajustes: `html_renderer = "webkit" | "light" | "auto"` en `config.toml` y `CORREO_HTML_RENDERER` (ver `docs/DEVELOPMENT.md`).
+Variables y ajustes: `html_renderer = "webkit" | "light" | "auto"` en `config.toml` y `CORREO_HTML_RENDERER`; `html_dark_mode = "auto" | "original" | "invert"` y `CORREO_HTML_DARK_MODE` (ver `docs/DEVELOPMENT.md`).
 
 ## Validación
 

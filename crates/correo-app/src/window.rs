@@ -20,6 +20,7 @@ use crate::composer;
 use crate::load_status::LoadTracker;
 use crate::message_list::{thread_rows, MessageList, Selection};
 use crate::notify;
+use crate::older::{self, OlderTracker};
 use crate::reader::MessageView;
 use crate::search;
 use crate::services::{flatten, Services};
@@ -58,6 +59,7 @@ pub fn present(app: &adw::Application, services: Rc<Services>) {
         let weak = shell.weak.clone();
         let weak_auth = shell.weak.clone();
         let weak_status = shell.weak.clone();
+        let weak_counts = shell.weak.clone();
         let handle = setup::start_sync(
             shell.services.clone(),
             app,
@@ -74,6 +76,11 @@ pub fn present(app: &adw::Application, services: Rc<Services>) {
             move |account, mailbox, state| {
                 if let Some(s) = weak_status.upgrade() {
                     s.on_mailbox_status(&account, mailbox, state);
+                }
+            },
+            move |_account| {
+                if let Some(s) = weak_counts.upgrade() {
+                    s.on_counts_changed();
                 }
             },
         );
@@ -141,6 +148,8 @@ pub struct Shell {
     compact: Cell<bool>,
     /// Estado de sincronización de cada carpeta (avisos del runner).
     load: RefCell<LoadTracker>,
+    /// «Cargar mensajes anteriores» por carpeta (por sesión).
+    older: RefCell<OlderTracker>,
     /// Cuentas recién añadidas cuyo primer informe de sincronización aún no ha llegado.
     fresh_accounts: RefCell<Vec<correo_core::AccountId>>,
     inner: adw::NavigationSplitView,
@@ -437,7 +446,7 @@ impl Shell {
                 let w = weak.clone();
                 adj.connect_changed(move |a| {
                     if let Some(s) = w.upgrade() {
-                        s.maybe_load_more(a);
+                        s.maybe_load_more(a, false);
                     }
                 });
             }
@@ -445,7 +454,7 @@ impl Shell {
                 let w = weak.clone();
                 adj.connect_value_changed(move |a| {
                     if let Some(s) = w.upgrade() {
-                        s.maybe_load_more(a);
+                        s.maybe_load_more(a, true);
                     }
                 });
             }
@@ -472,6 +481,7 @@ impl Shell {
                 sync: RefCell::new(None),
                 compact: Cell::new(false),
                 load: RefCell::new(LoadTracker::default()),
+                older: RefCell::new(OlderTracker::default()),
                 fresh_accounts: RefCell::new(Vec::new()),
                 state: RefCell::new(State {
                     accounts: Vec::new(),
@@ -605,6 +615,12 @@ impl Shell {
         if let Err(e) = self.reload_model() {
             self.toast(format!("No se pudo leer la base de datos: {e}"));
         }
+        let w = self.weak.clone();
+        self.list.connect_load_older(move || {
+            if let Some(s) = w.upgrade() {
+                s.load_older(true);
+            }
+        });
         let w = self.weak.clone();
         self.list.connect_retry(move || {
             if let Some(s) = w.upgrade() {
@@ -780,6 +796,7 @@ impl Shell {
         }
         let loading = state == crate::message_list::LoadState::Loading;
         self.list.set_load_state(state);
+        self.update_older_ui();
         // Una sincronización manual en curso (botón desactivado) gestiona su propio giro.
         if self.sync_btn.is_sensitive() {
             if loading {
@@ -876,7 +893,8 @@ impl Shell {
         let mut fetched: Vec<(usize, Vec<MessageHeader>)> = Vec::new();
         let result = self.with_store(|s| {
             for (i, mailbox, offset) in &plan {
-                fetched.push((*i, s.list_headers(mailbox.id, PAGE, *offset)?));
+                // Una fila de más: así se sabe ya si queda otra página local.
+                fetched.push((*i, s.list_headers(mailbox.id, PAGE + 1, *offset)?));
             }
             Ok(())
         });
@@ -885,12 +903,15 @@ impl Shell {
             let mut st = self.state.borrow_mut();
             st.loading = false;
             if result.is_ok() {
-                for (i, headers) in fetched {
-                    let n = headers.len();
+                for (i, mut headers) in fetched {
                     let source = &mut st.sources[i];
-                    source.offset += n;
-                    source.exhausted = n < PAGE;
-                    st.headers.extend(headers);
+                    source.exhausted = headers.len() <= PAGE;
+                    headers.truncate(PAGE);
+                    source.offset += headers.len();
+                    // Con fechas desordenadas respecto al UID, una página puede repetir filas.
+                    let known: HashSet<MessageId> = st.headers.iter().map(|h| h.id).collect();
+                    st.headers
+                        .extend(headers.into_iter().filter(|h| !known.contains(&h.id)));
                 }
                 st.headers.sort_by_key(|m| std::cmp::Reverse(m.date));
             }
@@ -901,10 +922,98 @@ impl Shell {
         self.refresh_rows();
     }
 
-    fn maybe_load_more(self: &Rc<Self>, adj: &gtk::Adjustment) {
+    /// `scrolled`: el aviso viene de un desplazamiento (no de un cambio de tamaño del contenido).
+    fn maybe_load_more(self: &Rc<Self>, adj: &gtk::Adjustment, scrolled: bool) {
         if adj.value() + adj.page_size() >= adj.upper() - 300.0 {
             self.load_more();
+            // Al llegar al final de una lista que ya se puede desplazar y sin filas locales
+            // por mostrar, se pide historial al servidor.
+            if scrolled && adj.value() > 0.0 && adj.upper() > adj.page_size() {
+                self.load_older(false);
+            }
         }
+    }
+
+    /// Carpetas de la vista que podrían tener mensajes más antiguos en el servidor.
+    fn older_targets(&self) -> Vec<MailboxId> {
+        self.state
+            .borrow()
+            .sources
+            .iter()
+            .map(|s| s.mailbox.id)
+            .collect()
+    }
+
+    /// Fila «Cargar mensajes anteriores» del final de la lista y su estado.
+    fn update_older_ui(&self) {
+        let (has_query, local_left) = {
+            let st = self.state.borrow();
+            (
+                !st.query.is_empty(),
+                st.sources.iter().any(|s| !s.exhausted),
+            )
+        };
+        let ids = self.older_targets();
+        let idle = self.load.borrow().summary(&ids) == crate::message_list::LoadState::Idle;
+        let footer = if older::footer_allowed(has_query, local_left, idle) {
+            self.older.borrow().footer(&ids)
+        } else {
+            older::Footer::Hidden
+        };
+        self.list.set_older_footer(&footer);
+    }
+
+    /// Pide al servidor los mensajes anteriores a los de la caché (en segundo plano).
+    /// `manual`: botón (también reintenta lo fallido); si no, carga automática al llegar al final.
+    fn load_older(self: &Rc<Self>, manual: bool) {
+        {
+            let st = self.state.borrow();
+            let local_left = st.sources.iter().any(|s| !s.exhausted);
+            if !st.query.is_empty() || local_left {
+                return;
+            }
+        }
+        let ids = self.older_targets();
+        if self.load.borrow().summary(&ids) != crate::message_list::LoadState::Idle {
+            return;
+        }
+        let todo = self.older.borrow().to_request(&ids, manual);
+        for id in todo {
+            let Some(mailbox) = self.mailbox(id) else {
+                continue;
+            };
+            let Some(account) = self.account(mailbox.account_id) else {
+                continue;
+            };
+            self.older.borrow_mut().start(id);
+            let backend = self.services.backend(&account);
+            let fut = flatten(
+                self.services
+                    .spawn(async move { backend.fetch_older(&mailbox, older::OLDER_PAGE).await }),
+            );
+            let w = self.weak.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = fut.await.map_err(|e| e.to_string());
+                if let Some(s) = w.upgrade() {
+                    s.on_older(id, result);
+                }
+            });
+        }
+        self.update_older_ui();
+    }
+
+    fn on_older(self: &Rc<Self>, id: MailboxId, result: Result<correo_core::OlderPage, String>) {
+        let fetched = self.older.borrow_mut().finish(id, result);
+        if fetched && self.state.borrow().query.is_empty() {
+            // Las nuevas cabeceras van tras las ya mostradas: se retoma la paginación local.
+            for s in &mut self.state.borrow_mut().sources {
+                if s.mailbox.id == id {
+                    s.exhausted = false;
+                }
+            }
+            self.load_more();
+        }
+        self.update_older_ui();
     }
 
     fn refresh_rows(&self) {
@@ -912,6 +1021,7 @@ impl Shell {
         let rows = thread_rows(&self.state.borrow().headers);
         self.list.set_rows(&rows);
         self.update_batch_ui();
+        self.update_older_ui();
     }
 
     fn on_search(self: &Rc<Self>) {
@@ -1173,6 +1283,16 @@ impl Shell {
         if shows_account {
             self.refresh_list();
         }
+    }
+
+    /// Cambiaron contadores de no leídos en segundo plano: solo se relee la barra lateral
+    /// (la lista de mensajes y la selección no se tocan).
+    fn on_counts_changed(self: &Rc<Self>) {
+        if let Err(e) = self.reload_model() {
+            eprintln!("correo: no se pudieron releer las carpetas: {e}");
+            return;
+        }
+        self.reload_sidebar();
     }
 
     /// El lector cambió un mensaje (leído, no leído, archivado o borrado).
@@ -2240,7 +2360,8 @@ fn folder_label(m: &Mailbox) -> String {
     crate::folder_tree::role_name(m.role).map_or_else(
         || {
             let sep = m.delimiter.unwrap_or('/');
-            m.path.rsplit(sep).next().unwrap_or(&m.path).to_string()
+            // Solo para mostrar: la ruta cruda (UTF-7 modificado) no se toca.
+            correo_core::decode_modified_utf7(m.path.rsplit(sep).next().unwrap_or(&m.path))
         },
         str::to_string,
     )
@@ -2305,8 +2426,9 @@ pub fn demo_services() -> Result<Services, Box<dyn std::error::Error>> {
     if std::env::var_os("CORREO_DEMO_EMPTY").is_none() {
         seed_demo(&store);
     }
-    Ok(Services::new(store, Arc::new(NoTokens))?
-        .with_backend_override(crate::demo_backend::DemoBackend::shared()))
+    let services = Services::new(store, Arc::new(NoTokens))?;
+    let backend = crate::demo_backend::DemoBackend::shared(Arc::clone(&services.store));
+    Ok(services.with_backend_override(backend))
 }
 
 /// Inserta cuatro cuentas ficticias (dos Gmail y dos Outlook / Microsoft 365), cada una con
@@ -2430,6 +2552,11 @@ pub fn seed_demo(store: &Store) {
                 ("Proyectos/Casa/Obra", MailboxRole::Other, 3),
                 ("Proyectos/Casa/Obra/Facturas", MailboxRole::Other, 0),
                 ("Proyectos/Viaje", MailboxRole::Other, 0),
+                // Nombres en UTF-7 modificado (RFC 3501 §5.1.3): se muestran decodificados.
+                ("Problemas de sincronizaci&APM-n", MailboxRole::Other, 2),
+                ("Facturaci&APM-n", MailboxRole::Other, 0),
+                ("Facturaci&APM-n/Ni&APE-os &- Cia", MailboxRole::Other, 0),
+                ("&2D3eAA- Ideas", MailboxRole::Other, 0),
             ]
             .into_iter()
             .map(|(p, r, u)| (p.to_string(), r, u))
@@ -2459,9 +2586,24 @@ pub fn seed_demo(store: &Store) {
             _ => Vec::new(),
         };
         for (path, role, unread) in extra {
-            store
+            let id = store
                 .upsert_mailbox(&mailbox(&path, role, unread))
                 .expect("carpeta demo");
+            // Carpetas de archivo con historial: solo están en caché los últimos 100 de los
+            // que «tiene el servidor» (`fetch_older` de la demo trae el resto).
+            let top = path
+                .starts_with("Archives/")
+                .then(|| crate::demo_backend::demo_archive_top(&path))
+                .flatten();
+            if let Some(top) = top {
+                let first = top.saturating_sub(99).max(1);
+                store
+                    .upsert_headers(
+                        id,
+                        &crate::demo_backend::demo_archive_headers(id, &path, first..=top),
+                    )
+                    .expect("cabeceras demo");
+            }
         }
 
         let mut headers = Vec::new();

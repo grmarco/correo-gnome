@@ -10,6 +10,7 @@ mod load_status;
 mod message_list;
 mod notice;
 mod notify;
+mod older;
 mod reader;
 mod search;
 mod services;

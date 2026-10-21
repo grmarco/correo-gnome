@@ -48,15 +48,24 @@ pub enum MailboxSync {
 /// Callback con el estado de una carpeta (cuenta, carpeta, estado).
 pub type OnMailbox = Rc<dyn Fn(Account, MailboxId, MailboxSync)>;
 
+/// Callback cuando cambian los contadores de no leídos de una cuenta.
+pub type OnCounts = Rc<dyn Fn(Account)>;
+
 type Senders = Rc<RefCell<HashMap<AccountId, Running>>>;
+
+/// Callbacks hacia la interfaz, compartidos por todos los runners.
+struct Callbacks {
+    on_new: Box<dyn Fn(Account, Vec<MessageId>)>,
+    on_auth: Box<dyn Fn(Account)>,
+    on_mailbox: OnMailbox,
+    on_counts: OnCounts,
+}
 
 /// Control de la sincronización desde la interfaz. Mantenlo vivo mientras la app
 /// necesite sincronizar: al soltarlo, los `Rc` de los callbacks se liberan.
 pub struct SyncHandle {
     services: Rc<Services>,
-    on_new: Rc<dyn Fn(Account, Vec<MessageId>)>,
-    on_auth: Rc<dyn Fn(Account)>,
-    on_mailbox: OnMailbox,
+    callbacks: Rc<Callbacks>,
     senders: Senders,
     power: Rc<PowerWatcher>,
     _resume: Option<ResumeWatch>,
@@ -98,9 +107,7 @@ impl SyncHandle {
             async move { start_runner(account, backend, store).await }
         }));
         let senders = Rc::clone(&self.senders);
-        let on_new = Rc::clone(&self.on_new);
-        let on_auth = Rc::clone(&self.on_auth);
-        let on_mailbox = Rc::clone(&self.on_mailbox);
+        let callbacks = Rc::clone(&self.callbacks);
         let power = Rc::clone(&self.power);
         let services = Rc::clone(&self.services);
         glib::MainContext::default().spawn_local(async move {
@@ -116,19 +123,11 @@ impl SyncHandle {
                         channels.task.abort();
                         return;
                     }
-                    attach(
-                        account,
-                        channels,
-                        &senders,
-                        &on_new,
-                        &on_auth,
-                        &on_mailbox,
-                        power.conditions(),
-                    )
+                    attach(account, channels, &senders, &callbacks, power.conditions())
                 }
                 Err(Error::Auth(e)) => {
                     eprintln!("correo: {}: requiere reautorización ({e})", account.email);
-                    on_auth(account);
+                    (callbacks.on_auth)(account);
                 }
                 Err(e) => eprintln!("correo: no se pudo iniciar la sincronización: {e}"),
             }
@@ -162,6 +161,7 @@ pub fn start_sync(
     on_new: impl Fn(Account, Vec<MessageId>) + 'static,
     on_auth_required: impl Fn(Account) + 'static,
     on_mailbox: impl Fn(Account, MailboxId, MailboxSync) + 'static,
+    on_counts: impl Fn(Account) + 'static,
 ) -> SyncHandle {
     if super::app_config().run_in_background {
         // Modo residente: el guard vive lo que la app. Se olvida a propósito para que
@@ -190,9 +190,12 @@ pub fn start_sync(
 
     let handle = SyncHandle {
         services: Rc::clone(&services),
-        on_new: Rc::new(on_new),
-        on_auth: Rc::new(on_auth_required),
-        on_mailbox: Rc::new(on_mailbox),
+        callbacks: Rc::new(Callbacks {
+            on_new: Box::new(on_new),
+            on_auth: Box::new(on_auth_required),
+            on_mailbox: Rc::new(on_mailbox),
+            on_counts: Rc::new(on_counts),
+        }),
         senders,
         power: Rc::new(power),
         _resume: resume,
@@ -212,9 +215,7 @@ fn attach(
     account: Account,
     channels: SyncChannels,
     senders: &Senders,
-    on_new: &Rc<dyn Fn(Account, Vec<MessageId>)>,
-    on_auth: &Rc<dyn Fn(Account)>,
-    on_mailbox: &OnMailbox,
+    callbacks: &Rc<Callbacks>,
     conditions: correo_sync::Conditions,
 ) {
     let SyncChannels {
@@ -231,21 +232,20 @@ fn attach(
         previous.task.abort();
     }
 
-    let on_new = Rc::clone(on_new);
-    let on_auth = Rc::clone(on_auth);
-    let on_mailbox = Rc::clone(on_mailbox);
+    let callbacks = Rc::clone(callbacks);
     glib::MainContext::default().spawn_local(async move {
         while let Some(notice) = reports.recv().await {
             match notice {
                 SyncNotice::NewMessages(SyncReport { new_messages, .. }) => {
-                    on_new(account.clone(), new_messages)
+                    (callbacks.on_new)(account.clone(), new_messages)
                 }
-                SyncNotice::AuthRequired { .. } => on_auth(account.clone()),
+                SyncNotice::AuthRequired { .. } => (callbacks.on_auth)(account.clone()),
+                SyncNotice::CountsChanged { .. } => (callbacks.on_counts)(account.clone()),
                 SyncNotice::MailboxSyncing { mailbox, .. } => {
-                    on_mailbox(account.clone(), mailbox, MailboxSync::Syncing)
+                    (callbacks.on_mailbox)(account.clone(), mailbox, MailboxSync::Syncing)
                 }
                 SyncNotice::MailboxSynced { mailbox, error, .. } => {
-                    on_mailbox(account.clone(), mailbox, MailboxSync::Done(error))
+                    (callbacks.on_mailbox)(account.clone(), mailbox, MailboxSync::Done(error))
                 }
             }
         }

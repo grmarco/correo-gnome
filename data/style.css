@@ -331,6 +331,13 @@ textview.correo-reader-body, textview.correo-reader-body text { background: tran
   box-shadow: 0 0 0 1px alpha(currentColor, 0.10), 0 2px 8px alpha(black, 0.10);
 }
 
+/* En tema oscuro (clase puesta por reader_web.rs según el aspecto del correo) la tarjeta es
+ * oscura: el WebView pinta ese mismo color antes de cargar, así no hay destello blanco. */
+.correo-mail-card.correo-mail-card-dark {
+  background: #1e1e1e;
+  box-shadow: 0 0 0 1px alpha(white, 0.10), 0 2px 8px alpha(black, 0.30);
+}
+
 /* Citas plegables: botón «···» que revela la cita (gtk::Revealer) */
 .correo-quote-toggle {
   min-height: 20px;

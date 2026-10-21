@@ -15,6 +15,7 @@ pub const ENV_MICROSOFT_CLIENT_SECRET: &str = "CORREO_MICROSOFT_CLIENT_SECRET";
 pub const ENV_MICROSOFT_TENANT: &str = "CORREO_MICROSOFT_TENANT";
 
 pub const ENV_HTML_RENDERER: &str = "CORREO_HTML_RENDERER";
+pub const ENV_HTML_DARK_MODE: &str = "CORREO_HTML_DARK_MODE";
 
 /// Renderizador de los mensajes con HTML. Sin la feature `webkit` siempre se usa el ligero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -48,14 +49,53 @@ impl<'de> Deserialize<'de> for HtmlRenderer {
     }
 }
 
+/// Qué hace la vista completa con los correos HTML cuando el tema del sistema es oscuro.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HtmlDarkMode {
+    /// Los correos conscientes del modo oscuro usan sus propios colores oscuros; los demás se
+    /// oscurecen automáticamente; los que ya traen fondo oscuro se dejan como están.
+    #[default]
+    Auto,
+    /// Colores originales: siempre sobre una tarjeta blanca.
+    Original,
+    /// Oscurización automática siempre (salvo en correos que ya traen fondo oscuro).
+    Invert,
+}
+
+impl HtmlDarkMode {
+    /// Analiza `auto`, `original` o `invert` (sin distinguir mayúsculas).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "original" => Some(Self::Original),
+            "invert" => Some(Self::Invert),
+            _ => None,
+        }
+    }
+}
+
+/// Un valor desconocido en el fichero no invalida el resto de la configuración.
+impl<'de> Deserialize<'de> for HtmlDarkMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Ok(Self::parse(&text).unwrap_or_default())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
     /// `"webkit"` (por defecto), `"light"` o `"auto"`. Ver `HtmlRenderer`.
     #[cfg_attr(not(feature = "webkit"), allow(dead_code))]
     pub html_renderer: HtmlRenderer,
+    /// `"auto"` (por defecto), `"original"` o `"invert"`: la vista completa en tema oscuro.
+    #[cfg_attr(not(feature = "webkit"), allow(dead_code))]
+    pub html_dark_mode: HtmlDarkMode,
     /// Días de cabeceras a sincronizar al crear una cuenta.
     pub sync_days: u32,
+    /// Mínimo de mensajes recientes que se mantienen en caché por carpeta aunque sean más
+    /// antiguos que la ventana de días (se valida a 20..=2000; ver `min_messages`).
+    pub min_messages_per_folder: u32,
     /// Modo residente: la app sigue activa (con notificaciones) sin ventanas abiertas.
     pub run_in_background: bool,
     pub google: ProviderConfig,
@@ -92,8 +132,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sync_days: DEFAULT_SYNC_DAYS,
+            min_messages_per_folder: correo_imap::DEFAULT_MIN_MESSAGES,
             run_in_background: false,
             html_renderer: HtmlRenderer::default(),
+            html_dark_mode: HtmlDarkMode::default(),
             google: ProviderConfig::default(),
             microsoft: ProviderConfig::default(),
         }
@@ -112,6 +154,9 @@ impl Config {
         if let Some(mode) = var(ENV_HTML_RENDERER).and_then(|v| HtmlRenderer::parse(&v)) {
             self.html_renderer = mode;
         }
+        if let Some(mode) = var(ENV_HTML_DARK_MODE).and_then(|v| HtmlDarkMode::parse(&v)) {
+            self.html_dark_mode = mode;
+        }
         if let Some(id) = var(ENV_GOOGLE_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
             self.google.client_id = Some(id.trim().to_owned());
         }
@@ -127,6 +172,11 @@ impl Config {
         if let Some(secret) = var(ENV_MICROSOFT_CLIENT_SECRET).filter(|v| !v.trim().is_empty()) {
             self.microsoft.client_secret = Some(secret.trim().to_owned());
         }
+    }
+
+    /// Mínimo de mensajes por carpeta, ajustado al rango válido.
+    pub fn min_messages(&self) -> usize {
+        correo_imap::effective_min_messages(self.min_messages_per_folder)
     }
 
     /// Client ID de Google, si está configurado y no está vacío.
@@ -297,6 +347,40 @@ mod tests {
         assert_eq!(config.html_renderer, HtmlRenderer::Light);
         config.apply_env(|n| (n == ENV_HTML_RENDERER).then(|| "nada".to_owned()));
         assert_eq!(config.html_renderer, HtmlRenderer::Light);
+    }
+
+    #[test]
+    fn html_dark_mode_defaults_to_auto_and_parses_values() {
+        assert_eq!(Config::default().html_dark_mode, HtmlDarkMode::Auto);
+        for (text, mode) in [
+            ("original", HtmlDarkMode::Original),
+            ("Invert", HtmlDarkMode::Invert),
+            ("auto", HtmlDarkMode::Auto),
+        ] {
+            let config = Config::parse(&format!("html_dark_mode = \"{text}\"")).unwrap();
+            assert_eq!(config.html_dark_mode, mode);
+        }
+        let config = Config::parse("html_dark_mode = \"raro\"\nsync_days = 3").unwrap();
+        assert_eq!(config.html_dark_mode, HtmlDarkMode::Auto);
+        assert_eq!(config.sync_days, 3);
+    }
+
+    #[test]
+    fn env_overrides_html_dark_mode_and_ignores_garbage() {
+        let mut config = Config::parse("html_dark_mode = \"invert\"").unwrap();
+        config.apply_env(|n| (n == ENV_HTML_DARK_MODE).then(|| " ORIGINAL ".to_owned()));
+        assert_eq!(config.html_dark_mode, HtmlDarkMode::Original);
+        config.apply_env(|n| (n == ENV_HTML_DARK_MODE).then(|| "nada".to_owned()));
+        assert_eq!(config.html_dark_mode, HtmlDarkMode::Original);
+    }
+
+    #[test]
+    fn min_messages_per_folder_is_validated() {
+        assert_eq!(Config::default().min_messages(), 100);
+        let parse = |v: &str| Config::parse(&format!("min_messages_per_folder = {v}")).unwrap();
+        assert_eq!(parse("250").min_messages(), 250);
+        assert_eq!(parse("5").min_messages(), 20);
+        assert_eq!(parse("100000").min_messages(), 2000);
     }
 
     #[test]

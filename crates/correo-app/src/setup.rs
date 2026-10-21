@@ -99,7 +99,9 @@ pub fn init_services() -> std::result::Result<Services, Box<dyn StdError>> {
     });
     let _ = ROUTER.set(Arc::clone(&router));
 
-    Ok(Services::new(store, router)?.with_forget_tokens(forget))
+    Ok(Services::new(store, router)?
+        .with_forget_tokens(forget)
+        .with_min_messages(cfg.min_messages()))
 }
 
 /// Guarda los tokens de una cuenta (alta o reautorización) en el almacén y en la caché del

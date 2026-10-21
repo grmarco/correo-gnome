@@ -19,6 +19,7 @@ Después de registrar las apps, configura los identificadores en
 
 ```toml
 sync_days = 14            # días de cabeceras a sincronizar al crear una cuenta
+min_messages_per_folder = 100 # mínimo de mensajes recientes en caché por carpeta (20..2000)
 run_in_background = false # true: la app sigue activa sin ventanas (notificaciones)
 
 [google]

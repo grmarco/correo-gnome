@@ -24,6 +24,8 @@ pub struct Services {
     /// Backend IMAP por cuenta: conserva su conexión TLS+sesión entre operaciones.
     backends: Mutex<HashMap<AccountId, Arc<ImapBackend>>>,
     forget_tokens: Option<ForgetTokens>,
+    /// Mínimo de mensajes recientes por carpeta que sincroniza cada backend IMAP.
+    min_messages: usize,
     /// Backend falso del modo demo (solo depuración): sustituye al IMAP en `backend()`.
     #[cfg(debug_assertions)]
     backend_override: Option<Arc<dyn MailBackend>>,
@@ -59,9 +61,16 @@ impl Services {
             runtime,
             backends: Mutex::new(HashMap::new()),
             forget_tokens: None,
+            min_messages: correo_imap::DEFAULT_MIN_MESSAGES as usize,
             #[cfg(debug_assertions)]
             backend_override: None,
         })
+    }
+
+    /// Mínimo de mensajes por carpeta (`min_messages_per_folder` de la configuración).
+    pub fn with_min_messages(mut self, min: usize) -> Self {
+        self.min_messages = min;
+        self
     }
 
     /// Sustituye el backend de todas las cuentas (modo demo, solo depuración).
@@ -119,6 +128,7 @@ impl Services {
             Provider::Gmail => ImapBackend::gmail(account.id, email, tokens, store),
             _ => ImapBackend::outlook(account.id, email, tokens, store),
         }
+        .with_min_messages(self.min_messages)
     }
 
     pub fn sender(&self, account: &Account) -> Arc<dyn Sender> {

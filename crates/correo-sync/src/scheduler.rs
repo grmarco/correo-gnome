@@ -26,6 +26,9 @@ const IDLE_RETRY: Duration = Duration::from_secs(60 * 60);
 /// Barrido de carpetas secundarias.
 const SWEEP: Duration = Duration::from_secs(30 * 60);
 const SWEEP_LOW_POWER: Duration = Duration::from_secs(2 * 60 * 60);
+/// Con ahorro de energía, batería baja o red de pago, el refresco de no leídos (un
+/// `STATUS` por carpeta) se hace como mucho una vez cada tanto.
+const UNREAD_RESTRICTED_MIN: Duration = Duration::from_secs(30 * 60);
 /// Factor sobre los intervalos con ahorro de energía o batería baja.
 const LOW_POWER_FACTOR: u32 = 3;
 /// Backoff de reconexión: 5 s doblando hasta 10 min.
@@ -95,6 +98,9 @@ pub enum Event {
     },
     /// El servidor no anuncia IDLE.
     IdleUnsupported,
+    /// Terminó (bien, mal o cancelado) el refresco de no leídos pedido con
+    /// `Action::RefreshUnread`.
+    UnreadRefreshDone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +112,9 @@ pub enum Action {
     Sleep(Instant),
     /// Sin red: cancelar IDLE y no programar nada hasta volver a estar online.
     Pause,
+    /// Refrescar los contadores de no leídos de todas las carpetas de la cuenta (tarea
+    /// cancelable; el planificador garantiza que no hay dos a la vez).
+    RefreshUnread(AccountId),
     /// Hace falta volver a autorizar la cuenta; la aplicación debe avisar al usuario.
     AuthRequired(AccountId),
 }
@@ -163,6 +172,12 @@ pub struct SyncScheduler<C: Clock> {
     failures: u32,
     next_inbox_at: Option<Instant>,
     next_sweep_at: Option<Instant>,
+    /// Ya se sincronizó la bandeja correctamente alguna vez.
+    inbox_synced_once: bool,
+    /// Hay un refresco de no leídos en curso (o pendiente de lanzarse) en el runner.
+    unread_running: bool,
+    /// Último refresco pedido (para espaciarlos con ahorro de energía o red de pago).
+    last_unread_at: Option<Instant>,
     /// Carpetas secundarias abiertas alguna vez.
     subscribed: BTreeSet<MailboxId>,
     /// Última carpeta secundaria abierta.
@@ -187,6 +202,9 @@ impl<C: Clock> SyncScheduler<C> {
             failures: 0,
             next_inbox_at: None,
             next_sweep_at: None,
+            inbox_synced_once: false,
+            unread_running: false,
+            last_unread_at: None,
             subscribed: BTreeSet::new(),
             open: None,
         }
@@ -256,9 +274,13 @@ impl<C: Clock> SyncScheduler<C> {
             }
             Event::Resumed => {
                 if !self.paused {
+                    // El runner cancela el refresco en curso: la sesión no es fiable.
+                    self.unread_running = false;
                     self.resume(now, &mut out);
+                    self.request_unread_refresh(now, &mut out);
                 }
             }
+            Event::UnreadRefreshDone => self.unread_running = false,
             Event::IdleWake { lasted } => {
                 if !self.paused {
                     self.idle_running = false;
@@ -281,6 +303,7 @@ impl<C: Clock> SyncScheduler<C> {
                 if !self.paused {
                     self.auth_required = true;
                     self.idle_running = false;
+                    self.unread_running = false;
                     self.next_inbox_at = None;
                     self.next_sweep_at = None;
                     self.idle_retry_at = None;
@@ -330,6 +353,8 @@ impl<C: Clock> SyncScheduler<C> {
                 if !self.paused {
                     // Solo reinicia el backoff de sincronización; los fallos de IDLE son independientes.
                     self.failures = 0;
+                    let first_ok = !self.inbox_synced_once;
+                    self.inbox_synced_once = true;
                     if self.idle_unsupported {
                         if new_messages > 0 {
                             self.poll_step = 0;
@@ -339,6 +364,9 @@ impl<C: Clock> SyncScheduler<C> {
                         self.next_inbox_at = Some(now + self.poll_interval());
                     }
                     self.ensure_idle(&mut out);
+                    if first_ok {
+                        self.request_unread_refresh(now, &mut out);
+                    }
                 }
             }
             Event::IdleUnsupported => {
@@ -381,6 +409,7 @@ impl<C: Clock> SyncScheduler<C> {
         }
         self.paused = true;
         self.idle_running = false;
+        self.unread_running = false;
         self.next_inbox_at = None;
         self.next_sweep_at = None;
         out.push(Action::Pause);
@@ -438,6 +467,27 @@ impl<C: Clock> SyncScheduler<C> {
             out.push(Action::SyncMailbox(self.account, id));
         }
         self.next_sweep_at = Some(now + self.sweep_interval());
+        self.request_unread_refresh(now, out);
+    }
+
+    /// Política del refresco de no leídos: nunca sin red, en pausa o sin autorización; uno
+    /// a la vez; y con ahorro de energía, batería baja o red de pago, como mucho uno cada
+    /// 30 minutos. Una petición rechazada se descarta (la siguiente ocasión lo recuperará).
+    fn request_unread_refresh(&mut self, now: Instant, out: &mut Vec<Action>) {
+        if self.paused || self.auth_required || !self.online() || self.unread_running {
+            return;
+        }
+        let restricted = self.cond.metered || self.cond.low_power();
+        if restricted
+            && self
+                .last_unread_at
+                .is_some_and(|at| now.saturating_duration_since(at) < UNREAD_RESTRICTED_MIN)
+        {
+            return;
+        }
+        self.unread_running = true;
+        self.last_unread_at = Some(now);
+        out.push(Action::RefreshUnread(self.account));
     }
 
     /// Añade el `Sleep` con el próximo deadline (si no hay pausa).
@@ -483,10 +533,11 @@ mod tests {
         })
     }
 
+    /// Quita `Sleep` y `RefreshUnread` (esta última se prueba aparte).
     fn without_sleep(actions: Vec<Action>) -> Vec<Action> {
         actions
             .into_iter()
-            .filter(|a| !matches!(a, Action::Sleep(_)))
+            .filter(|a| !matches!(a, Action::Sleep(_) | Action::RefreshUnread(_)))
             .collect()
     }
 
@@ -653,7 +704,7 @@ mod tests {
         s.start();
         assert_eq!(
             s.handle(Event::SyncOk { new_messages: 3 }),
-            vec![Action::Sleep(t0 + 30 * MIN)]
+            vec![Action::RefreshUnread(ACCOUNT), Action::Sleep(t0 + 30 * MIN)]
         );
     }
 
@@ -874,6 +925,7 @@ mod tests {
             vec![
                 Action::SyncMailbox(ACCOUNT, SECONDARY),
                 Action::SyncMailbox(ACCOUNT, OTHER),
+                Action::RefreshUnread(ACCOUNT),
                 Action::Sleep(t + 30 * MIN),
             ]
         );
@@ -1132,5 +1184,114 @@ mod tests {
         assert!(s.handle(Event::ConditionsChanged(offline())).is_empty());
         assert_eq!(s.handle(Event::Reauthorized), vec![Action::Pause]);
         assert!(s.handle(Event::Tick).is_empty());
+    }
+
+    // ----- Refresco de no leídos --------------------------------------------------
+
+    fn refreshes(actions: &[Action]) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::RefreshUnread(_)))
+            .count()
+    }
+
+    #[test]
+    fn unread_refresh_waits_for_the_first_successful_inbox_sync() {
+        let (_clock, mut s) = setup();
+        // Ni el arranque ni un fallo de sincronización lo piden.
+        assert_eq!(refreshes(&s.start()), 0);
+        assert_eq!(refreshes(&s.handle(Event::SyncFailed)), 0);
+        // La primera sincronización correcta sí, y solo esa.
+        let ok = s.handle(Event::SyncOk { new_messages: 0 });
+        assert_eq!(refreshes(&ok), 1);
+        s.handle(Event::UnreadRefreshDone);
+        assert_eq!(
+            refreshes(&s.handle(Event::SyncOk { new_messages: 0 })),
+            0,
+            "las siguientes sincronizaciones no lo repiten"
+        );
+    }
+
+    #[test]
+    fn unread_refresh_runs_after_every_sweep_and_never_twice_at_once() {
+        let (clock, mut s) = setup();
+        s.start();
+        s.handle(Event::SyncOk { new_messages: 0 }); // lanza el primero
+        clock.advance(30 * MIN);
+        // Aún en curso: el barrido no lanza otro.
+        assert_eq!(refreshes(&s.handle(Event::Tick)), 0);
+        s.handle(Event::UnreadRefreshDone);
+        clock.advance(30 * MIN);
+        let tick = s.handle(Event::Tick);
+        assert_eq!(refreshes(&tick), 1);
+        // Va después de las sincronizaciones del barrido.
+        let last = tick
+            .iter()
+            .rposition(|a| matches!(a, Action::SyncMailbox(..)));
+        let refresh = tick
+            .iter()
+            .position(|a| matches!(a, Action::RefreshUnread(_)))
+            .unwrap();
+        assert!(last.is_none_or(|l| l < refresh));
+    }
+
+    #[test]
+    fn unread_refresh_runs_on_resume() {
+        let (clock, mut s) = setup();
+        s.start();
+        s.handle(Event::SyncOk { new_messages: 0 });
+        s.handle(Event::UnreadRefreshDone);
+        clock.advance(3 * 3600 * Duration::from_secs(1));
+        assert_eq!(refreshes(&s.handle(Event::Resumed)), 1);
+        // Un Resumed con el refresco aún "en curso" lo reinicia (el runner lo cancela).
+        assert_eq!(refreshes(&s.handle(Event::Resumed)), 1);
+    }
+
+    #[test]
+    fn unread_refresh_is_rate_limited_when_restricted() {
+        for restrict in [
+            (|c: &mut Conditions| c.power_saver = true) as fn(&mut Conditions),
+            |c| c.low_battery = true,
+            |c| c.metered = true,
+        ] {
+            let (clock, mut s) = setup();
+            s.handle(Event::ConditionsChanged(online_with(restrict)));
+            s.start();
+            assert_eq!(refreshes(&s.handle(Event::SyncOk { new_messages: 0 })), 1);
+            s.handle(Event::UnreadRefreshDone);
+            // Dentro de los 30 min, ni Resumed ni más barridos lo repiten.
+            clock.advance(10 * MIN);
+            assert_eq!(refreshes(&s.handle(Event::Resumed)), 0);
+            clock.advance(10 * MIN);
+            assert_eq!(refreshes(&s.handle(Event::Resumed)), 0);
+            // Pasados 30 min desde el último, vuelve a estar permitido.
+            clock.advance(11 * MIN);
+            assert_eq!(refreshes(&s.handle(Event::Resumed)), 1);
+        }
+    }
+
+    #[test]
+    fn unread_refresh_is_never_requested_when_paused_or_unauthorized() {
+        let (clock, mut s) = setup();
+        s.start();
+        s.handle(Event::ConditionsChanged(offline()));
+        assert_eq!(refreshes(&s.handle(Event::Resumed)), 0);
+        s.handle(Event::ConditionsChanged(Conditions::default()));
+        s.handle(Event::AuthFailed);
+        clock.advance(MIN);
+        assert_eq!(refreshes(&s.handle(Event::Resumed)), 0);
+        assert_eq!(refreshes(&s.handle(Event::SyncOk { new_messages: 0 })), 0);
+    }
+
+    #[test]
+    fn going_offline_frees_the_refresh_slot() {
+        let (_clock, mut s) = setup();
+        s.start();
+        assert_eq!(refreshes(&s.handle(Event::SyncOk { new_messages: 0 })), 1);
+        // Pause cancela la tarea sin avisar: al volver, puede lanzarse otra.
+        s.handle(Event::ConditionsChanged(offline()));
+        let back = s.handle(Event::ConditionsChanged(Conditions::default()));
+        assert_eq!(refreshes(&back), 0, "ConditionsChanged no lo pide");
+        assert_eq!(refreshes(&s.handle(Event::Resumed)), 1);
     }
 }

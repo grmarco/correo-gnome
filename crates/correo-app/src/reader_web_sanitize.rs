@@ -104,15 +104,17 @@ const GENERIC_ATTRS: &[&str] = &[
 const CID_PLACEHOLDER: &str = "data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48'%3E%3Crect width='48' height='48' fill='%23e5e5e5'/%3E%3C/svg%3E";
 
 /// Estilos base de la página. El `html` no lleva fondo para que el del `body` del correo
-/// (si lo declara) cubra todo el lienzo; el WebView es blanco por defecto.
-const BASE_CSS: &str = "body{margin:0;color:#1e1e1e;\
+/// (si lo declara) cubra todo el lienzo. Los colores por defecto (texto, enlaces, citas)
+/// son variables que define la hoja de usuario del modo oscuro (`reader_web_dark.rs`).
+const BASE_CSS: &str = "body{margin:0;color:var(--correo-fg,#1e1e1e);\
 font:15px/1.5 Cantarell,'Adwaita Sans',system-ui,sans-serif;overflow-wrap:anywhere;\
 -webkit-text-size-adjust:100%}\
 #correo-pad{padding:16px 20px 28px}\
 img{max-width:100%;height:auto}\
 table{max-width:100%}pre{white-space:pre-wrap}\
-blockquote{margin:.6em 0 .6em .4em;padding-left:.9em;border-left:3px solid #c0bfbc;color:#5e5c64}\
-a[href]{color:#1c71d8}";
+blockquote{margin:.6em 0 .6em .4em;padding-left:.9em;\
+border-left:3px solid var(--correo-quote-line,#c0bfbc);color:var(--correo-quote-fg,#5e5c64)}\
+a[href]{color:var(--correo-link,#1c71d8)}";
 
 /// Sanea el HTML del correo para mostrarlo en el WebView. Devuelve un fragmento (sin
 /// `<html>`/`<head>`/`<body>`); `build_document` lo envuelve.
@@ -133,7 +135,7 @@ pub fn sanitize_for_web(html: &str) -> String {
         .strip_comments(true)
         .attribute_filter(filter_attribute);
     let clean = builder.clean(html).to_string();
-    scrub_style_elements(&clean)
+    map_style_elements(&clean, scrub_css)
 }
 
 fn tag_attributes() -> HashMap<&'static str, HashSet<&'static str>> {
@@ -293,8 +295,8 @@ fn replace_functions(css: &str) -> String {
     }
 }
 
-/// Aplica `scrub_css` al contenido de cada `<style>` del HTML ya saneado.
-fn scrub_style_elements(html: &str) -> String {
+/// Aplica `f` al contenido de cada `<style>` del HTML ya saneado.
+pub fn map_style_elements(html: &str, f: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     loop {
@@ -311,11 +313,11 @@ fn scrub_style_elements(html: &str) -> String {
         out.push_str(&rest[..body_start]);
         match lower[body_start..].find("</style") {
             Some(close) => {
-                out.push_str(&scrub_css(&rest[body_start..body_start + close]));
+                out.push_str(&f(&rest[body_start..body_start + close]));
                 rest = &rest[body_start + close..];
             }
             None => {
-                out.push_str(&scrub_css(&rest[body_start..]));
+                out.push_str(&f(&rest[body_start..]));
                 out.push_str("</style>");
                 return out;
             }
@@ -364,7 +366,7 @@ pub fn body_style(html: &str) -> String {
 }
 
 /// Valor de `name="..."`/`name='...'` en una etiqueta (`tag_lower` es `tag` en minúsculas).
-fn attr_value(tag: &str, tag_lower: &str, name: &str) -> Option<String> {
+pub(super) fn attr_value(tag: &str, tag_lower: &str, name: &str) -> Option<String> {
     let mut from = 0;
     while let Some(i) = tag_lower[from..].find(name) {
         let at = from + i;
@@ -429,17 +431,21 @@ pub fn table_width_hint(html: &str) -> u32 {
 }
 
 /// Documento completo que se carga en el WebView. `token` va en el `<title>` y permite
-/// distinguir la carga de este documento de otras (p. ej. `about:blank`).
+/// distinguir la carga de este documento de otras (p. ej. `about:blank`). `dark` indica si el
+/// correo se pinta en oscuro: fija lo que valen sus consultas `prefers-color-scheme`.
 pub fn build_document(
     clean_fragment: &str,
     body_style: &str,
     remote_images: bool,
     token: u64,
+    dark: bool,
 ) -> String {
+    let clean_fragment = &map_style_elements(clean_fragment, |css| {
+        super::reader_web_dark::rewrite_scheme_queries(css, dark)
+    });
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
-         <meta name=\"color-scheme\" content=\"light\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>correo-{token}</title><style>{BASE_CSS}</style></head>\
          <body style=\"{body_style}\"><div id=\"correo-pad\">{clean_fragment}</div></body></html>",
@@ -610,7 +616,7 @@ mod tests {
 
     #[test]
     fn document_has_strict_csp_and_token() {
-        let doc = build_document("<p>hola</p>", "color:red;", false, 7);
+        let doc = build_document("<p>hola</p>", "color:red;", false, 7, false);
         assert!(doc.contains("default-src 'none'"));
         assert!(doc.contains("script-src 'none'"));
         assert!(doc.contains("frame-src 'none'"));
@@ -621,9 +627,19 @@ mod tests {
         assert!(doc.contains(
             "<body style=\"color:red;\"><div id=\"correo-pad\"><p>hola</p></div></body>"
         ));
-        assert!(build_document("", "", true, 1).contains("img-src data: https:;"));
+        assert!(build_document("", "", true, 1, false).contains("img-src data: https:;"));
         // Los cuerpos con `</style>` o scripts quedan ya saneados antes de envolverse.
         assert!(!csp(false).contains("https:"));
+    }
+
+    #[test]
+    fn document_pins_scheme_queries_to_the_look() {
+        let clean = "<style>@media (prefers-color-scheme: dark){p{color:#fff}}</style><p>x</p>";
+        let dark = build_document(clean, "", false, 1, true);
+        assert!(dark.contains("@media (min-width: 0px){p{color:#fff}}"));
+        let light = build_document(clean, "", false, 1, false);
+        assert!(light.contains("@media (min-width: 99999px){p{color:#fff}}"));
+        assert!(!light.contains("prefers-color-scheme: dark"));
     }
 
     #[test]

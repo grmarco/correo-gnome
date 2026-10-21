@@ -10,6 +10,7 @@ use gtk::glib;
 
 use super::reader_html::{count_images, html_to_segments, Segment};
 use super::reader_web::{HtmlView, WebDoc, WebEvent};
+use super::reader_web_dark::{choose_look, Look};
 use super::reader_web_sanitize::{
     body_style, needs_rich_rendering, sanitize_for_web, table_width_hint,
 };
@@ -22,6 +23,8 @@ pub const WEB_IDLE_SECS: u32 = 30;
 const WEB_LIMIT: usize = 2 * 1024 * 1024;
 pub const LABEL_FULL: &str = "Vista completa";
 pub const LABEL_LIGHT: &str = "Vista ligera";
+pub const LABEL_ORIGINAL_COLORS: &str = "Colores originales";
+pub const LABEL_ADAPT_DARK: &str = "Adaptar al tema oscuro";
 const BANNER_BUTTON: &str = "Cargar imágenes remotas";
 const FALLBACK_NOTICE: &str = "La vista completa no está disponible; se muestra la vista ligera";
 const TRUNCATED_WEB: &str = "Mensaje truncado: no se muestra el contenido completo";
@@ -54,10 +57,12 @@ pub fn show(inner: &Rc<Inner>, html: &str) -> Result<(), String> {
 
     let (html, truncated) = cut(html);
     let images = count_images(html);
+    let look = look_for(inner, html);
     let doc = WebDoc {
         clean: sanitize_for_web(html),
         body_style: body_style(html),
         width_hint: table_width_hint(html),
+        look,
     };
     // Enlaces para la comprobación de «texto que aparenta otro dominio».
     let (segments_src, _) = limit_body(html);
@@ -79,6 +84,8 @@ pub fn show(inner: &Rc<Inner>, html: &str) -> Result<(), String> {
     }
 
     inner.web_active.set(true);
+    inner.web_look.set(look);
+    sync_dark_toggle(inner);
     inner.toggle.set_label(LABEL_LIGHT);
     inner.toggle.set_visible(true);
     // Esqueleto mientras carga; el fundido llega cuando el documento está listo.
@@ -92,6 +99,70 @@ pub fn show(inner: &Rc<Inner>, html: &str) -> Result<(), String> {
     };
     inner.web_token.set(token);
     Ok(())
+}
+
+/// ¿El tema de la aplicación es oscuro?
+fn dark_theme() -> bool {
+    adw::StyleManager::default().is_dark()
+}
+
+/// Aspecto de este HTML con el tema actual, la configuración y la elección del menú.
+fn look_for(inner: &Inner, html: &str) -> Look {
+    choose_look(inner.dark_mode, inner.dark_pref.get(), dark_theme(), html)
+}
+
+fn current_html(inner: &Inner) -> Option<String> {
+    inner
+        .current
+        .borrow()
+        .body
+        .as_ref()
+        .and_then(|b| b.html.clone())
+}
+
+/// Muestra u oculta «Colores originales» / «Adaptar al tema oscuro» en el menú «Más»:
+/// solo en tema oscuro y con el mensaje en vista completa.
+fn sync_dark_toggle(inner: &Inner) {
+    let visible = inner.web_active.get() && dark_theme();
+    inner.dark_toggle.set_visible(visible);
+    inner
+        .dark_toggle
+        .set_label(if inner.web_look.get().is_dark() {
+            LABEL_ORIGINAL_COLORS
+        } else {
+            LABEL_ADAPT_DARK
+        });
+}
+
+/// Alterna «Colores originales» ↔ «Adaptar al tema oscuro» sobre el mensaje mostrado, sin
+/// volver a procesarlo, y lo recuerda el resto de la sesión.
+pub fn toggle_dark(inner: &Rc<Inner>) {
+    inner.dark_pref.set(Some(!inner.web_look.get().is_dark()));
+    restyle(inner);
+}
+
+/// El tema del sistema ha cambiado: se reaplica el aspecto sin recargar el mensaje.
+pub fn theme_changed(inner: &Rc<Inner>) {
+    restyle(inner);
+}
+
+/// Recalcula el aspecto del mensaje mostrado y lo aplica en caliente.
+fn restyle(inner: &Rc<Inner>) {
+    if inner.web_active.get() {
+        if let Some(html) = current_html(inner) {
+            let look = look_for(inner, &html);
+            inner.web_look.set(look);
+            let token = inner.web.borrow().as_ref().and_then(|v| v.set_look(look));
+            if let Some(token) = token {
+                // Recarga del documento ya saneado (el correo usa `prefers-color-scheme`).
+                inner.web_token.set(token);
+                inner
+                    .stack
+                    .set_visible_child_full("loading", gtk::StackTransitionType::None);
+            }
+        }
+    }
+    sync_dark_toggle(inner);
 }
 
 /// Recorta a `WEB_LIMIT` bytes en un límite de carácter.
@@ -134,6 +205,7 @@ pub fn toggle(inner: &Rc<Inner>) {
 /// programa la destrucción del WebView.
 pub fn release(inner: &Rc<Inner>) {
     inner.web_active.set(false);
+    sync_dark_toggle(inner);
     let Some(()) = inner.web.borrow().as_ref().map(HtmlView::blank) else {
         return;
     };
@@ -163,6 +235,7 @@ fn cancel_idle(inner: &Inner) {
 pub fn destroy(inner: &Inner) {
     cancel_idle(inner);
     inner.web_active.set(false);
+    sync_dark_toggle(inner);
     let Some(view) = inner.web.borrow_mut().take() else {
         return;
     };

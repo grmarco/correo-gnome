@@ -7,13 +7,15 @@
 //! - cualquier otro: baja a ~4 MB/s (codificados) y termina bien.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use correo_core::{
-    Attachment, CancelToken, Error, MailBackend, Mailbox, MessageBody, Progress, ProgressFn, Result,
+    Address, Attachment, CancelToken, Error, Flags, MailBackend, Mailbox, MessageBody,
+    MessageHeader, OlderPage, Progress, ProgressFn, Result,
 };
+use correo_store::Store;
 
 /// Adjuntos de demostración (nombre, tipo, tamaño decodificado) de los mensajes que los llevan.
 pub fn demo_attachments() -> Vec<Attachment> {
@@ -39,11 +41,80 @@ pub fn demo_attachments() -> Vec<Attachment> {
 const SPEED: u64 = 4_000_000;
 const STEP: Duration = Duration::from_millis(50);
 
-pub struct DemoBackend;
+/// Carpetas de archivo de la demo con historial simulado en el «servidor»:
+/// (sufijo de la ruta, UID más alto, comportamiento de «Cargar mensajes anteriores»).
+pub const DEMO_ARCHIVES: [(&str, u32, &str); 4] = [
+    ("2014", 500, "cuatro páginas y se agota"),
+    ("2015", 130, "una página y se agota"),
+    ("2016", 300, "no termina nunca (cargando)"),
+    ("2019", 300, "falla"),
+];
+
+/// UID más alto del historial simulado de una carpeta `Archives/<año>`.
+pub fn demo_archive_top(path: &str) -> Option<u32> {
+    let year = path.rsplit(['/', '.']).next()?;
+    DEMO_ARCHIVES
+        .iter()
+        .find(|(y, _, _)| *y == year)
+        .map(|(_, top, _)| *top)
+}
+
+/// Cabeceras sintéticas de una carpeta de archivo: un mensaje por día desde el 1 de enero
+/// del año de la carpeta, con el UID como número de orden.
+pub fn demo_archive_headers(
+    mailbox_id: correo_core::MailboxId,
+    path: &str,
+    uids: std::ops::RangeInclusive<u32>,
+) -> Vec<MessageHeader> {
+    let year: i64 = path
+        .rsplit(['/', '.'])
+        .next()
+        .and_then(|y| y.parse().ok())
+        .unwrap_or(2014);
+    let base = (year - 1970) * 365 * 86_400 + ((year - 1969) / 4) * 86_400;
+    let people = [
+        ("Ana Ruiz", "ana@ejemplo.com"),
+        ("Luis Gómez", "luis@ejemplo.org"),
+        ("Marta Solé", "marta@ejemplo.com"),
+    ];
+    uids.map(|uid| {
+        let (name, email) = people[uid as usize % people.len()];
+        MessageHeader {
+            id: 0,
+            mailbox_id,
+            uid,
+            message_id: Some(format!("<archivo-{year}-{uid}@ejemplo.com>")),
+            in_reply_to: None,
+            references: Vec::new(),
+            subject: format!("Archivo {year}: mensaje {uid}"),
+            from: vec![Address {
+                name: Some(name.into()),
+                email: email.into(),
+            }],
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: base + i64::from(uid) * 86_400,
+            flags: Flags {
+                seen: true,
+                ..Flags::default()
+            },
+            has_attachments: uid % 7 == 0,
+            snippet: Some("Mensaje antiguo del archivo de demostración.".into()),
+            labels: Vec::new(),
+        }
+    })
+    .collect()
+}
+
+#[derive(Default)]
+pub struct DemoBackend {
+    /// Caché de la demo: `fetch_older` le añade las cabeceras «traídas del servidor».
+    store: Option<Arc<Mutex<Store>>>,
+}
 
 impl DemoBackend {
-    pub fn shared() -> Arc<dyn MailBackend> {
-        Arc::new(DemoBackend)
+    pub fn shared(store: Arc<Mutex<Store>>) -> Arc<dyn MailBackend> {
+        Arc::new(DemoBackend { store: Some(store) })
     }
 }
 
@@ -54,6 +125,43 @@ impl MailBackend for DemoBackend {
     }
     async fn sync_mailbox(&self, _: &Mailbox, _: u32) -> Result<usize> {
         Ok(0)
+    }
+    /// Historial simulado: `Archives/2014` tiene 500 mensajes en el servidor, 2015 solo 130,
+    /// 2016 se queda cargando para siempre y 2019 falla (ver `DEMO_ARCHIVES`).
+    async fn fetch_older(&self, mailbox: &Mailbox, count: usize) -> Result<OlderPage> {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let year = mailbox.path.rsplit(['/', '.']).next().unwrap_or_default();
+        match year {
+            "2016" => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            "2019" => {
+                return Err(Error::Network("tiempo de espera agotado (60 s)".into()));
+            }
+            _ => {}
+        }
+        let (Some(store), Some(top)) = (&self.store, demo_archive_top(&mailbox.path)) else {
+            return Ok(OlderPage {
+                fetched: 0,
+                exhausted: true,
+            });
+        };
+        let store = store.lock().map_err(|_| Error::Store("bloqueado".into()))?;
+        let min = store.min_uid(mailbox.id)?.unwrap_or(top + 1);
+        if min <= 1 {
+            return Ok(OlderPage {
+                fetched: 0,
+                exhausted: true,
+            });
+        }
+        let hi = min - 1;
+        let lo = hi.saturating_sub(count as u32 - 1).max(1);
+        let headers = demo_archive_headers(mailbox.id, &mailbox.path, lo..=hi);
+        store.upsert_headers(mailbox.id, &headers)?;
+        Ok(OlderPage {
+            fetched: headers.len(),
+            exhausted: lo <= 1,
+        })
     }
     async fn fetch_body(&self, _: &Mailbox, _: u32) -> Result<MessageBody> {
         Err(Error::Network("modo demostración: sin red".into()))
@@ -163,7 +271,7 @@ mod tests {
             unread: 0,
             delimiter: None,
         };
-        let r = DemoBackend
+        let r = DemoBackend::default()
             .fetch_attachment_to(&mailbox, 1, 1, &dest, progress, cancel)
             .await;
         assert!(matches!(r, Err(Error::Cancelled)));

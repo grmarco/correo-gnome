@@ -15,6 +15,7 @@ use std::rc::Rc;
 use gtk::{gio, glib};
 use webkit6::prelude::*;
 
+use super::reader_web_dark::{card_color, user_stylesheet, Look};
 use super::reader_web_policy::{
     content_filter_json, navigation_decision, response_allowed, NavDecision,
 };
@@ -28,6 +29,8 @@ pub struct WebDoc {
     pub body_style: String,
     /// Ancho fijo de tabla más grande (px), 0 si no hay: para encoger en ventanas estrechas.
     pub width_hint: u32,
+    /// Aspecto (claro, oscuro nativo, oscurización automática…).
+    pub look: Look,
 }
 
 /// Directorio (en tmpfs de `$XDG_RUNTIME_DIR`) donde WebKit compila los filtros de contenido.
@@ -61,13 +64,17 @@ struct Shared {
     installed: Cell<Option<bool>>,
     /// Ancho actual de la tarjeta (px).
     width: Cell<i32>,
+    /// Aspecto aplicado ahora mismo y si el documento cargado admite imágenes https.
+    look: Cell<Look>,
+    remote: Cell<bool>,
     notified: Cell<u64>,
     /// La vista se está cerrando: el fin del proceso web ya no es un fallo.
     closing: Cell<bool>,
 }
 
 pub struct HtmlView {
-    /// Tarjeta blanca con esquinas redondeadas que contiene el WebView.
+    /// Tarjeta (blanca o, en tema oscuro, oscura) con esquinas redondeadas que contiene el
+    /// WebView.
     card: gtk::Box,
     view: webkit6::WebView,
     ucm: webkit6::UserContentManager,
@@ -98,7 +105,6 @@ impl HtmlView {
             .network_session(&session)
             .user_content_manager(&ucm)
             .build();
-        view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
         view.set_hexpand(true);
         view.set_vexpand(true);
 
@@ -109,8 +115,11 @@ impl HtmlView {
                 clean: String::new(),
                 body_style: String::new(),
                 width_hint: 0,
+                look: Look::Light,
             }),
             width: Cell::new(0),
+            look: Cell::new(Look::Light),
+            remote: Cell::new(false),
             hover: RefCell::new(None),
             finished: Cell::new(0),
             installed: Cell::new(None),
@@ -197,7 +206,7 @@ impl HtmlView {
         card.append(&sensor);
         card.append(&view);
 
-        Ok(Self {
+        let this = Self {
             card,
             view,
             ucm,
@@ -205,7 +214,55 @@ impl HtmlView {
             _session: session,
             filters: Rc::new(RefCell::new(HashMap::new())),
             shared,
-        })
+        };
+        this.apply_chrome(Look::Light);
+        Ok(this)
+    }
+
+    /// Color de fondo del WebView (visible antes de que cargue el contenido: sin destello
+    /// blanco en tema oscuro), hoja de estilos de usuario del aspecto y clase de la tarjeta.
+    /// No toca el documento: se puede cambiar en caliente.
+    fn apply_chrome(&self, look: Look) {
+        self.shared.look.set(look);
+        let (r, g, b) = card_color(look);
+        self.view.set_background_color(&gtk::gdk::RGBA::new(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        ));
+        self.ucm.remove_all_style_sheets();
+        self.ucm.add_style_sheet(&webkit6::UserStyleSheet::new(
+            &user_stylesheet(look),
+            webkit6::UserContentInjectedFrames::AllFrames,
+            webkit6::UserStyleLevel::User,
+            &[],
+            &[],
+        ));
+        if look.is_dark() {
+            self.card.add_css_class("correo-mail-card-dark");
+        } else {
+            self.card.remove_css_class("correo-mail-card-dark");
+        }
+    }
+
+    /// Cambia el aspecto del documento actual. Normalmente es instantáneo; solo si el correo
+    /// usa `prefers-color-scheme` y cambia lo que valen sus consultas hay que recargar el
+    /// documento (ya saneado, en memoria): entonces devuelve el token de la nueva carga.
+    pub fn set_look(&self, look: Look) -> Option<u64> {
+        let old = self.shared.look.get();
+        if old == look {
+            return None;
+        }
+        self.apply_chrome(look);
+        let reload = {
+            let mut doc = self.shared.doc.borrow_mut();
+            doc.look = look;
+            !doc.clean.is_empty()
+                && old.dark_media() != look.dark_media()
+                && doc.clean.contains("prefers-color-scheme")
+        };
+        reload.then(|| self.reload_with(self.shared.remote.get()))
     }
 
     pub fn widget(&self) -> &gtk::Widget {
@@ -217,6 +274,10 @@ impl HtmlView {
     pub fn show(&self, doc: WebDoc, remote_images: bool) -> u64 {
         let token = self.shared.token.get() + 1;
         self.shared.token.set(token);
+        self.shared.remote.set(remote_images);
+        if self.shared.look.get() != doc.look {
+            self.apply_chrome(doc.look);
+        }
         *self.shared.doc.borrow_mut() = doc;
         fit_zoom(&self.view, &self.shared);
         if let Some(filter) = self.filters.borrow().get(&remote_images).cloned() {
@@ -236,15 +297,20 @@ impl HtmlView {
 
     /// Recarga el mensaje actual permitiendo imágenes https.
     pub fn reload_with_images(&self) -> u64 {
+        self.reload_with(true)
+    }
+
+    fn reload_with(&self, remote_images: bool) -> u64 {
         let doc = {
             let d = self.shared.doc.borrow();
             WebDoc {
                 clean: d.clean.clone(),
                 body_style: d.body_style.clone(),
                 width_hint: d.width_hint,
+                look: d.look,
             }
         };
-        self.show(doc, true)
+        self.show(doc, remote_images)
     }
 
     /// Descarta el documento actual (libera su memoria) sin destruir el WebView.
@@ -337,7 +403,13 @@ fn apply(
     }
     let doc = {
         let d = shared.doc.borrow();
-        build_document(&d.clean, &d.body_style, remote_images, token)
+        build_document(
+            &d.clean,
+            &d.body_style,
+            remote_images,
+            token,
+            d.look.dark_media(),
+        )
     };
     view.load_html(&doc, Some("about:blank"));
 }

@@ -16,7 +16,7 @@ use async_imap::types::{Fetch, Name};
 use async_trait::async_trait;
 use correo_core::{
     AccountId, Attachment, BATCH_MAX_UIDS, BatchReport, CancelToken, Error, Flags, Mailbox,
-    MailboxId, MailboxRole, MessageBody, MessageHeader, MessageId, ProgressFn, Result,
+    MailboxId, MailboxRole, MessageBody, MessageHeader, MessageId, OlderPage, ProgressFn, Result,
     TokenProvider,
 };
 use correo_store::Store;
@@ -25,11 +25,13 @@ use tokio::sync::{MappedMutexGuard, Mutex as AsyncMutex, MutexGuard};
 
 use crate::attach::{self, CHUNK_SIZE, ChunkSource};
 use crate::conn::{self, Conn, OP_TIMEOUT, imap, is_network, map_imap_error, timeout_error};
+use crate::paging::{UidSearch, newest_uids, plan_older};
 use crate::parse::{
-    self, BATCH_SIZE, FetchMeta, attachment_contents, attribute_strings, flags_from, imap_date,
-    mailbox_role, parse_body, plan_sync, same_flags, today_days, uid_set, uid_sets,
-    uid_validity_changed,
+    self, BATCH_SIZE, DEFAULT_MIN_MESSAGES, FetchMeta, attachment_contents, attribute_strings,
+    compare_floor, flags_from, imap_date, mailbox_role, parse_body, plan_range_sync, same_flags,
+    synced_floor, today_days, uid_set, uid_sets, uid_validity_changed,
 };
+use crate::unread;
 
 pub const GMAIL_HOST: &str = "imap.gmail.com";
 pub const OUTLOOK_HOST: &str = "outlook.office365.com";
@@ -74,6 +76,8 @@ pub struct ImapBackend {
     tokens: Arc<dyn TokenProvider>,
     store: Arc<Mutex<Store>>,
     conn: AsyncMutex<Option<Conn>>,
+    /// Mínimo de mensajes recientes (por UID) que debe tener la caché de cada carpeta.
+    min_messages: usize,
 }
 
 impl ImapBackend {
@@ -93,7 +97,15 @@ impl ImapBackend {
             tokens,
             store,
             conn: AsyncMutex::new(None),
+            min_messages: DEFAULT_MIN_MESSAGES as usize,
         }
+    }
+
+    /// Mínimo de mensajes más recientes que `sync_mailbox` garantiza en la caché de cada
+    /// carpeta, además de la ventana de días (ver `effective_min_messages`).
+    pub fn with_min_messages(mut self, min: usize) -> Self {
+        self.min_messages = min.max(1);
+        self
     }
 
     /// Preset para Gmail (imap.gmail.com:993).
@@ -316,6 +328,86 @@ impl ChunkSource for ImapChunkSource<'_> {
     }
 }
 
+/// Tope de mensajes por página de «anteriores».
+const MAX_OLDER_PAGE: usize = 500;
+
+/// `UID SEARCH UID lo:hi` sobre la sesión del backend.
+struct ConnSearch<'a> {
+    conn: &'a mut Conn,
+}
+
+#[async_trait]
+impl UidSearch for ConnSearch<'_> {
+    async fn search(&mut self, lo: u32, hi: u32) -> Result<BTreeSet<u32>> {
+        let found = imap(
+            OP_TIMEOUT,
+            self.conn.session.uid_search(format!("UID {lo}:{hi}")),
+        )
+        .await?;
+        Ok(found.into_iter().collect())
+    }
+}
+
+/// UIDNEXT de la carpeta seleccionada; si el servidor no lo anunció, el UID máximo + 1
+/// (`UID SEARCH UID *`) o 1 si está vacía.
+async fn server_uid_next(conn: &mut Conn, selected: &async_imap::types::Mailbox) -> Result<u32> {
+    if let Some(next) = selected.uid_next {
+        return Ok(next);
+    }
+    let max = imap(OP_TIMEOUT, conn.session.uid_search("UID *")).await?;
+    Ok(max.into_iter().max().map_or(1, |m| m.saturating_add(1)))
+}
+
+/// No leídos según `STATUS`. `Ok(None)` si el servidor lo rechaza o no informa; un error de
+/// red se propaga (la sesión no es fiable).
+async fn unseen_count(conn: &mut Conn, path: &str, limit: Duration) -> Result<Option<u32>> {
+    match imap(limit, conn.session.status(path, "(UNSEEN)")).await {
+        Ok(status) => Ok(status.unseen),
+        Err(e) if is_network(&e) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `UnseenSource` real: toma el mutex de la sesión solo durante cada `STATUS`.
+struct BackendUnseen<'a>(&'a ImapBackend);
+
+/// Si el futuro se cancela en mitad de un `STATUS`, la respuesta quedaría sin leer en la
+/// sesión: se descarta para que la siguiente operación abra una limpia.
+struct DiscardOnCancel<'g, 'a> {
+    slot: &'g mut MutexGuard<'a, Option<Conn>>,
+    finished: bool,
+}
+
+impl Drop for DiscardOnCancel<'_, '_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            **self.slot = None;
+        }
+    }
+}
+
+#[async_trait]
+impl unread::UnseenSource for BackendUnseen<'_> {
+    async fn unseen(&mut self, path: &str, limit: Duration) -> Result<Option<u32>> {
+        let mut slot = self.0.conn.lock().await;
+        if slot.is_none() {
+            *slot = Some(self.0.connect().await?);
+        }
+        let mut bomb = DiscardOnCancel {
+            slot: &mut slot,
+            finished: false,
+        };
+        let conn = bomb.slot.as_mut().expect("conexión inicializada arriba");
+        let result = unseen_count(conn, path, limit).await;
+        bomb.finished = true;
+        result
+    }
+
+    async fn discard(&mut self) {
+        self.0.reset().await;
+    }
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,9 +421,28 @@ impl correo_core::MailBackend for ImapBackend {
         self.retry(|| self.list_mailboxes_once()).await
     }
 
+    async fn refresh_unread(&self) -> Result<Vec<MailboxId>> {
+        self.refresh_unread_once().await
+    }
+
     async fn sync_mailbox(&self, mailbox: &Mailbox, days: u32) -> Result<usize> {
         let days = effective_sync_days(days);
         self.retry(|| self.sync_mailbox_once(mailbox, days)).await
+    }
+
+    async fn fetch_older(&self, mailbox: &Mailbox, count: usize) -> Result<OlderPage> {
+        let count = count.clamp(1, MAX_OLDER_PAGE);
+        // Con el UID 1 en caché no hay nada más antiguo: sin red.
+        if self
+            .with_store(|s| s.min_uid(mailbox.id))?
+            .is_some_and(|m| m <= 1)
+        {
+            return Ok(OlderPage {
+                fetched: 0,
+                exhausted: true,
+            });
+        }
+        self.retry(|| self.fetch_older_once(mailbox, count)).await
     }
 
     async fn fetch_body(&self, mailbox: &Mailbox, uid: u32) -> Result<MessageBody> {
@@ -528,11 +639,52 @@ impl ImapBackend {
         Ok(out)
     }
 
+    /// Recorre las carpetas conocidas (desde el almacén, sin otro LIST) pidiendo
+    /// `STATUS (UNSEEN)` de una en una; ver `unread`. Los cambios se guardan de una vez al
+    /// final (sin esperas por medio), conservando el resto de campos de cada carpeta.
+    async fn refresh_unread_once(&self) -> Result<Vec<MailboxId>> {
+        let known = self.with_store(|s| s.list_mailboxes(self.account_id))?;
+        let boxes = unread::priority_order(known);
+        let outcome = unread::collect_unread(
+            &mut BackendUnseen(self),
+            boxes,
+            unread::BUDGET,
+            unread::PER_STATUS,
+        )
+        .await;
+        let changed = self.with_store(|s| {
+            let mut ids = Vec::new();
+            for found in &outcome.changed {
+                // Se relee: una sincronización concurrente pudo cambiar uid_validity.
+                let Ok(mut current) = s.get_mailbox(found.id) else {
+                    continue;
+                };
+                if current.unread != found.unread {
+                    current.unread = found.unread;
+                    s.upsert_mailbox(&current)?;
+                    ids.push(found.id);
+                }
+            }
+            Ok(ids)
+        })?;
+        match outcome.error {
+            Some(e) if changed.is_empty() => Err(e),
+            _ => Ok(changed),
+        }
+    }
+
+    /// Sincroniza la carpeta: ventana de días O mínimo de `min_messages` mensajes.
+    ///
+    /// Rango sincronizado `uid_min..`: el más bajo entre la ventana (`SINCE`) y los N UID
+    /// más altos (búsquedas por tramos, nunca `SEARCH ALL`). Se piden cabeceras de lo que
+    /// falte desde `uid_min` y se detectan borrados comparando la caché con
+    /// `UID SEARCH UID lo:*`, donde `lo` baja hasta el UID más antiguo en caché (páginas
+    /// cargadas con `fetch_older`). Coste: una búsqueda SINCE, 0..n tramos de UID si la
+    /// ventana trae menos de N mensajes y una búsqueda `lo:*` con tantos UID como mensajes
+    /// cacheados o recientes (unos pocos KB incluso con miles).
     async fn sync_mailbox_once(&self, mailbox: &Mailbox, days: u32) -> Result<usize> {
         let today = today_days(now_unix());
-        let cutoff_day = today - i64::from(days);
-        let cutoff_ts = cutoff_day * 86_400;
-        let since = imap_date(cutoff_day);
+        let since = imap_date(today - i64::from(days));
 
         let mut guard = self.conn().await?;
         let conn = &mut *guard;
@@ -550,17 +702,26 @@ impl ImapBackend {
         }
         let mut state = stored.clone();
         state.uid_validity = selected.uid_validity.or(stored.uid_validity);
-        state.unread = selected.unseen.unwrap_or(0);
         self.with_store(|s| s.upsert_mailbox(&state))?;
 
-        // Servidor: UIDs dentro de la ventana.
-        let server: BTreeSet<u32> = imap(
+        let uid_next = server_uid_next(conn, &selected).await?;
+
+        // Servidor: ventana de días y, si trae pocos, los N más recientes por UID.
+        let window: BTreeSet<u32> = imap(
             OP_TIMEOUT,
             conn.session.uid_search(format!("SINCE {since}")),
         )
         .await?
         .into_iter()
         .collect();
+        let newest = if window.len() >= self.min_messages {
+            Vec::new()
+        } else {
+            newest_uids(&mut ConnSearch { conn }, uid_next, None, self.min_messages)
+                .await?
+                .uids
+        };
+        let uid_min = synced_floor(&window, &newest);
 
         // Caché: estado actual de la carpeta.
         let cached: Vec<MessageHeader> = if wiped {
@@ -568,41 +729,63 @@ impl ImapBackend {
         } else {
             self.cached_headers(mailbox.id)?
         };
-        let cached_all: BTreeSet<u32> = cached.iter().map(|h| h.uid).collect();
-        let cached_in_window: BTreeSet<u32> = cached
-            .iter()
-            .filter(|h| h.date >= cutoff_ts)
-            .map(|h| h.uid)
-            .collect();
+        let cached_set: BTreeSet<u32> = cached.iter().map(|h| h.uid).collect();
         let cached_flags: BTreeMap<u32, Flags> =
             cached.iter().map(|h| (h.uid, h.flags.clone())).collect();
 
-        let plan = plan_sync(&server, &cached_all, &cached_in_window);
         let mut changed = 0usize;
+        if let Some(lo) = compare_floor(uid_min, cached_set.first().copied()) {
+            let server: BTreeSet<u32> =
+                imap(OP_TIMEOUT, conn.session.uid_search(format!("UID {lo}:*")))
+                    .await?
+                    .into_iter()
+                    .collect();
+            let plan = plan_range_sync(&server, &cached_set, uid_min.unwrap_or(u32::MAX), lo);
 
-        // Borrados en servidor dentro de la ventana.
-        for uid in &plan.removed_uids {
-            self.with_store(|s| s.delete_uid(mailbox.id, *uid))?;
-        }
+            // Borrados en el servidor (dentro o fuera de la ventana de días).
+            for uid in &plan.removed_uids {
+                self.with_store(|s| s.delete_uid(mailbox.id, *uid))?;
+            }
 
-        // Flags de los ya conocidos (límite por lote).
-        for chunk in plan.known_uids.chunks(BATCH_SIZE) {
-            let stream = imap(OP_TIMEOUT, conn.session.uid_fetch(uid_set(chunk), "FLAGS")).await?;
-            let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
-            for f in &fetches {
-                let Some(uid) = f.uid else { continue };
-                let Some(old) = cached_flags.get(&uid) else {
-                    continue;
-                };
-                let new = flags_from(f.flags());
-                if !same_flags(old, &new) {
-                    self.cache_flags(mailbox.id, uid, &new)?;
-                    changed += 1;
+            // Flags de los ya conocidos del rango sincronizado (límite por lote).
+            for chunk in plan.known_uids.chunks(BATCH_SIZE) {
+                let stream =
+                    imap(OP_TIMEOUT, conn.session.uid_fetch(uid_set(chunk), "FLAGS")).await?;
+                let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
+                for f in &fetches {
+                    let Some(uid) = f.uid else { continue };
+                    let Some(old) = cached_flags.get(&uid) else {
+                        continue;
+                    };
+                    let new = flags_from(f.flags());
+                    if !same_flags(old, &new) {
+                        self.cache_flags(mailbox.id, uid, &new)?;
+                        changed += 1;
+                    }
                 }
             }
+
+            changed += self.fetch_headers(conn, mailbox, &plan.new_uids).await?;
         }
 
-        // Cabeceras nuevas.
+        // No leídos reales de la carpeta (STATUS; si falla se conserva el contador anterior).
+        if let Some(unseen) = unseen_count(conn, &mailbox.path, OP_TIMEOUT).await?
+            && unseen != state.unread
+        {
+            state.unread = unseen;
+            self.with_store(|s| s.upsert_mailbox(&state))?;
+        }
+
+        Ok(changed)
+    }
+
+    /// Trae las cabeceras de `uids` (en lotes) y las guarda en la caché. Devuelve cuántas.
+    async fn fetch_headers(
+        &self,
+        conn: &mut Conn,
+        mailbox: &Mailbox,
+        uids: &[u32],
+    ) -> Result<usize> {
         let gmail = conn.caps.gmail_labels;
         let mut query = format!("(UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE {HEADER_FIELDS}");
         if gmail {
@@ -610,7 +793,8 @@ impl ImapBackend {
         }
         query.push(')');
 
-        for chunk in plan.new_uids.chunks(BATCH_SIZE) {
+        let mut stored = 0usize;
+        for chunk in uids.chunks(BATCH_SIZE) {
             let stream = imap(OP_TIMEOUT, conn.session.uid_fetch(uid_set(chunk), &query)).await?;
             let fetches: Vec<Fetch> = imap(OP_TIMEOUT, stream.try_collect()).await?;
 
@@ -631,12 +815,27 @@ impl ImapBackend {
                 headers.push(parse::build_header(f.header(), f.envelope(), meta));
             }
             if !headers.is_empty() {
-                changed += headers.len();
+                stored += headers.len();
                 self.with_store(|s| s.upsert_headers(mailbox.id, &headers))?;
             }
         }
+        Ok(stored)
+    }
 
-        Ok(changed)
+    /// Una página hacia atrás: las `count` cabeceras anteriores a la más antigua en caché.
+    async fn fetch_older_once(&self, mailbox: &Mailbox, count: usize) -> Result<OlderPage> {
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        let selected = imap(OP_TIMEOUT, conn.session.select(&mailbox.path)).await?;
+        self.guard_uid_validity(mailbox, selected.uid_validity)?;
+        let uid_next = server_uid_next(conn, &selected).await?;
+        let cache_min = self.with_store(|s| s.min_uid(mailbox.id))?;
+        let plan = plan_older(&mut ConnSearch { conn }, uid_next, cache_min, count).await?;
+        let fetched = self.fetch_headers(conn, mailbox, &plan.uids).await?;
+        Ok(OlderPage {
+            fetched,
+            exhausted: plan.exhausted,
+        })
     }
 
     /// Descarga el mensaje completo (BODY.PEEK[]) y devuelve sus bytes.
@@ -653,7 +852,12 @@ impl ImapBackend {
         fetches
             .iter()
             .find_map(|f| f.body().map(<[u8]>::to_vec))
-            .ok_or_else(|| Error::NotFound(format!("mensaje uid {uid} en {}", mailbox.path)))
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "mensaje uid {uid} en {}",
+                    correo_core::decode_modified_utf7(&mailbox.path)
+                ))
+            })
     }
 
     /// Metadatos del adjunto `index` según el cuerpo cacheado, si lo hay.
@@ -709,7 +913,7 @@ impl ImapBackend {
                 None if fetches.iter().any(|f| f.uid == Some(uid)) => Ok(Vec::new()),
                 None => Err(Error::NotFound(format!(
                     "mensaje uid {uid} en {}",
-                    mailbox.path
+                    correo_core::decode_modified_utf7(&mailbox.path)
                 ))),
             }
         };

@@ -456,6 +456,17 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(se)
     }
 
+    /// UID más bajo cacheado de una carpeta (`None` si no hay mensajes).
+    pub fn min_uid(&self, mailbox_id: MailboxId) -> Result<Option<u32>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(uid) FROM messages WHERE mailbox_id = ?1",
+                params![mailbox_id],
+                |r| r.get(0),
+            )
+            .map_err(se)
+    }
+
     /// Cabecera por id interno.
     pub fn get_header(&self, id: MessageId) -> Result<Option<MessageHeader>> {
         self.conn
@@ -1292,6 +1303,20 @@ mod tests {
         assert_eq!(s.list_headers(sent, 10, 0).unwrap().len(), 1);
         assert!(s.search_messages("uno", 10).unwrap().is_empty());
         assert_eq!(s.search_messages("enviado", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn min_uid_is_per_mailbox() {
+        let s = store();
+        let acc = new_account(&s, "m@example.com");
+        let a = new_mailbox(&s, acc, "INBOX");
+        let b = new_mailbox(&s, acc, "Archivo");
+        assert_eq!(s.min_uid(a).unwrap(), None);
+        s.upsert_headers(a, &[header(a, 7, "x", 1), header(a, 3, "y", 2)])
+            .unwrap();
+        s.upsert_headers(b, &[header(b, 1, "z", 3)]).unwrap();
+        assert_eq!(s.min_uid(a).unwrap(), Some(3));
+        assert_eq!(s.min_uid(b).unwrap(), Some(1));
     }
 
     #[test]

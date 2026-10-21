@@ -10,6 +10,9 @@ mod reader_html;
 #[path = "reader_web.rs"]
 mod reader_web;
 #[cfg(any(feature = "webkit", test))]
+#[path = "reader_web_dark.rs"]
+mod reader_web_dark;
+#[cfg(any(feature = "webkit", test))]
 #[path = "reader_web_policy.rs"]
 mod reader_web_policy;
 #[cfg(any(feature = "webkit", test))]
@@ -158,6 +161,18 @@ struct Inner {
     /// Alterna entre la vista ligera y la completa (solo con la feature `webkit`).
     #[cfg(feature = "webkit")]
     toggle: gtk::Button,
+    /// «Colores originales» / «Adaptar al tema oscuro» (solo tema oscuro y vista completa).
+    #[cfg(feature = "webkit")]
+    dark_toggle: gtk::Button,
+    /// Configuración del modo oscuro de la vista completa.
+    #[cfg(feature = "webkit")]
+    dark_mode: crate::setup::config::HtmlDarkMode,
+    /// Última elección del menú en la sesión: `Some(true)` = adaptar al tema oscuro.
+    #[cfg(feature = "webkit")]
+    dark_pref: Cell<Option<bool>>,
+    /// Aspecto con el que se muestra el mensaje actual en el WebView.
+    #[cfg(feature = "webkit")]
+    web_look: Cell<reader_web_dark::Look>,
     /// WebView compartido por los mensajes con HTML; `None` hasta el primero y tras el reposo.
     #[cfg(feature = "webkit")]
     web: RefCell<Option<reader_web::HtmlView>>,
@@ -279,6 +294,8 @@ impl MessageView {
         compact_items.set_visible(false);
         #[cfg(feature = "webkit")]
         let toggle = menu_item(reader_web_ui::LABEL_FULL);
+        #[cfg(feature = "webkit")]
+        let dark_toggle = menu_item(reader_web_ui::LABEL_ORIGINAL_COLORS);
         let more_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         more_box.append(&compact_items);
         more_box.append(&mark_unread);
@@ -286,6 +303,8 @@ impl MessageView {
         {
             toggle.set_visible(false);
             more_box.append(&toggle);
+            dark_toggle.set_visible(false);
+            more_box.append(&dark_toggle);
         }
         let more_popover = gtk::Popover::new();
         more_popover.add_css_class("menu");
@@ -306,7 +325,10 @@ impl MessageView {
                     delete_item.clone(),
                 ];
                 #[cfg(feature = "webkit")]
-                v.push(toggle.clone());
+                {
+                    v.push(toggle.clone());
+                    v.push(dark_toggle.clone());
+                }
                 v
             };
             for b in buttons {
@@ -433,6 +455,14 @@ impl MessageView {
             #[cfg(feature = "webkit")]
             toggle: toggle.clone(),
             #[cfg(feature = "webkit")]
+            dark_toggle: dark_toggle.clone(),
+            #[cfg(feature = "webkit")]
+            dark_mode: crate::setup::app_config().html_dark_mode,
+            #[cfg(feature = "webkit")]
+            dark_pref: Cell::new(None),
+            #[cfg(feature = "webkit")]
+            web_look: Cell::new(reader_web_dark::Look::Light),
+            #[cfg(feature = "webkit")]
             web: RefCell::new(None),
             #[cfg(feature = "webkit")]
             web_idle: RefCell::new(None),
@@ -452,6 +482,19 @@ impl MessageView {
             toggle.connect_clicked(move |_| {
                 if let Some(inner) = weak.upgrade() {
                     reader_web_ui::toggle(&inner);
+                }
+            });
+            let weak = Rc::downgrade(&inner);
+            dark_toggle.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    reader_web_ui::toggle_dark(&inner);
+                }
+            });
+            // El tema del sistema cambia en caliente: el mensaje mostrado se reajusta.
+            let weak = Rc::downgrade(&inner);
+            adw::StyleManager::default().connect_dark_notify(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    reader_web_ui::theme_changed(&inner);
                 }
             });
             let weak = Rc::downgrade(&inner);

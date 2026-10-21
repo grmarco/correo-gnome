@@ -61,6 +61,9 @@ pub enum SyncNotice {
         mailbox: MailboxId,
         error: Option<String>,
     },
+    /// Cambió el contador de no leídos de alguna carpeta (ya guardado): la interfaz debe
+    /// releer la barra lateral; la lista de mensajes no cambia.
+    CountsChanged { account: AccountId },
 }
 
 /// Motivo que se informa cuando una carpeta abierta no puede sincronizarse porque el
@@ -87,6 +90,7 @@ impl Drop for SyncRunner {
         if let Some(task) = self.idle_task.take() {
             task.abort();
         }
+        self.cancel_unread();
     }
 }
 
@@ -267,6 +271,11 @@ pub struct SyncRunner {
     sync_task: Option<JoinHandle<Option<Event>>>,
     /// Resultado: cuánto duró la espera y si terminó bien.
     idle_task: Option<JoinHandle<(Duration, Result<()>)>>,
+    /// Refresco de no leídos en curso (como mucho uno).
+    unread_task: Option<JoinHandle<Result<Vec<MailboxId>>>>,
+    /// El planificador pidió un refresco que aún no ha empezado: espera a que no haya
+    /// sincronizaciones en curso o pendientes, para ir «tras» ellas.
+    unread_wanted: bool,
     deadline: Option<Instant>,
 }
 
@@ -295,6 +304,8 @@ impl SyncRunner {
             pending_sync: VecDeque::new(),
             sync_task: None,
             idle_task: None,
+            unread_task: None,
+            unread_wanted: false,
             deadline: None,
         }
     }
@@ -316,9 +327,11 @@ impl SyncRunner {
         self.execute(actions, &notices).await;
         loop {
             self.start_next_sync(&notices);
+            self.start_unread();
             let deadline = self.deadline;
             let mut sync_done = false;
             let mut idle_done = false;
+            let mut unread_result = None;
             let event = tokio::select! {
                 biased;
                 ev = events.recv() => match ev {
@@ -334,8 +347,19 @@ impl SyncRunner {
                     idle_done = true;
                     Some(idle_event(joined))
                 }
+                joined = join_unread(&mut self.unread_task) => {
+                    unread_result = Some(joined);
+                    None
+                }
                 _ = wait_until(deadline) => Some(Event::Tick),
             };
+            if let Some(joined) = unread_result {
+                self.unread_task = None;
+                let event = self.unread_event(joined, &notices).await;
+                let actions = self.scheduler.handle(event);
+                self.execute(actions, &notices).await;
+                continue;
+            }
             if sync_done {
                 self.sync_task = None;
             }
@@ -348,6 +372,7 @@ impl SyncRunner {
             if event == Event::Resumed {
                 // Vuelta del equipo o de la red: lo que estaba en curso ya no sirve.
                 self.cancel_sync(&notices);
+                self.cancel_unread();
             }
             let opened = match event {
                 Event::MailboxOpened(id) => Some(id),
@@ -388,6 +413,10 @@ impl SyncRunner {
                     None
                 }
                 Action::StartIdle(_) => self.start_idle(),
+                Action::RefreshUnread(_) => {
+                    self.unread_wanted = true;
+                    None
+                }
                 Action::Sleep(at) => {
                     self.deadline = Some(at);
                     None
@@ -396,6 +425,7 @@ impl SyncRunner {
                     self.deadline = None;
                     self.abort_idle();
                     self.cancel_sync(notices);
+                    self.cancel_unread();
                     None
                 }
                 Action::AuthRequired(account) => {
@@ -422,6 +452,61 @@ impl SyncRunner {
         self.sync_task = Some(tokio::spawn(
             async move { shared.run(action, &notices).await },
         ));
+    }
+
+    /// Lanza el refresco de no leídos pedido, si no hay otro y no hay sincronizaciones en
+    /// curso ni pendientes. Va en su propia tarea: el bucle de eventos sigue atendiendo
+    /// `Pause`, `Resumed` y `ConditionsChanged`.
+    fn start_unread(&mut self) {
+        if !self.unread_wanted
+            || self.unread_task.is_some()
+            || self.sync_task.is_some()
+            || !self.pending_sync.is_empty()
+        {
+            return;
+        }
+        self.unread_wanted = false;
+        let backend = Arc::clone(&self.shared.backend);
+        self.unread_task = Some(tokio::spawn(async move { backend.refresh_unread().await }));
+    }
+
+    /// Cancela el refresco en curso o pendiente. El planificador ya lo da por terminado
+    /// en los casos en que lo pide (pausa, reanudación, reautorización).
+    fn cancel_unread(&mut self) {
+        self.unread_wanted = false;
+        if let Some(task) = self.unread_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Traduce el final del refresco: avisa a la interfaz si cambió algún contador.
+    async fn unread_event(
+        &self,
+        joined: std::result::Result<Result<Vec<MailboxId>>, JoinError>,
+        notices: &mpsc::Sender<SyncNotice>,
+    ) -> Event {
+        match joined {
+            Ok(Ok(changed)) if !changed.is_empty() => {
+                let _ = notices
+                    .send(SyncNotice::CountsChanged {
+                        account: self.shared.account,
+                    })
+                    .await;
+            }
+            Ok(Err(Error::Auth(e))) => {
+                eprintln!(
+                    "correo-sync: cuenta {}: autenticación rechazada al contar no leídos: {e}",
+                    self.shared.account
+                );
+                return Event::AuthFailed;
+            }
+            Ok(Err(e)) => eprintln!(
+                "correo-sync: cuenta {}: no se actualizaron los no leídos: {e}",
+                self.shared.account
+            ),
+            _ => {}
+        }
+        Event::UnreadRefreshDone
     }
 
     /// Cancela la sincronización en curso y descarta las pendientes.
@@ -499,6 +584,15 @@ async fn join_idle(
     }
 }
 
+async fn join_unread(
+    slot: &mut Option<JoinHandle<Result<Vec<MailboxId>>>>,
+) -> std::result::Result<Result<Vec<MailboxId>>, JoinError> {
+    match slot {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
 async fn wait_until(at: Option<Instant>) {
     match at {
         Some(at) => sleep_until(TokioInstant::from_std(at)).await,
@@ -550,6 +644,15 @@ mod tests {
         hang_next: AtomicBool,
         auth_error: AtomicBool,
         cancelled: Arc<AtomicUsize>,
+        /// Refrescos de no leídos: arrancados, en curso, máximo simultáneo y cancelados.
+        refresh_started: AtomicUsize,
+        refresh_active: AtomicUsize,
+        refresh_max_active: AtomicUsize,
+        refresh_cancelled: AtomicUsize,
+        /// Sincronizaciones de la bandeja ya hechas cuando arrancó cada refresco.
+        refresh_after_syncs: Mutex<Vec<usize>>,
+        hang_refresh: AtomicBool,
+        refresh_changed: Mutex<Vec<MailboxId>>,
     }
 
     impl FakeBackend {
@@ -560,6 +663,13 @@ mod tests {
                 hang_next: AtomicBool::new(false),
                 auth_error: AtomicBool::new(false),
                 cancelled: Arc::new(AtomicUsize::new(0)),
+                refresh_started: AtomicUsize::new(0),
+                refresh_active: AtomicUsize::new(0),
+                refresh_max_active: AtomicUsize::new(0),
+                refresh_cancelled: AtomicUsize::new(0),
+                refresh_after_syncs: Mutex::new(Vec::new()),
+                hang_refresh: AtomicBool::new(false),
+                refresh_changed: Mutex::new(Vec::new()),
             })
         }
 
@@ -584,6 +694,29 @@ mod tests {
                 mailbox(INBOX, MailboxRole::Inbox),
                 mailbox(SECONDARY, MailboxRole::Other),
             ])
+        }
+        async fn refresh_unread(&self) -> Result<Vec<MailboxId>> {
+            struct Active<'a>(&'a FakeBackend, bool);
+            impl Drop for Active<'_> {
+                fn drop(&mut self) {
+                    self.0.refresh_active.fetch_sub(1, Ordering::SeqCst);
+                    if !self.1 {
+                        self.0.refresh_cancelled.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            let inbox_syncs = self.sync_count(INBOX);
+            self.refresh_after_syncs.lock().unwrap().push(inbox_syncs);
+            self.refresh_started.fetch_add(1, Ordering::SeqCst);
+            let now = self.refresh_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.refresh_max_active.fetch_max(now, Ordering::SeqCst);
+            let mut guard = Active(self, false);
+            if self.hang_refresh.load(Ordering::SeqCst) {
+                pending::<()>().await;
+            }
+            tokio::task::yield_now().await;
+            guard.1 = true;
+            Ok(self.refresh_changed.lock().unwrap().clone())
         }
         async fn sync_mailbox(&self, mailbox: &Mailbox, _days: u32) -> Result<usize> {
             self.syncs.lock().unwrap().push(mailbox.id);
@@ -1038,6 +1171,94 @@ mod tests {
             }
         }
         assert_eq!(backend.sync_count(SECONDARY), 0);
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unread_refresh_runs_once_after_the_first_inbox_sync_and_reports_changes() {
+        let backend = FakeBackend::new(0);
+        *backend.refresh_changed.lock().unwrap() = vec![SECONDARY];
+        let mut ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.refresh_started.load(Ordering::SeqCst) == 1).await;
+        // No antes de la primera sincronización de la bandeja.
+        assert_eq!(*backend.refresh_after_syncs.lock().unwrap(), vec![1]);
+        let notice = next_report(&mut ch.reports, Duration::from_secs(5)).await;
+        assert_eq!(notice, Some(SyncNotice::CountsChanged { account: ACCOUNT }));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(backend.refresh_started.load(Ordering::SeqCst), 1);
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unread_refresh_without_changes_sends_no_notice() {
+        let backend = FakeBackend::new(0);
+        let mut ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.refresh_started.load(Ordering::SeqCst) == 1).await;
+        let got = next_report(&mut ch.reports, Duration::from_millis(300)).await;
+        assert!(got.is_none(), "{got:?}");
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unread_refresh_does_not_start_before_the_inbox_sync_succeeds() {
+        let backend = FakeBackend::new(0);
+        backend.auth_error.store(true, Ordering::SeqCst);
+        let ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.sync_count(INBOX) == 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(backend.refresh_started.load(Ordering::SeqCst), 0);
+        drop(ch.events);
+        ch.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_cancels_a_hung_unread_refresh_without_blocking_events() {
+        let backend = FakeBackend::new(0);
+        backend.hang_refresh.store(true, Ordering::SeqCst);
+        let ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.refresh_started.load(Ordering::SeqCst) == 1).await;
+
+        // Con el refresco colgado el bucle sigue atendiendo eventos: abrir una carpeta
+        // sincroniza y la pérdida de red cancela el refresco.
+        ch.events
+            .send(Event::MailboxOpened(SECONDARY))
+            .await
+            .unwrap();
+        eventually(|| backend.sync_count(SECONDARY) == 1).await;
+        ch.events
+            .send(Event::ConditionsChanged(crate::Conditions {
+                network: crate::scheduler::Network::Offline,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        eventually(|| backend.refresh_cancelled.load(Ordering::SeqCst) == 1).await;
+        drop(ch.events);
+        tokio::time::timeout(Duration::from_secs(5), ch.task)
+            .await
+            .expect("el runner no terminó")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_restarts_the_unread_refresh_and_never_runs_two_at_once() {
+        let backend = FakeBackend::new(0);
+        backend.hang_refresh.store(true, Ordering::SeqCst);
+        let ch = runner(backend.clone(), None, vec![]).spawn();
+        eventually(|| backend.refresh_started.load(Ordering::SeqCst) == 1).await;
+
+        backend.hang_refresh.store(false, Ordering::SeqCst);
+        ch.events.send(Event::Resumed).await.unwrap();
+        // El colgado se cancela y se lanza uno nuevo (tras la resincronización).
+        eventually(|| backend.refresh_cancelled.load(Ordering::SeqCst) == 1).await;
+        eventually(|| backend.refresh_started.load(Ordering::SeqCst) == 2).await;
+        ch.events.send(Event::Resumed).await.unwrap();
+        ch.events.send(Event::Resumed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(backend.refresh_max_active.load(Ordering::SeqCst), 1);
         drop(ch.events);
         ch.task.await.unwrap();
     }

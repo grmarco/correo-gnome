@@ -6,6 +6,9 @@
 //!   sincronización no guarda) son nodos contenedor: `mailbox == None`.
 //! * Una carpeta con hijos que también es seleccionable (p. ej. `Archives` con
 //!   `Archives/2014`) es un nodo con `mailbox` y `children`.
+//! * Los nombres de IMAP llegan en UTF-7 modificado (`sincronizaci&APM-n`): el nombre visible
+//!   y el orden usan el nombre decodificado; `key` y la ruta de la carpeta siguen siendo los
+//!   crudos (plegado en ui-state, SELECT/COPY).
 //! * Nombre visible: las carpetas con rol usan su nombre fijo en castellano (la primera de
 //!   cada rol; si hay otra con el mismo rol conserva su nombre) y el resto, su último segmento
 //!   (así `[Gmail]/Enviados` no repite el prefijo).
@@ -162,7 +165,7 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 
 fn new_node(name: &str, key: String) -> Node {
     Node {
-        name: name.to_owned(),
+        name: correo_core::decode_modified_utf7(name),
         key,
         mailbox: None,
         role: MailboxRole::Other,
@@ -188,7 +191,8 @@ fn insert(
 ) {
     let seg = &segs[depth];
     let key = join(&segs[..=depth], delimiter);
-    let idx = match nodes.iter().position(|n| n.name == *seg) {
+    // Se busca por la clave cruda: dos segmentos distintos podrían decodificar igual.
+    let idx = match nodes.iter().position(|n| n.key == key) {
         Some(i) => i,
         None => {
             nodes.push(new_node(seg, key));
@@ -487,6 +491,35 @@ mod tests {
         assert_eq!(ancestor_keys(&m), ["Proyectos", "Proyectos/Casa"]);
         assert!(ancestor_keys(&other(2, "Solo", '/')).is_empty());
         assert!(ancestor_keys(&mb(3, "a/b", MailboxRole::Other, None)).is_empty());
+    }
+
+    #[test]
+    fn utf7_names_are_decoded_for_display_but_keys_stay_raw() {
+        let t = folder_tree(&[
+            other(1, "Problemas de sincronizaci&APM-n", '/'),
+            other(2, "Facturaci&APM-n/&2D3eAA- Ni&APE-os", '/'),
+            other(3, "Facturaci&APM-n", '/'),
+            other(4, "Zeta", '/'),
+        ]);
+        assert_eq!(
+            names(&t),
+            ["Facturación", "Problemas de sincronización", "Zeta"]
+        );
+        assert_eq!(t[0].key, "Facturaci&APM-n");
+        assert_eq!(t[0].children[0].name, "\u{1F600} Niños");
+        assert_eq!(t[0].children[0].key, "Facturaci&APM-n/&2D3eAA- Ni&APE-os");
+        assert_eq!(t[1].key, "Problemas de sincronizaci&APM-n");
+    }
+
+    #[test]
+    fn natural_order_uses_the_decoded_name() {
+        // «&AME-lbum» = «Álbum» ordena junto a la «a»; sin decodificar iría tras la «Z».
+        let t = folder_tree(&[
+            other(1, "zebra", '/'),
+            other(2, "&AME-lbum", '/'),
+            other(3, "beta", '/'),
+        ]);
+        assert_eq!(names(&t), ["Álbum", "beta", "zebra"]);
     }
 
     #[test]

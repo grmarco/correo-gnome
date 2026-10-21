@@ -11,6 +11,7 @@ use correo_threads::build_threads;
 use gtk::{gio, glib};
 
 use crate::notice::{Notice, Tone};
+use crate::older::Footer;
 use crate::ui_style;
 
 /// Un hilo tal como se muestra: su último mensaje y el resumen del conjunto.
@@ -124,8 +125,94 @@ pub enum LoadState {
 /// Texto de «Cargando» accesible, también usado por el esqueleto.
 const LOADING_LABEL: &str = "Cargando mensajes…";
 
+/// Fila del final de la lista: «Cargar mensajes anteriores» y sus estados.
+struct OlderRow {
+    root: gtk::Box,
+    spinner: gtk::Spinner,
+    label: gtk::Label,
+    button: gtk::Button,
+    /// Callback de «Cargar mensajes anteriores» / «Reintentar».
+    on_load: RetrySlot,
+}
+
+impl OlderRow {
+    fn new() -> Self {
+        let spinner = gtk::Spinner::new();
+        spinner.set_visible(false);
+        let label = gtk::Label::new(None);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.add_css_class("caption");
+        label.set_visible(false);
+        let button = gtk::Button::with_label("Cargar mensajes anteriores");
+        button.add_css_class("flat");
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        root.add_css_class("correo-older-row");
+        root.set_halign(gtk::Align::Center);
+        root.set_margin_top(6);
+        root.set_margin_bottom(6);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        root.append(&spinner);
+        root.append(&label);
+        root.append(&button);
+        root.set_visible(false);
+        let on_load: RetrySlot = Rc::default();
+        {
+            let on_load = on_load.clone();
+            button.connect_clicked(move |_| {
+                let f = on_load.borrow().clone();
+                if let Some(f) = f {
+                    f();
+                }
+            });
+        }
+        Self {
+            root,
+            spinner,
+            label,
+            button,
+            on_load,
+        }
+    }
+
+    fn set(&self, footer: &Footer) {
+        let (spin, text, button, error) = match footer {
+            Footer::Hidden => (false, None, None, false),
+            Footer::Available => (false, None, Some("Cargar mensajes anteriores"), false),
+            Footer::Loading => (true, Some("Cargando mensajes anteriores…"), None, false),
+            Footer::Exhausted => (false, Some("No hay mensajes más antiguos"), None, false),
+            Footer::Failed(e) => (false, Some(e.as_str()), Some("Reintentar"), true),
+        };
+        self.root.set_visible(*footer != Footer::Hidden);
+        self.spinner.set_visible(spin);
+        self.spinner
+            .set_spinning(spin && adw::is_animations_enabled(&self.root));
+        self.label.set_visible(text.is_some());
+        self.label.set_label(text.unwrap_or(""));
+        self.label.set_tooltip_text(error.then_some(text).flatten());
+        if error {
+            self.label.add_css_class("error");
+            self.label.remove_css_class("dim-label");
+        } else {
+            self.label.remove_css_class("error");
+            self.label.add_css_class("dim-label");
+        }
+        self.button.set_visible(button.is_some());
+        if let Some(b) = button {
+            self.button.set_label(b);
+        }
+        let description = match footer {
+            Footer::Failed(e) => format!("No se pudieron cargar mensajes anteriores: {e}"),
+            _ => text.or(button).unwrap_or("").to_string(),
+        };
+        self.root
+            .update_property(&[gtk::accessible::Property::Label(&description)]);
+    }
+}
+
 pub struct MessageList {
     root: gtk::Box,
+    older: OlderRow,
     stack: gtk::Stack,
     empty: adw::StatusPage,
     /// Barra fina indeterminada sobre el borde superior mientras se sincroniza.
@@ -284,8 +371,12 @@ impl MessageList {
         }
         failed_banner.connect_button_clicked(move || on_retry());
 
+        let older = OlderRow::new();
+        let list_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list_page.append(&scroller);
+        list_page.append(&older.root);
         let stack = gtk::Stack::new();
-        stack.add_named(&scroller, Some("list"));
+        stack.add_named(&list_page, Some("list"));
         stack.add_named(&empty, Some("empty"));
         stack.add_named(&loading_page(), Some("loading"));
         stack.add_named(&failed_page, Some("failed"));
@@ -329,6 +420,7 @@ impl MessageList {
 
         Self {
             root,
+            older,
             stack,
             empty,
             progress,
@@ -354,6 +446,16 @@ impl MessageList {
     /// Se invoca al pulsar «Reintentar» tras un fallo de sincronización.
     pub fn connect_retry(&self, f: impl Fn() + 'static) {
         *self.retry.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Se invoca al pulsar «Cargar mensajes anteriores» (o «Reintentar» tras un fallo).
+    pub fn connect_load_older(&self, f: impl Fn() + 'static) {
+        *self.older.on_load.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Fila del final de la lista.
+    pub fn set_older_footer(&self, footer: &Footer) {
+        self.older.set(footer);
     }
 
     /// Estado de sincronización de lo que se muestra: barra fina mientras carga, esqueleto

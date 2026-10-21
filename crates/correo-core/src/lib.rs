@@ -1,5 +1,8 @@
 //! Tipos y contratos compartidos por todos los crates.
 
+mod mutf7;
+pub use mutf7::{decode_modified_utf7, encode_modified_utf7};
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,6 +272,24 @@ pub trait MailBackend: Send + Sync {
     async fn list_mailboxes(&self) -> Result<Vec<Mailbox>>;
     /// Sincroniza cabeceras de los últimos `days` días; devuelve cuántas son nuevas o cambiadas.
     async fn sync_mailbox(&self, mailbox: &Mailbox, days: u32) -> Result<usize>;
+
+    /// Trae las `count` cabeceras inmediatamente anteriores a la más antigua que hay en caché
+    /// de la carpeta (paginación hacia atrás). `exhausted` indica que ya no quedan más
+    /// antiguas en el servidor. Por defecto no hay nada más antiguo que cargar.
+    async fn fetch_older(&self, _mailbox: &Mailbox, _count: usize) -> Result<OlderPage> {
+        Ok(OlderPage {
+            fetched: 0,
+            exhausted: true,
+        })
+    }
+
+    /// Actualiza los contadores de no leídos de todas las carpetas de la cuenta (en
+    /// segundo plano, sin bloquear el resto de operaciones) y devuelve los ids de las
+    /// carpetas cuyo contador cambió. Por defecto no hace nada.
+    async fn refresh_unread(&self) -> Result<Vec<MailboxId>> {
+        Ok(Vec::new())
+    }
+
     async fn fetch_body(&self, mailbox: &Mailbox, uid: u32) -> Result<MessageBody>;
     async fn fetch_attachment(&self, mailbox: &Mailbox, uid: u32, index: usize) -> Result<Vec<u8>>;
 
@@ -326,6 +347,15 @@ pub trait MailBackend: Send + Sync {
         }
         report
     }
+}
+
+/// Resultado de `MailBackend::fetch_older`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OlderPage {
+    /// Cabeceras nuevas traídas a la caché.
+    pub fetched: usize,
+    /// No quedan mensajes más antiguos en el servidor.
+    pub exhausted: bool,
 }
 
 /// Máximo de UIDs por conjunto en una orden IMAP por lotes.

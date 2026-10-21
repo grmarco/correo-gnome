@@ -176,26 +176,91 @@ pub fn uid_sets(uids: &[u32], max: usize) -> Vec<(String, Vec<u32>)> {
 /// Resultado de comparar el servidor con la caché.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncPlan {
-    /// En el servidor (dentro de la ventana) y no en caché: descargar cabeceras.
+    /// En el servidor, dentro del rango sincronizado (`>= uid_min`) y no en caché: descargar
+    /// cabeceras.
     pub new_uids: Vec<u32>,
-    /// En el servidor y en caché: refrescar FLAGS.
+    /// En el servidor y en caché, dentro del rango sincronizado: refrescar FLAGS.
     pub known_uids: Vec<u32>,
-    /// En caché dentro de la ventana y ya no en el servidor: borrar de caché.
+    /// En caché (rango `>= lo`) y ya no en el servidor: borrar de caché.
     pub removed_uids: Vec<u32>,
 }
 
-/// `server`: UIDs que devuelve SEARCH SINCE. `cached_all`: todos los UIDs en
-/// caché de la carpeta. `cached_in_window`: los de caché dentro de la ventana.
-pub fn plan_sync(
-    server: &BTreeSet<u32>,
-    cached_all: &BTreeSet<u32>,
-    cached_in_window: &BTreeSet<u32>,
-) -> SyncPlan {
-    SyncPlan {
-        new_uids: server.difference(cached_all).copied().collect(),
-        known_uids: server.intersection(cached_all).copied().collect(),
-        removed_uids: cached_in_window.difference(server).copied().collect(),
+/// Límite inferior de UID que se pide al servidor para comparar con la caché.
+///
+/// Se sincroniza todo UID `>= uid_min` (ventana de días O mínimo de mensajes), pero la
+/// caché puede tener además mensajes más antiguos (páginas ya cargadas con «Cargar
+/// anteriores» o de ventanas previas): para detectar sus borrados se compara desde el UID
+/// más bajo que haya en caché. Sin nada que sincronizar ni nada en caché: `None`.
+pub fn compare_floor(uid_min: Option<u32>, cached_min: Option<u32>) -> Option<u32> {
+    match (uid_min, cached_min) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
+}
+
+/// UID mínimo del rango sincronizado: el más bajo entre la ventana de días (`SINCE`) y los
+/// `N` más recientes por UID. `None` si la carpeta está vacía.
+pub fn synced_floor(window: &BTreeSet<u32>, newest: &[u32]) -> Option<u32> {
+    let a = window.first().copied();
+    let b = newest.iter().copied().min();
+    compare_floor(a, b)
+}
+
+/// Compara el resultado de `UID SEARCH UID lo:*` con la caché.
+///
+/// - `server`: UIDs devueltos por el servidor. Se descartan los `< lo`: por el RFC 3501
+///   `n:*` con `n` mayor que el máximo devuelve el último mensaje aunque sea `< n`.
+/// - `cached`: UIDs de la carpeta en caché.
+/// - `uid_min`: inicio del rango sincronizado; solo desde ahí se descargan cabeceras nuevas
+///   y se refrescan flags. Por debajo (páginas antiguas ya cargadas) solo se detectan borrados.
+/// - `lo`: límite inferior de la búsqueda (`compare_floor`).
+///
+/// Un mensaje cacheado `>= lo` que el servidor no devuelve se considera borrado, esté o no
+/// dentro de la ventana de días: el rango cubierto lo decide el UID, no la fecha.
+pub fn plan_range_sync(
+    server: &BTreeSet<u32>,
+    cached: &BTreeSet<u32>,
+    uid_min: u32,
+    lo: u32,
+) -> SyncPlan {
+    let server: BTreeSet<u32> = server.range(lo..).copied().collect();
+    SyncPlan {
+        new_uids: server
+            .range(uid_min..)
+            .filter(|u| !cached.contains(u))
+            .copied()
+            .collect(),
+        known_uids: server
+            .range(uid_min..)
+            .filter(|u| cached.contains(u))
+            .copied()
+            .collect(),
+        removed_uids: cached
+            .range(lo..)
+            .filter(|u| !server.contains(u))
+            .copied()
+            .collect(),
+    }
+}
+
+/// Mínimo configurable de mensajes por carpeta.
+pub const MIN_MESSAGES_RANGE: std::ops::RangeInclusive<u32> = 20..=2000;
+pub const DEFAULT_MIN_MESSAGES: u32 = 100;
+
+/// Valida `min_messages_per_folder`: fuera de 20..=2000 se ajusta al extremo más cercano
+/// (0 = «sin configurar» = valor por defecto).
+pub fn effective_min_messages(value: u32) -> usize {
+    if value == 0 {
+        return DEFAULT_MIN_MESSAGES as usize;
+    }
+    value.clamp(*MIN_MESSAGES_RANGE.start(), *MIN_MESSAGES_RANGE.end()) as usize
+}
+
+/// Siguiente tramo de UIDs `[lo, hi]` al buscar hacia atrás desde `hi` con `step` UIDs.
+/// Nunca baja de 1 (los UID empiezan en 1).
+pub fn probe_range(hi: u32, step: u32) -> (u32, u32) {
+    let lo = hi.saturating_sub(step.saturating_sub(1)).max(1);
+    (lo, hi)
 }
 
 // ----- Fechas ------------------------------------------------------------
@@ -697,16 +762,107 @@ JVBERi0xLjQK\r\n\
         assert_eq!(mail_addr(&blank).unwrap().name, None);
     }
 
+    fn set(v: &[u32]) -> BTreeSet<u32> {
+        v.iter().copied().collect()
+    }
+
     #[test]
-    fn sync_plan_classifies_uids() {
-        let server: BTreeSet<u32> = [1, 2, 3, 5].into();
-        let cached_all: BTreeSet<u32> = [2, 3, 4, 9].into();
-        let in_window: BTreeSet<u32> = [2, 3, 4].into();
-        let plan = plan_sync(&server, &cached_all, &in_window);
+    fn range_plan_classifies_uids() {
+        let plan = plan_range_sync(&set(&[1, 2, 3, 5]), &set(&[2, 3, 4, 9]), 1, 1);
         assert_eq!(plan.new_uids, vec![1, 5]);
         assert_eq!(plan.known_uids, vec![2, 3]);
-        // 9 está en caché pero fuera de la ventana: no se borra.
-        assert_eq!(plan.removed_uids, vec![4]);
+        assert_eq!(plan.removed_uids, vec![4, 9]);
+    }
+
+    #[test]
+    fn empty_folder_in_window_and_empty_cache() {
+        assert_eq!(synced_floor(&set(&[]), &[]), None);
+        assert_eq!(compare_floor(None, None), None);
+        // Carpeta vacía en servidor con caché: todo se borra.
+        let plan = plan_range_sync(&set(&[]), &set(&[3, 4]), 3, 3);
+        assert_eq!(plan.removed_uids, vec![3, 4]);
+        assert!(plan.new_uids.is_empty() && plan.known_uids.is_empty());
+    }
+
+    #[test]
+    fn old_folder_with_5000_messages_syncs_only_the_newest_hundred() {
+        // Ningún mensaje en la ventana de días; UIDs 1..=5000 en el servidor.
+        let newest: Vec<u32> = (4901..=5000).rev().collect();
+        let floor = synced_floor(&set(&[]), &newest).unwrap();
+        assert_eq!(floor, 4901);
+        // Caché vacía: se compara desde el suelo, con `UID 4901:*`.
+        let server: BTreeSet<u32> = (floor..=5000).collect();
+        let plan = plan_range_sync(
+            &server,
+            &set(&[]),
+            floor,
+            compare_floor(Some(floor), None).unwrap(),
+        );
+        assert_eq!(plan.new_uids.len(), 100);
+        assert_eq!(plan.new_uids[0], 4901);
+        assert!(plan.removed_uids.is_empty());
+    }
+
+    #[test]
+    fn window_wins_when_it_reaches_further_back_than_the_newest_n() {
+        assert_eq!(synced_floor(&set(&[50, 60]), &[90, 80, 70]), Some(50));
+        assert_eq!(synced_floor(&set(&[95]), &[90, 80, 70]), Some(70));
+    }
+
+    #[test]
+    fn deleted_messages_are_detected_inside_and_outside_the_day_window() {
+        // Rango sincronizado desde 100; la caché además tiene 40 y 41 de una página antigua.
+        let cached = set(&[40, 41, 100, 101, 102]);
+        let lo = compare_floor(Some(100), Some(40)).unwrap();
+        assert_eq!(lo, 40);
+        // En el servidor desaparecieron 41 (fuera de la ventana) y 101 (dentro).
+        let server = set(&[40, 100, 102, 103]);
+        let plan = plan_range_sync(&server, &cached, 100, lo);
+        assert_eq!(plan.removed_uids, vec![41, 101]);
+        assert_eq!(plan.new_uids, vec![103]);
+        // 40 sigue existiendo pero queda fuera del rango sincronizado: sin refresco de flags.
+        assert_eq!(plan.known_uids, vec![100, 102]);
+    }
+
+    #[test]
+    fn cached_messages_outside_the_window_are_not_removed_when_still_on_server() {
+        let plan = plan_range_sync(&set(&[7, 8, 9]), &set(&[7, 8, 9]), 9, 7);
+        assert!(plan.removed_uids.is_empty());
+        assert_eq!(plan.known_uids, vec![9]);
+    }
+
+    #[test]
+    fn star_range_quirk_does_not_resurrect_or_remove() {
+        // `UID SEARCH UID 500:*` con máximo 300 devuelve 300: debe ignorarse (< lo).
+        let plan = plan_range_sync(&set(&[300]), &set(&[]), 500, 500);
+        assert!(plan.new_uids.is_empty() && plan.known_uids.is_empty());
+    }
+
+    #[test]
+    fn uidvalidity_change_leaves_nothing_to_compare() {
+        // Tras el cambio de UIDVALIDITY la caché se borra: todo es nuevo y nada se borra.
+        let server = set(&[1, 2, 3]);
+        let plan = plan_range_sync(&server, &set(&[]), 1, 1);
+        assert_eq!(plan.new_uids, vec![1, 2, 3]);
+        assert!(plan.removed_uids.is_empty());
+        assert!(uid_validity_changed(Some(1), Some(2)));
+    }
+
+    #[test]
+    fn min_messages_is_validated() {
+        assert_eq!(effective_min_messages(0), 100);
+        assert_eq!(effective_min_messages(5), 20);
+        assert_eq!(effective_min_messages(20), 20);
+        assert_eq!(effective_min_messages(500), 500);
+        assert_eq!(effective_min_messages(99_999), 2000);
+    }
+
+    #[test]
+    fn probe_ranges_never_go_below_one() {
+        assert_eq!(probe_range(5000, 200), (4801, 5000));
+        assert_eq!(probe_range(100, 200), (1, 100));
+        assert_eq!(probe_range(1, 200), (1, 1));
+        assert_eq!(probe_range(u32::MAX, u32::MAX), (1, u32::MAX));
     }
 
     #[test]
