@@ -1,7 +1,7 @@
 //! T9: ventana principal. `NavigationSplitView` externo (cuentas y carpetas) que
 //! contiene otro (lista de hilos | lector). Toda la E/S de red va por `Services::spawn`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::rc::{Rc, Weak};
@@ -17,12 +17,13 @@ use gtk::{gio, glib};
 use crate::batch::{self, Phrase};
 use crate::batch_bar::BatchBar;
 use crate::composer;
+use crate::load_status::LoadTracker;
 use crate::message_list::{thread_rows, MessageList, Selection};
 use crate::notify;
 use crate::reader::MessageView;
 use crate::search;
 use crate::services::{flatten, Services};
-use crate::setup::{self, AddOutcome, SyncHandle};
+use crate::setup::{self, AddOutcome, MailboxSync, SyncHandle};
 use crate::sidebar::{Sidebar, Target};
 use crate::ui_style;
 use crate::ui_types::ComposeMode;
@@ -56,6 +57,7 @@ pub fn present(app: &adw::Application, services: Rc<Services>) {
     if !demo_mode() {
         let weak = shell.weak.clone();
         let weak_auth = shell.weak.clone();
+        let weak_status = shell.weak.clone();
         let handle = setup::start_sync(
             shell.services.clone(),
             app,
@@ -67,6 +69,11 @@ pub fn present(app: &adw::Application, services: Rc<Services>) {
             move |account| {
                 if let Some(s) = weak_auth.upgrade() {
                     s.on_auth_required(&account);
+                }
+            },
+            move |account, mailbox, state| {
+                if let Some(s) = weak_status.upgrade() {
+                    s.on_mailbox_status(&account, mailbox, state);
                 }
             },
         );
@@ -130,6 +137,10 @@ pub struct Shell {
     batch_bar: BatchBar,
     /// Sincronización en segundo plano; `None` en modo demostración.
     sync: RefCell<Option<SyncHandle>>,
+    /// Ventana estrecha (≤ 560sp): el lector compacta su barra de acciones.
+    compact: Cell<bool>,
+    /// Estado de sincronización de cada carpeta (avisos del runner).
+    load: RefCell<LoadTracker>,
     /// Cuentas recién añadidas cuyo primer informe de sincronización aún no ha llegado.
     fresh_accounts: RefCell<Vec<correo_core::AccountId>>,
     inner: adw::NavigationSplitView,
@@ -372,9 +383,21 @@ impl Shell {
                     // El botón Redactar se reduce a su icono.
                     bp.add_setter(&compose_content, "label", Some(&"".to_value()));
                     let win = window.clone();
-                    bp.connect_apply(move |_| win.add_css_class("correo-compact"));
+                    let w = weak.clone();
+                    bp.connect_apply(move |_| {
+                        win.add_css_class("correo-compact");
+                        if let Some(s) = w.upgrade() {
+                            s.set_compact(true);
+                        }
+                    });
                     let win = window.clone();
-                    bp.connect_unapply(move |_| win.remove_css_class("correo-compact"));
+                    let w = weak.clone();
+                    bp.connect_unapply(move |_| {
+                        win.remove_css_class("correo-compact");
+                        if let Some(s) = w.upgrade() {
+                            s.set_compact(false);
+                        }
+                    });
                 }
                 window.add_breakpoint(bp);
             };
@@ -447,6 +470,8 @@ impl Shell {
                 reader_box,
                 reader: RefCell::new(None),
                 sync: RefCell::new(None),
+                compact: Cell::new(false),
+                load: RefCell::new(LoadTracker::default()),
                 fresh_accounts: RefCell::new(Vec::new()),
                 state: RefCell::new(State {
                     accounts: Vec::new(),
@@ -460,6 +485,13 @@ impl Shell {
                 }),
             }
         })
+    }
+
+    fn set_compact(&self, compact: bool) {
+        self.compact.set(compact);
+        if let Some(reader) = self.reader.borrow().as_ref() {
+            reader.set_compact(compact);
+        }
     }
 
     /// Acciones de ventana y atajos de teclado.
@@ -573,6 +605,18 @@ impl Shell {
         if let Err(e) = self.reload_model() {
             self.toast(format!("No se pudo leer la base de datos: {e}"));
         }
+        let w = self.weak.clone();
+        self.list.connect_retry(move || {
+            if let Some(s) = w.upgrade() {
+                s.retry_sync();
+            }
+        });
+        if demo_mode() {
+            let ids: Vec<MailboxId> = self.state.borrow().mailboxes.iter().map(|m| m.id).collect();
+            for id in ids {
+                self.demo_sync(id);
+            }
+        }
         let has_accounts = !self.state.borrow().accounts.is_empty();
         if has_accounts {
             self.root.set_visible_child_name("main");
@@ -674,11 +718,99 @@ impl Shell {
         }
         self.state.borrow_mut().target = target;
         if let Target::Mailbox(id) = target {
-            if let (Some(mailbox), Some(sync)) = (self.mailbox(id), self.sync.borrow().as_ref()) {
-                sync.mailbox_opened(mailbox.account_id, id);
-            }
+            self.request_mailbox_sync(id);
         }
         self.apply_target();
+    }
+
+    /// Pide al sincronizador que traiga ya una carpeta y la marca «cargando» hasta que
+    /// avise (así el indicador aparece al instante, sin esperar al runner).
+    fn request_mailbox_sync(self: &Rc<Self>, id: MailboxId) {
+        let Some(mailbox) = self.mailbox(id) else {
+            return;
+        };
+        let asked = self
+            .sync
+            .borrow()
+            .as_ref()
+            .is_some_and(|sync| sync.mailbox_opened(mailbox.account_id, id));
+        if asked {
+            self.load.borrow_mut().mark_pending(id);
+        } else if demo_mode() {
+            self.demo_sync(id);
+        }
+    }
+
+    /// «Reintentar» tras un fallo: vuelve a pedir las carpetas de la vista.
+    fn retry_sync(self: &Rc<Self>) {
+        for mailbox in self.target_mailboxes() {
+            self.request_mailbox_sync(mailbox.id);
+        }
+        self.update_load_ui();
+    }
+
+    /// Un aviso del runner sobre una carpeta: actualiza el indicador si está a la vista.
+    fn on_mailbox_status(
+        self: &Rc<Self>,
+        _account: &Account,
+        mailbox: MailboxId,
+        state: MailboxSync,
+    ) {
+        self.load.borrow_mut().set(mailbox, state);
+        if self.target_mailboxes().iter().any(|m| m.id == mailbox) {
+            self.update_load_ui();
+        }
+    }
+
+    /// Traslada el estado de sincronización de las carpetas a la lista y al botón de
+    /// sincronizar (el icono gira mientras algo de lo que se ve está cargando).
+    fn update_load_ui(&self) {
+        let ids: Vec<MailboxId> = self.target_mailboxes().iter().map(|m| m.id).collect();
+        let mut state = self.load.borrow().summary(&ids);
+        // Cuenta recién añadida: su bandeja aún no ha informado, pero se está sincronizando.
+        if state == crate::message_list::LoadState::Idle {
+            let fresh = self.fresh_accounts.borrow();
+            let waiting = self
+                .target_mailboxes()
+                .iter()
+                .any(|m| m.role == MailboxRole::Inbox && fresh.contains(&m.account_id));
+            if waiting {
+                state = crate::message_list::LoadState::Loading;
+            }
+        }
+        let loading = state == crate::message_list::LoadState::Loading;
+        self.list.set_load_state(state);
+        // Una sincronización manual en curso (botón desactivado) gestiona su propio giro.
+        if self.sync_btn.is_sensitive() {
+            if loading {
+                self.sync_btn.add_css_class("correo-syncing");
+            } else {
+                self.sync_btn.remove_css_class("correo-syncing");
+            }
+        }
+    }
+
+    /// Simula la sincronización de una carpeta en el modo demo (`CORREO_DEMO_SYNC=loading`
+    /// no termina nunca; `failed` termina con error; sin la variable no hace nada).
+    fn demo_sync(self: &Rc<Self>, id: MailboxId) {
+        let mode = std::env::var("CORREO_DEMO_SYNC").unwrap_or_default();
+        let result = match mode.as_str() {
+            "loading" => {
+                self.load.borrow_mut().mark_pending(id);
+                return;
+            }
+            "failed" => Some("No se pudo conectar con imap.ejemplo.com: tiempo de espera agotado."),
+            _ => return,
+        };
+        self.load.borrow_mut().mark_pending(id);
+        let w = self.weak.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+            if let Some(s) = w.upgrade() {
+                let state = MailboxSync::Done(result.map(str::to_string));
+                s.load.borrow_mut().set(id, state);
+                s.update_load_ui();
+            }
+        });
     }
 
     /// Reinicia la vista para el destino actual (sin búsqueda).
@@ -703,6 +835,7 @@ impl Shell {
         self.search.set_text("");
         self.reader_stack.set_visible_child_name("empty");
         self.reload_sidebar();
+        self.update_load_ui();
         self.reset_list();
     }
 
@@ -861,6 +994,7 @@ impl Shell {
                 s.on_reader_changed();
             }
         });
+        view.set_compact(self.compact.get());
         self.reader_header.pack_end(view.actions());
         self.reader_box.append(view.widget());
         *self.reader.borrow_mut() = Some(view);
@@ -964,6 +1098,8 @@ impl Shell {
                 format!("Cuenta reautorizada: {}", account.email)
             }
         };
+        // La bandeja de la cuenta nueva se está sincronizando: lo indica la lista.
+        self.update_load_ui();
         if let Some(sync) = self.sync.borrow().as_ref() {
             sync.account_reauthorized(account.clone());
         }
@@ -1027,6 +1163,7 @@ impl Shell {
             return;
         }
         self.reload_sidebar();
+        self.update_load_ui();
         // Se relee la lista si muestra alguna carpeta de la cuenta: la bandeja (informe de
         // mensajes nuevos) o una carpeta secundaria que acaba de sincronizarse al abrirla.
         let shows_account = self
@@ -2168,7 +2305,8 @@ pub fn demo_services() -> Result<Services, Box<dyn std::error::Error>> {
     if std::env::var_os("CORREO_DEMO_EMPTY").is_none() {
         seed_demo(&store);
     }
-    Ok(Services::new(store, Arc::new(NoTokens))?)
+    Ok(Services::new(store, Arc::new(NoTokens))?
+        .with_backend_override(crate::demo_backend::DemoBackend::shared()))
 }
 
 /// Inserta cuatro cuentas ficticias (dos Gmail y dos Outlook / Microsoft 365), cada una con
@@ -2403,22 +2541,7 @@ pub fn seed_demo(store: &Store) {
                 h.snippet.clone().unwrap_or_default()
             );
             let attachments = if h.uid % 6 == 3 {
-                vec![
-                    correo_core::Attachment {
-                        filename: "Presupuesto-T4.pdf".into(),
-                        mime_type: "application/pdf".into(),
-                        size: 248_000,
-                        content_id: None,
-                        ..Default::default()
-                    },
-                    correo_core::Attachment {
-                        filename: "cifras.xlsx".into(),
-                        mime_type: "application/vnd.ms-excel".into(),
-                        size: 56_400,
-                        content_id: None,
-                        ..Default::default()
-                    },
-                ]
+                crate::demo_backend::demo_attachments()
             } else {
                 Vec::new()
             };

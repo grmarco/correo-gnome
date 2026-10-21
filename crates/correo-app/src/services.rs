@@ -24,6 +24,9 @@ pub struct Services {
     /// Backend IMAP por cuenta: conserva su conexión TLS+sesión entre operaciones.
     backends: Mutex<HashMap<AccountId, Arc<ImapBackend>>>,
     forget_tokens: Option<ForgetTokens>,
+    /// Backend falso del modo demo (solo depuración): sustituye al IMAP en `backend()`.
+    #[cfg(debug_assertions)]
+    backend_override: Option<Arc<dyn MailBackend>>,
 }
 
 /// Aplana el resultado de un future de `Services::spawn` cuyo valor ya era un `Result`.
@@ -56,7 +59,16 @@ impl Services {
             runtime,
             backends: Mutex::new(HashMap::new()),
             forget_tokens: None,
+            #[cfg(debug_assertions)]
+            backend_override: None,
         })
+    }
+
+    /// Sustituye el backend de todas las cuentas (modo demo, solo depuración).
+    #[cfg(debug_assertions)]
+    pub fn with_backend_override(mut self, backend: Arc<dyn MailBackend>) -> Self {
+        self.backend_override = Some(backend);
+        self
     }
 
     /// Hook para borrar los tokens de una cuenta al eliminarla (lo aporta `setup`).
@@ -79,6 +91,10 @@ impl Services {
     /// Backend de correo de la cuenta, reutilizado entre llamadas. Tras cambiar el proveedor
     /// o el correo de una cuenta, llamar antes a `forget_backend`.
     pub fn backend(&self, account: &Account) -> Arc<dyn MailBackend> {
+        #[cfg(debug_assertions)]
+        if let Some(fake) = &self.backend_override {
+            return Arc::clone(fake);
+        }
         let mut backends = self.backends.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backends
             .entry(account.id)

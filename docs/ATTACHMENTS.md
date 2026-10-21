@@ -39,3 +39,16 @@
   escritos. Las firmas antiguas (`fetch_attachment`) siguen existiendo.
 - Cuerpos cacheados antiguos: sin `part`, se usa el mensaje completo (sin progreso real).
   Volver a bajar el cuerpo (p. ej. tras `wipe`) los actualiza.
+
+## Interfaz (`reader_attach.rs`)
+
+- Cada fila usa `fetch_attachment_to` (nunca `fetch_attachment`) desde una tarea de tokio. El
+  progreso se publica en un contador atómico y un temporizador de 100 ms (10 Hz) lo vuelca a
+  la fila; la cancelación usa el `CancelToken` de la descarga.
+- La descarga siempre va a un fichero privado (`$XDG_RUNTIME_DIR/correo-adjuntos/<uuid>/`, 0700,
+  fichero 0600, `O_NOFOLLOW`). «Guardar» lo copia después al destino elegido, de modo que un
+  fallo o una cancelación no tocan el fichero del usuario.
+- `Error::Cancelled` y el cierre del diálogo del portal no se muestran como errores.
+- Texto de progreso: `progress_text` / `shown_progress` (puras, con tests): `3,2 MB de 12 MB · 27 %`.
+  Las cifras se reescalan al tamaño decodificado; sin total conocido solo se muestra lo recibido.
+- Modo demo (solo depuración): `demo_backend.rs`, ver `docs/DESIGN.md` §6.4.

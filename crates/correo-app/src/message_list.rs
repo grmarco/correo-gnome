@@ -10,6 +10,7 @@ use correo_core::{Address, MessageHeader, MessageId};
 use correo_threads::build_threads;
 use gtk::{gio, glib};
 
+use crate::notice::{Notice, Tone};
 use crate::ui_style;
 
 /// Un hilo tal como se muestra: su último mensaje y el resumen del conjunto.
@@ -95,6 +96,9 @@ impl Selection {
 
 type SelectFn = dyn Fn(Selection);
 
+/// Callback de «Reintentar», compartido con los botones del aviso y de la página de error.
+type RetrySlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
 /// Estado compartido entre la lista y los cierres de sus filas y señales.
 struct Shared {
     rows: RefCell<Vec<ThreadRow>>,
@@ -105,9 +109,33 @@ struct Shared {
     last: Cell<SelKey>,
 }
 
+/// Estado de carga de la carpeta (o carpetas) que muestra la lista.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LoadState {
+    /// Sincronizada: una lista vacía significa «todo al día».
+    #[default]
+    Idle,
+    /// Se está sincronizando por primera vez o refrescando.
+    Loading,
+    /// La última sincronización falló, con el motivo.
+    Failed(String),
+}
+
+/// Texto de «Cargando» accesible, también usado por el esqueleto.
+const LOADING_LABEL: &str = "Cargando mensajes…";
+
 pub struct MessageList {
+    root: gtk::Box,
     stack: gtk::Stack,
     empty: adw::StatusPage,
+    /// Barra fina indeterminada sobre el borde superior mientras se sincroniza.
+    progress: gtk::Box,
+    /// Aviso con «Reintentar» cuando falla la sincronización y hay filas en caché.
+    failed_banner: Notice,
+    failed_page: adw::StatusPage,
+    retry: RetrySlot,
+    load: RefCell<LoadState>,
+    has_query: Cell<bool>,
     scroller: gtk::ScrolledWindow,
     view: gtk::ListView,
     store: gio::ListStore,
@@ -231,9 +259,36 @@ impl MessageList {
         empty.set_title("Todo al día");
         empty.set_description(Some("No hay mensajes en esta carpeta."));
 
+        let failed_page = adw::StatusPage::new();
+        failed_page.set_icon_name(Some("network-error-symbolic"));
+        failed_page.add_css_class("correo-empty");
+        failed_page.add_css_class("correo-error");
+        failed_page.add_css_class("compact");
+        failed_page.set_title("No se pudo cargar la carpeta");
+        let retry: RetrySlot = Rc::default();
+        let retry_btn = gtk::Button::with_label("Reintentar");
+        retry_btn.add_css_class("pill");
+        retry_btn.set_halign(gtk::Align::Center);
+        failed_page.set_child(Some(&retry_btn));
+        let failed_banner = Notice::new("dialog-warning-symbolic", Tone::Error, false);
+        failed_banner.set_title("No se pudo actualizar la carpeta");
+        failed_banner.set_compact();
+        failed_banner.set_button_label(Some("Reintentar"));
+        let on_retry: Rc<dyn Fn()> = {
+            let retry = retry.clone();
+            Rc::new(move || fire_retry(&retry))
+        };
+        {
+            let f = on_retry.clone();
+            retry_btn.connect_clicked(move |_| f());
+        }
+        failed_banner.connect_button_clicked(move || on_retry());
+
         let stack = gtk::Stack::new();
         stack.add_named(&scroller, Some("list"));
         stack.add_named(&empty, Some("empty"));
+        stack.add_named(&loading_page(), Some("loading"));
+        stack.add_named(&failed_page, Some("failed"));
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
         stack.set_transition_duration(160);
         stack.set_visible_child_name("empty");
@@ -256,9 +311,32 @@ impl MessageList {
             });
         }
 
+        // Barra indeterminada solo con CSS (un bloque que se desliza): sin temporizadores y
+        // la animación se detiene sola cuando el widget no se ve.
+        let progress = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        progress.add_css_class("correo-loading-bar");
+        progress.set_valign(gtk::Align::Start);
+        progress.set_visible(false);
+        progress.set_can_target(false);
+        progress.set_accessible_role(gtk::AccessibleRole::Presentation);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&stack));
+        overlay.add_overlay(&progress);
+        overlay.set_vexpand(true);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(failed_banner.widget());
+        root.append(&overlay);
+
         Self {
+            root,
             stack,
             empty,
+            progress,
+            failed_banner,
+            failed_page,
+            retry,
+            load: RefCell::new(LoadState::Idle),
+            has_query: Cell::new(false),
             scroller,
             view,
             store,
@@ -270,7 +348,57 @@ impl MessageList {
     }
 
     pub fn widget(&self) -> &gtk::Widget {
-        self.stack.upcast_ref()
+        self.root.upcast_ref()
+    }
+
+    /// Se invoca al pulsar «Reintentar» tras un fallo de sincronización.
+    pub fn connect_retry(&self, f: impl Fn() + 'static) {
+        *self.retry.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Estado de sincronización de lo que se muestra: barra fina mientras carga, esqueleto
+    /// si además no hay filas, y aviso o página de error si falló.
+    pub fn set_load_state(&self, state: LoadState) {
+        if *self.load.borrow() == state {
+            return;
+        }
+        *self.load.borrow_mut() = state;
+        self.update_page();
+    }
+
+    /// Elige qué página muestra la pila según las filas, la búsqueda y el estado de carga.
+    fn update_page(&self) {
+        let has_rows = !self.shared.rows.borrow().is_empty();
+        // Una búsqueda local no depende de la sincronización: su vacío es «sin resultados».
+        let state = if self.has_query.get() {
+            LoadState::Idle
+        } else {
+            self.load.borrow().clone()
+        };
+        let page = match (&state, has_rows) {
+            (_, true) => "list",
+            (LoadState::Loading, false) => "loading",
+            (LoadState::Failed(_), false) => "failed",
+            (LoadState::Idle, false) => "empty",
+        };
+        self.stack.set_visible_child_name(page);
+
+        let loading = matches!(*self.load.borrow(), LoadState::Loading);
+        self.progress.set_visible(loading);
+        // Sin animaciones del sistema, una barra fija y tenue en lugar del bloque deslizante.
+        if adw::is_animations_enabled(&self.progress) {
+            self.progress.remove_css_class("correo-static");
+        } else {
+            self.progress.add_css_class("correo-static");
+        }
+        match &state {
+            LoadState::Failed(reason) => {
+                self.failed_page.set_description(Some(reason));
+                self.failed_banner.set_detail(Some(reason));
+                self.failed_banner.set_revealed(has_rows);
+            }
+            _ => self.failed_banner.set_revealed(false),
+        }
     }
 
     /// Desplazamiento vertical de la lista, para la carga bajo demanda.
@@ -280,6 +408,7 @@ impl MessageList {
 
     /// Texto del estado vacío: con una búsqueda activa se indica que no hay coincidencias.
     pub fn set_empty_for_query(&self, query: &str) {
+        self.has_query.set(!query.is_empty());
         if query.is_empty() {
             self.empty.set_icon_name(Some("mail-read-symbolic"));
             self.empty.set_title("Todo al día");
@@ -449,8 +578,7 @@ impl MessageList {
         }
         self.shared.updating.set(false);
 
-        self.stack
-            .set_visible_child_name(if rows.is_empty() { "empty" } else { "list" });
+        self.update_page();
 
         let state = selection_state(&self.selection, &self.shared.rows.borrow());
         if state.key() != prev_key {
@@ -458,6 +586,62 @@ impl MessageList {
             (self.on_select)(state);
         }
     }
+}
+
+fn fire_retry(retry: &RetrySlot) {
+    let callback = retry.borrow().clone();
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+/// Esqueleto de filas de la lista mientras una carpeta se carga por primera vez.
+fn loading_page() -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.add_css_class("correo-list-skeleton");
+    page.set_accessible_role(gtk::AccessibleRole::Group);
+    page.update_property(&[gtk::accessible::Property::Label(LOADING_LABEL)]);
+    let caption = gtk::Label::new(Some(LOADING_LABEL));
+    caption.add_css_class("caption");
+    caption.add_css_class("dim-label");
+    caption.set_xalign(0.0);
+    caption.set_margin_start(18);
+    caption.set_margin_top(14);
+    caption.set_margin_bottom(6);
+    page.append(&caption);
+    // Anchos variados para que no parezca una rejilla; cada fila algo más tenue.
+    let widths = [
+        (150, 230),
+        (120, 190),
+        (170, 250),
+        (110, 210),
+        (140, 170),
+        (160, 240),
+    ];
+    for (i, (name, text)) in widths.iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("correo-skeleton-row");
+        row.set_opacity(1.0 - i as f64 * 0.13);
+        let avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        avatar.add_css_class("correo-skeleton");
+        avatar.add_css_class("correo-skeleton-circle");
+        avatar.set_size_request(40, 40);
+        avatar.set_valign(gtk::Align::Start);
+        let lines = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        lines.set_hexpand(true);
+        for (w, h) in [(*name, 12), (*text, 10)] {
+            let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            bar.add_css_class("correo-skeleton");
+            bar.set_size_request(w, h);
+            bar.set_halign(gtk::Align::Start);
+            lines.append(&bar);
+        }
+        row.append(&avatar);
+        row.append(&lines);
+        page.append(&row);
+    }
+    page.set_valign(gtk::Align::Start);
+    page
 }
 
 fn selection_state(selection: &gtk::MultiSelection, rows: &[ThreadRow]) -> Selection {

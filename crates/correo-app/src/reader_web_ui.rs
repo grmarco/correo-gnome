@@ -68,10 +68,12 @@ pub fn show(inner: &Rc<Inner>, html: &str) -> Result<(), String> {
 
     if truncated {
         inner.banner.set_title(TRUNCATED_WEB);
+        inner.banner.set_icon("dialog-information-symbolic");
         inner.banner.set_button_label(None);
         inner.banner.set_revealed(true);
     } else {
         inner.banner.set_title(BANNER_NORMAL);
+        inner.banner.set_icon("view-conceal-symbolic");
         inner.banner.set_button_label(Some(BANNER_BUTTON));
         inner.banner.set_revealed(images > 0);
     }
@@ -237,6 +239,7 @@ fn fall_back(inner: &Rc<Inner>, reason: &str) {
 
 pub fn show_fallback_notice(inner: &Inner) {
     inner.banner.set_title(FALLBACK_NOTICE);
+    inner.banner.set_icon("dialog-information-symbolic");
     inner.banner.set_button_label(None);
     inner.banner.set_revealed(true);
 }

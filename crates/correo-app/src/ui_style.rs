@@ -10,6 +10,37 @@ const STYLE: &str = include_str!("../../../data/style.css");
 /// Número de tonos de la paleta de avatares (`correo-acct-1..8`).
 const TONES: usize = 8;
 
+/// Iconos simbólicos propios, incrustados (nombre de fichero, contenido). También se
+/// instalan en `hicolor` con `make install`.
+const ICONS: &[(&str, &str)] = &[(
+    "correo-archive-symbolic.svg",
+    include_str!("../../../data/icons/hicolor/scalable/actions/correo-archive-symbolic.svg"),
+)];
+
+/// Registra los iconos propios: los vuelca en `$XDG_CACHE_HOME/correo/icons/hicolor/...`
+/// (solo si cambian) y añade esa carpeta a las rutas de búsqueda del tema de iconos.
+pub fn install_icons() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let base = glib::user_cache_dir().join("correo").join("icons");
+    let dir = base.join("hicolor").join("scalable").join("actions");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("correo: no se pudo crear la carpeta de iconos: {e}");
+        return;
+    }
+    for (name, svg) in ICONS {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).is_ok_and(|current| current == *svg) {
+            continue;
+        }
+        if let Err(e) = std::fs::write(&path, svg) {
+            eprintln!("correo: no se pudo escribir el icono {name}: {e}");
+        }
+    }
+    gtk::IconTheme::for_display(&display).add_search_path(&base);
+}
+
 /// Carga la hoja de estilos para toda la aplicación. Se llama una vez, en `startup`.
 pub fn load_css() {
     let Some(display) = gtk::gdk::Display::default() else {

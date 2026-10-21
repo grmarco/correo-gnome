@@ -31,3 +31,17 @@ Tema oscuro: `ADW_DEBUG_COLOR_SCHEME=prefer-dark`. El menú «Más» alterna «V
 Comprobar que el correo hostil no hace red: `python3 -m http.server 8099 --bind 127.0.0.1` en otra terminal, abrir ese correo (y pulsar «Cargar imágenes remotas»); el registro del servidor debe quedar vacío. Al pulsar el enlace `https://paypal.com` debe aparecer el diálogo «¿Abrir este enlace?». Procesos auxiliares: `ps -o pid,rss,comm --ppid $(pgrep -x correo-app)`; el proceso web desaparece unos 30 s después de dejar de ver HTML.
 
 Tests puros: `cargo test -p correo-app sanitize` (saneado, CSP, heurística), `policy` (navegación) y `config`.
+
+## Pruebas de interfaz sin servidor (solo depuración)
+
+Con `CORREO_DEMO=1` la app usa un `MailBackend` falso (`demo_backend.rs`) y datos ficticios:
+
+| Variable | Efecto |
+|---|---|
+| `CORREO_DEMO_SYNC=loading` | las carpetas se quedan «cargando» (barra fina; esqueleto si no hay caché, p. ej. «Proyectos») |
+| `CORREO_DEMO_SYNC=failed` | las carpetas fallan a los 1,2 s (aviso o página de error con «Reintentar») |
+| `CORREO_DEMO_SAVE_DIR=<dir>` | «Guardar» un adjunto no abre el diálogo: guarda en ese directorio |
+| `CORREO_DEMO_NO_LAUNCH=1` | «Abrir» un adjunto no lanza nada y mantiene «Abriendo…» 4 s |
+
+Los mensajes «Presupuesto del trimestre» con clip (p. ej. el de Ana Ruiz) traen cuatro adjuntos de prueba: uno que termina
+(~4 s), uno que se detiene al 40 % hasta cancelarlo, uno que falla al 60 % y un `.sh` que pide confirmación antes de descargar.

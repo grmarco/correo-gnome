@@ -62,6 +62,18 @@ inner() {
         click:98:155 wait:1 click:98:555 wait:1 click:90:75 wait:1
     run cuenta-con-cliente CORREO_GOOGLE_CLIENT_ID=prueba.apps.googleusercontent.com \
         click:28:27 wait:1 click:590:350 wait:3 key:Escape wait:1
+    # Adjuntos del demo: descarga y cancelación, error, confirmación de un .sh, menú «Responder»,
+    # y la barra de acciones compacta.
+    run adjuntos "" \
+        click:400:490 wait:1 click:887:32 wait:1 key:Escape \
+        click:1125:258 wait:2 click:1125:258 wait:1 \
+        click:1125:313 wait:3 click:1125:313 wait:3 \
+        click:1125:368 wait:1 key:Escape wait:1 \
+        click:1125:207 wait:1 click:1125:207 wait:1 \
+        resize:560:700 wait:1 click:413:32 wait:1 key:Escape wait:1 resize:1180:760 wait:1
+    # Estado de carga de las carpetas: cargando (barra y esqueleto) y con error (reintentar).
+    run carga CORREO_DEMO_SYNC=loading click:95:223 wait:1 click:95:155 wait:1 click:28:27 wait:1 key:Escape
+    run fallo CORREO_DEMO_SYNC=failed click:95:223 wait:3 click:425:511 wait:3 click:95:155 wait:2
     run vacio CORREO_DEMO_EMPTY=1 \
         click:589:534 wait:1 key:Escape wait:1 click:589:534 wait:1 key:Escape wait:1
 }

@@ -119,7 +119,8 @@ Solo iconos simbólicos de Adwaita (`*-symbolic`), tamaño 16 (por defecto), 12 
 | Etiqueta/subcarpeta | `tag-symbolic` |
 | Responder / a todos / reenviar | `mail-reply-sender-symbolic`, `mail-reply-all-symbolic`, `mail-forward-symbolic` |
 | Marcar no leído / leído | `mail-unread-symbolic` / `mail-read-symbolic` |
-| Adjunto | `mail-attachment-symbolic` |
+| Adjunto | por tipo: `x-office-document-symbolic`, `x-office-spreadsheet-symbolic`, `package-x-generic-symbolic`, `image-x-generic-symbolic`…; por defecto `mail-attachment-symbolic` |
+| Archivar | `correo-archive-symbolic` (propio) |
 | Sincronizar | `view-refresh-symbolic` |
 | Buscar | `system-search-symbolic` (SearchEntry lo trae) |
 | Añadir cuenta | `list-add-symbolic`; cuenta: `avatar-default-symbolic` |
@@ -171,7 +172,12 @@ Fila (`gtk::Box` horizontal, `correo-thread-row`, clase `correo-unread` si `unre
 - **Cabeceras de grupo** («Hoy», «Ayer», «Esta semana», «Más antiguos»): `gtk::ListHeaderFactory` en `ListView` con `GtkSectionModel` (`gtk::SortListModel` con `Sorter`/`set_section_sorter`) y `correo-group-header`. Alto impacto, riesgo medio (requiere modelo seccionado); es fase 3.
 - Hilo con varios no leídos: el contador del sidebar se actualiza con una transición de opacidad corta (140ms).
 - Carga de más páginas: fila final con `adw::Spinner` (1.6+) de 16px, centrada.
-- Esqueletos: al cambiar de carpeta sin datos en caché se muestran 6 filas con `correo-skeleton` (avatar circular + 3 barras de anchos 40/70/55 %) en un `gtk::Stack` («skeleton» → «list»), con transición `Crossfade` 160ms.
+- **Estado de carga de la carpeta** (`LoadState` en `message_list.rs`, alimentado por `load_status.rs` con los avisos `SyncNotice::MailboxSyncing` / `MailboxSynced` de `correo-sync`): la lista es un `gtk::Stack` con cuatro páginas, `list` / `empty` / `loading` / `failed`, y el vacío («Todo al día») solo aparece cuando la carpeta está sincronizada y de verdad vacía.
+  - Sincronizando con filas en caché: la lista se ve normal y una barra fina indeterminada (2px, `correo-loading-bar`: un degradado de acento que se desliza con una animación CSS, sin temporizadores; fija y tenue sin animaciones) recorre el borde superior, en una `gtk::Overlay` (no mueve las filas). El icono de sincronizar de la cabecera gira (`correo-syncing`).
+  - Sincronizando sin caché: página `loading` con la leyenda «Cargando mensajes…» (`caption`) y 6 filas esqueleto (`correo-skeleton`: avatar circular de 40px + dos barras, cada fila algo más tenue; mismo pulso de opacidad que el lector) en lugar de «Todo al día».
+  - Fallo: con filas en caché, aviso `Notice` de error («No se pudo actualizar la carpeta» + «Reintentar»; el motivo va en el tooltip) sobre la lista; sin caché, `StatusPage` compacta (`network-error-symbolic`, motivo, `Reintentar` `pill`). «Reintentar» vuelve a pedir la carpeta al sincronizador.
+  - Una búsqueda local ignora el estado de carga (su vacío es «Sin resultados»). Una cuenta recién añadida cuenta como «cargando» hasta el primer informe de su bandeja.
+  - Pruebas sin servidor (solo depuración): `CORREO_DEMO_SYNC=loading` deja todas las carpetas cargando; `CORREO_DEMO_SYNC=failed` las hace fallar tras 1,2 s (y «Reintentar» vuelve a fallar).
 
 ### 6.4 Lector (`reader.rs`)
 
@@ -187,11 +193,34 @@ Asunto del mensaje (correo-reader-subject, wrap)
 ```
 
 - Línea de remitente con `adw::Avatar` 48px + nombre (`correo-reader-from`) + email y «para ti / para n más» en `correo-reader-meta`. Los campos Para/Cc/Cco completos se muestran plegados detrás de un botón «Detalles» (`gtk::Revealer` con `SlideDown` 200ms) para quitar ruido.
-- **Acciones agrupadas** en la `HeaderBar` (no bajo el asunto): `box.linked` con `correo-actions`: Responder (`mail-reply-sender-symbolic`), Responder a todos (`mail-reply-all-symbolic`), Reenviar (`mail-forward-symbolic`); separado: Archivar (`mail-archive-symbolic`), Borrar (`user-trash-symbolic`, clase `correo-danger`), y un `MenuButton` «Más» con «Marcar como no leído» y «Vista completa» / «Vista ligera». Atajos en tooltips (`Responder (R)`, `Borrar (Supr)`). Con ventana estrecha solo se muestran Responder, Archivar y Borrar; el resto va al menú.
-- Adjuntos: en lugar de `boxed-list`, `adw::WrapBox` (1.7) con tarjetas `correo-attachment` (icono de tipo en cuadro tintado 36px, nombre en `heading`, tamaño en `caption` tabular, botones «Guardar»/«Abrir» planos que aparecen con hover).
+- **Barra de acciones** en la `HeaderBar` (clase `correo-actions`), con jerarquía por peso visual y sin cajas ni bordes de más:
+  `[ ↩ Responder | ⌄ ]  ·  [ archivar ] [ borrar ] [ ⋮ ]`
+  - **Responder**: `adw::SplitButton` con icono (`mail-reply-sender-symbolic`) y texto «Responder». El botón principal responde; el menú desplegable (`gio::Menu` sobre el grupo de acciones `reader.*`) ofrece «Responder a todos» y «Reenviar». No hay atajos de teclado para estas acciones en la app (solo existen Ctrl+N/R/E/U/F, Ctrl+Supr), así que no se muestran. El botón y la flecha tienen etiqueta accesible propia («Responder», «Más opciones de respuesta») y tooltip.
+  - Un separador sutil (`correo-actions-sep`, 1px al 16 % de `currentColor`) separa las respuestas de las acciones sobre el mensaje.
+  - **Archivar** y **Borrar**: botones `flat` solo de icono, sin fondo fijo. Archivar usa un icono propio (`correo-archive-symbolic`, ver abajo); Borrar usa `user-trash-symbolic` y solo en hover/foco toma el matiz destructivo (`correo-danger`: fondo `destructive_bg_color` al 16 % y texto `destructive_color`). Tooltips con atajo: «Archivar (Ctrl+E)», «Borrar (Ctrl+Supr)». Foco visible: el anillo de libadwaita.
+  - **Más** (⋮): menú intacto: «Marcar como no leído» y «Vista ligera/completa».
+  - **Adaptativo** (≤ 560sp, `MessageView::set_compact` desde el breakpoint de la ventana): «Responder» queda solo con el icono (`adw::ButtonContent` con `label` vacío), y archivar, borrar y el separador desaparecen de la cabecera; «Archivar» y «Borrar» pasan al principio del menú «Más» (con separador; borrar con matiz destructivo al señalarlo).
+  - **Iconos propios**: el tema puede no traer `mail-archive-symbolic` (solo Yaru lo trae; con Adwaita el botón se veía como un cuadrado pálido). `data/icons/hicolor/scalable/actions/correo-archive-symbolic.svg` es un SVG de 16×16 al estilo Adwaita (formas rellenas, trazo de ~1,5px, un solo color `#2e3436` que GTK recolorea). Va incrustado en el binario (`ui_style::install_icons` lo vuelca en `$XDG_CACHE_HOME/correo/icons` y añade esa ruta al tema) y `make install` lo instala en `hicolor/scalable/actions`. Ojo: va en `scalable/actions` y no en `symbolic/actions` porque el `index.theme` de hicolor solo declara `symbolic/apps`.
+- **Adjuntos** (`reader_attach.rs`): `boxed-list` de filas propias (`correo-attach-row`) con icono de tipo en cuadro tintado de 36px, nombre en negrita media (elipsis central), subtítulo tabular de 0,86rem y acciones a la derecha. Cada fila tiene estados con su propia página de acciones y una barra de progreso de 3px superpuesta al borde inferior (`gtk::Overlay`, no cambia la altura):
+
+  | Estado | Subtítulo | Acciones |
+  |---|---|---|
+  | Reposo | `tipo · 12 MB` | Guardar, Abrir (iconos planos) |
+  | Descargando | `3,2 MB de 12 MB · 27 %` (o `Descargando · 3,2 MB` si no hay total: barra indeterminada) | ✕ «Cancelar la descarga» |
+  | Cancelando | `Cancelando…` (la cancelación se atiende entre trozos) | ✕ |
+  | Abriendo | `Abriendo…` (0,9 s) con barra completa | `adw::Spinner` |
+  | Guardado | `Guardado en <carpeta>` | ✓ + «Mostrar en carpeta» |
+  | Cancelado | `Descarga cancelada` | Guardar, Abrir |
+  | Error | motivo en `error_color` (+ tooltip) y icono en tono de error | «Reintentar» (repite Abrir, o Guardar al mismo destino) |
+
+  - El progreso real va en bytes codificados; se reescala al tamaño decodificado del adjunto (`shown_progress`) para que las cifras sean coherentes con la que ya muestra la fila. Texto y barra se refrescan a 10 Hz desde un contador atómico (la tarea de red no toca la interfaz); la barra se anima 140 ms entre lecturas con `adw::TimedAnimation` solo si `adw::is_animations_enabled`.
+  - Varias descargas a la vez: cada adjunto tiene su estado en un registro de `Inner` (por carpeta/uid/índice); cambiar de mensaje no las interrumpe y la fila retoma su estado al volver. Un «Abrir» terminado con otro mensaje a la vista no lanza el fichero (queda en caché).
+  - «Abrir» reutiliza el fichero temporal de esta sesión si sigue existiendo (y es un fichero normal, no un enlace). Las extensiones peligrosas piden confirmación **antes** de descargar (y antes de reutilizar). «Guardar» baja a un fichero privado y copia al destino al terminar, así un fallo o una cancelación no dejan a medias el fichero del usuario. Se mantiene la carpeta privada 0700, los ficheros 0600 con `O_NOFOLLOW` y los nombres saneados.
+  - Cerrar el diálogo del portal (`Dismissed`/`Cancelled`) no es un error: se olvida la copia temporal y la fila vuelve a reposo.
+  - Pruebas sin servidor (solo depuración, `demo_backend.rs`): el modo demo usa un `MailBackend` falso con descargas simuladas: `Presupuesto-T4.pdf` baja a ~4 MB/s y termina, `Fotos-fin-de-semana.zip` se detiene al 40 % hasta que se cancela, `Balance-2026.xlsx` falla al 60 %, `instalar.sh` pide confirmación. `CORREO_DEMO_SAVE_DIR=<dir>` salta el diálogo de guardar y `CORREO_DEMO_NO_LAUNCH=1` no lanza el fichero y mantiene «Abriendo…» 4 s.
 - Cuerpo: `correo-reader-body`, 1.04rem, interlineado 1.55, selección de texto permitida. Enlaces con el acento del sistema (`link`).
 - **Citas plegables**: el texto citado (`>`) se agrupa en un bloque; por defecto plegado tras un botón-píldora «···» (`correo-quote-toggle`) y al pulsar se despliega con `gtk::Revealer` (`SlideDown`, 200ms, `ease-out`); la cita desplegada usa `correo-quote` (barra izquierda de acento tenue, opacidad 0.8). Con `gtk::TextView`, se implementa con una `gtk::TextChildAnchor` que aloja el botón y una etiqueta de texto oculta/visible mediante `gtk::TextTag` `invisible`; la animación es el fundido del `Revealer` en un `TextChildAnchor`; si resulta compleja, solo conmutar la etiqueta `invisible` (sin animación) en la primera iteración.
-- Banner de privacidad (imágenes remotas): `adw::Banner` actual, con botón «Cargar imágenes»; se muestra con la animación propia de `Banner` (revealer).
+- **Avisos en línea** (`notice.rs`, sustituyen a `adw::Banner`): tarjeta suave (`correo-notice`, radio 12, fondo `currentColor` al 6 %) dentro del ancho de lectura (margen de 24px, como el resto del lector), con icono (`view-conceal-symbolic` para imágenes bloqueadas; `dialog-information-symbolic` para recortes y avisos de vista), texto de 0,92rem, botón de acción en píldora plana con tinte de acento («Cargar imágenes remotas») y ✕ «Descartar» (solo hasta el siguiente mensaje). Se revela con un `gtk::Revealer` `SlideDown` de 180ms (0 sin animaciones). Variante de error (`correo-notice-error`, tinte de `error_bg_color`) y compacta (`correo-notice-compact`) para el aviso de la lista.
 - Estado «Selecciona un mensaje»: ver §6.7.
 
 #### Vista completa de mensajes HTML (WebKit, `reader_web*.rs`)
@@ -265,7 +294,9 @@ Todas derivan de dos primitivas baratas: transiciones/keyframes CSS (cuyos tiemp
 | Plegado de citas | altura del bloque | 200ms | ease-out | `gtk::Revealer(SlideDown/SlideUp)` |
 | Esqueletos | pulso de opacidad 0.45→1 | 900ms alternate | ease-in-out | `.correo-skeleton`; solo mientras `stack == skeleton` |
 | Barra de formato (estado `checked`) | color de fondo | 120ms | ease-out | CSS `transition` |
-| Banner / aviso de red | revelado | ~250ms | nativa | `adw::Banner::set_revealed` |
+| Avisos en línea (`Notice`) | revelado | 180ms | nativa | `gtk::Revealer` `SlideDown` (0 sin animaciones) |
+| Progreso de adjunto | fracción de la barra | 140ms | ease-out cubic | `adw::TimedAnimation` entre lecturas a 10 Hz |
+| Carga de carpeta | barra indeterminada | 1,3 s, continua | ease-in-out | `@keyframes correo-slide` sobre `background-position`; solo mientras sincroniza |
 | Hover de botones, chips, tarjetas | color de fondo | 120ms | ease-out | CSS `transition` |
 
 Reglas: no animar más de dos propiedades a la vez; nada de animaciones con `width/height` o `margin` en listas largas; no animar durante un `splice` completo (por ejemplo al cambiar de carpeta): usar solo el fundido del `Stack`.
@@ -277,7 +308,7 @@ Reglas: no animar más de dos propiedades a la vez; nada de animaciones con `wid
 | > 1000 | 3 paneles | Sidebar, lista, lector visibles. Lector con `Clamp` 760. |
 | 720-1000 | 2 paneles | `inner.collapsed = true`: la lista ocupa el hueco del lector; al elegir hilo se navega a «Mensaje» con botón de volver. La barra lateral sigue fija (`outer` no colapsado). |
 | < 720 | 1 panel | `outer.collapsed = true` y `inner.collapsed = true`; jerarquía Carpetas → Mensajes → Mensaje con botón atrás en cada cabecera. |
-| < 560 | compacto | Setters de breakpoint: ocultar extracto en la fila; `Redactar` solo con icono; acciones del lector reducidas a Responder/Archivar/Borrar + menú; márgenes del lector 16. |
+| < 560 | compacto | Setters de breakpoint: ocultar extracto en la fila; `Redactar` solo con icono; «Responder» solo con icono y Archivar/Borrar dentro del menú «Más»; márgenes del lector 16. |
 
 Breakpoints (se mantienen los actuales y se añade `max-width: 560sp` con setters sobre `add_setter(&widget, "visible"/"css-classes"/…)`; para clases, un único `adw::Breakpoint` + `connect_apply`/`connect_unapply` que añade/quita `correo-compact` en la ventana y el CSS usa `window.correo-compact .correo-snippet { … }`.) Altura baja (< 500px): `ToolbarView` con `top-bar-style: raised` sin cambios.
 
@@ -371,12 +402,13 @@ Pendiente (marcados [B] o fuera del riesgo asumido), como TODO:
 
 - TODO: cabeceras de grupo por fecha en la lista (`ListHeaderFactory` + modelo seccionado).
 - TODO: citas plegables en el lector (`TextTag` `invisible` + `TextChildAnchor` con botón `correo-quote-toggle`).
-- TODO: adjuntos del lector como tarjetas en `adw::WrapBox` (hoy: `boxed-list` con icono y botones con etiqueta accesible).
+- Hecho: adjuntos del lector con estados, progreso y cancelación (ver §6.4); en lugar de `adw::WrapBox` se mantiene la `boxed-list`, que escala mejor con nombres largos.
+- Hecho: barra de acciones del lector rediseñada (`adw::SplitButton` + planos), avisos en línea (`notice.rs`), icono propio de archivar y estado de carga de carpetas (esqueleto, barra fina, error con «Reintentar»; ver §6.3).
 - TODO: estado `checked` de la barra de formato sincronizado con el cursor.
 - TODO: selector De con avatar (factory de `DropDown`), diálogo de alta de cuenta con `NavigationView`, redactor como `adw::Dialog`.
 - TODO: toasts con «Deshacer» al archivar/borrar (requiere mover de vuelta en el servidor), banner de red, `adw::ShortcutsDialog`.
 - Hecho: cuentas plegables en la barra lateral (`Revealer` 200 ms, cabecera enfocable con Enter/Espacio/flechas, insignia de no leídos al plegar, «Plegar/Desplegar todas» en el menú, estado en `ui-state.json` vía `ui_state.rs`).
 - TODO: entrada animada de filas nuevas de la lista (las filas se reciclan; se necesita marcar ids nuevos).
 - TODO: modo compacto real de la lista (ocultar extracto a <= 560sp): GTK CSS no tiene `display: none`; requiere una propiedad en la fila o un `connect_apply` que recorra las filas.
-- Los iconos `mail-inbox-symbolic` y `mail-archive-symbolic` se piden con `ui_style::icon_or` y caen a `mail-unread-symbolic` / `folder-symbolic` si el tema no los trae.
+- El icono `mail-inbox-symbolic` se pide con `ui_style::icon_or` y cae a `mail-unread-symbolic` si el tema no lo trae. El de archivar ya no depende del tema (icono propio `correo-archive-symbolic`).
 - Nota de avatares: el color de `adw::Avatar` vive en un nodo `avatar` hijo, por lo que las reglas son `.correo-avatar.correo-acct-N avatar`.

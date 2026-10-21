@@ -292,13 +292,26 @@ listview.correo-thread-list > row:focus-visible {
 .correo-reader-meta { font-size: 0.86rem; opacity: 0.68; }
 .correo-reader-date { font-size: 0.82rem; opacity: 0.62; font-feature-settings: "tnum"; }
 
-/* Acciones del mensaje (en la cabecera de la ventana) */
-box.correo-actions > button { min-height: 32px; min-width: 34px; }
-button.correo-danger:hover {
-  background: alpha(@destructive_bg_color, 0.18);
+/* Acciones del mensaje (en la cabecera de la ventana): «Responder» como botón dividido,
+ * archivar y borrar planos y solo de icono, y un separador sutil entre grupos. */
+box.correo-actions > button.flat,
+box.correo-actions > menubutton.flat > button { min-height: 32px; min-width: 34px; }
+box.correo-actions > splitbutton.correo-reply { margin-right: 2px; }
+.correo-actions-sep {
+  min-width: 1px;
+  min-height: 0;
+  margin: 9px 6px;
+  background: alpha(currentColor, 0.16);
+}
+/* Borrar: sin matiz en reposo; el destructivo solo aparece al señalar o enfocar. */
+button.correo-danger { transition: background-color 120ms ease-out, color 120ms ease-out; }
+button.correo-danger:hover,
+button.correo-danger:focus-visible {
+  background: alpha(@destructive_bg_color, 0.16);
   color: @destructive_color;
 }
-button.correo-danger:focus-visible { color: @destructive_color; }
+button.correo-danger:active { background: alpha(@destructive_bg_color, 0.26); }
+button.correo-danger-item:hover { color: @destructive_color; }
 
 /* Cuerpo del mensaje: ancho de lectura cómodo y tipografía algo mayor */
 .correo-reader-body {
@@ -334,25 +347,92 @@ textview.correo-reader-body, textview.correo-reader-body text { background: tran
   opacity: 0.8;
 }
 
-/* Tarjeta de adjunto (en el lector) */
-.correo-attachment {
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: @card_bg_color;
-  box-shadow: 0 0 0 1px alpha(currentColor, 0.08);
-  transition: background-color 120ms ease-out;
-}
-.correo-attachment:hover { background: color-mix(in srgb, currentColor 6%, @card_bg_color); }
-.correo-attachment .correo-attachment-icon {
+/* Adjuntos del lector: fila con icono, nombre, estado y acciones; una barra fina de
+ * progreso en el borde inferior de la fila mientras se descarga. */
+.correo-attach-row { padding: 0; }
+.correo-attach-line { padding: 9px 8px 9px 12px; }
+.correo-attach-tile {
   min-width: 36px;
   min-height: 36px;
   border-radius: 9px;
-  background: color-mix(in srgb, @accent_bg_color 16%, transparent);
+  background: color-mix(in srgb, @accent_bg_color 14%, transparent);
   color: @accent_color;
 }
+.correo-attach-title { font-weight: 600; }
+.correo-attach-sub { font-size: 0.86rem; opacity: 0.68; }
+.correo-attach-sub.error { color: @error_color; opacity: 1; }
+.correo-attach-failed .correo-attach-tile {
+  background: color-mix(in srgb, @error_bg_color 14%, transparent);
+  color: @error_color;
+}
+.correo-attach-ok { color: @success_color; }
+button.correo-attach-action {
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 99px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+button.correo-attach-retry { color: @accent_color; }
+progressbar.correo-attach-bar { min-height: 0; margin: 0; padding: 0; }
+progressbar.correo-attach-bar > trough { min-height: 3px; background: alpha(currentColor, 0.08); border: none; border-radius: 0; }
+progressbar.correo-attach-bar > trough > progress { min-height: 3px; background: @accent_bg_color; border-radius: 0 3px 3px 0; }
 
-/* Aviso de imágenes remotas bloqueadas */
-banner.correo-privacy > revealer > widget { border-radius: 0; }
+/* Avisos en línea (imágenes bloqueadas, mensaje recortado, fallo de sincronización):
+ * una tarjeta suave dentro del ancho de lectura, no una franja a todo el ancho. */
+.correo-notice {
+  margin: 2px 24px 10px 24px;
+  padding: 5px 6px 5px 14px;
+  min-height: 38px;
+  border-radius: 12px;
+  background: alpha(currentColor, 0.06);
+}
+.correo-notice.correo-notice-compact { margin: 6px 8px 2px 8px; padding-left: 12px; }
+.correo-notice .correo-notice-icon { opacity: 0.6; }
+.correo-notice .correo-notice-text { font-size: 0.92rem; opacity: 0.85; }
+.correo-notice button.correo-notice-action {
+  min-height: 28px;
+  padding: 0 12px;
+  border-radius: 99px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: @accent_color;
+  background: color-mix(in srgb, @accent_bg_color 12%, transparent);
+}
+.correo-notice button.correo-notice-action:hover {
+  background: color-mix(in srgb, @accent_bg_color 22%, transparent);
+}
+.correo-notice button.correo-notice-close { min-width: 26px; min-height: 26px; padding: 0; opacity: 0.6; }
+.correo-notice button.correo-notice-close:hover { opacity: 1; }
+.correo-notice.correo-notice-error {
+  background: color-mix(in srgb, @error_bg_color 12%, transparent);
+}
+.correo-notice.correo-notice-error .correo-notice-icon { color: @error_color; opacity: 1; }
+.correo-notice.correo-notice-error button.correo-notice-action {
+  color: @error_color;
+  background: color-mix(in srgb, @error_bg_color 14%, transparent);
+}
+
+/* Lista de hilos en carga: barra fina indeterminada sobre el borde y esqueleto de filas. */
+.correo-loading-bar {
+  min-height: 2px;
+  background-image: linear-gradient(90deg, transparent, @accent_bg_color 50%, transparent);
+  background-repeat: no-repeat;
+  background-size: 40% 100%;
+  animation: correo-slide 1300ms ease-in-out infinite;
+}
+.correo-loading-bar.correo-static {
+  background-image: none;
+  background-color: alpha(@accent_bg_color, 0.45);
+  animation: none;
+}
+@keyframes correo-slide {
+  from { background-position: -80% 0; }
+  to   { background-position: 180% 0; }
+}
+.correo-list-skeleton { padding: 0 6px; }
+.correo-skeleton-row { padding: 10px 12px; }
+.correo-list-skeleton .correo-skeleton { background: alpha(currentColor, 0.13); }
 
 /* ---------------------------------------------------------------------------------------
  * Redactor

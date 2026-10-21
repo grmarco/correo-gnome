@@ -2,6 +2,8 @@
 //! Cabecera, barra de acciones, cuerpo (HTML saneado o texto plano) sin WebKit y adjuntos.
 //! Toda la red va por `services.spawn`; los resultados vuelven al hilo de GTK con `spawn_local`.
 
+#[path = "reader_attach.rs"]
+mod reader_attach;
 #[path = "reader_html.rs"]
 mod reader_html;
 #[cfg(feature = "webkit")]
@@ -42,6 +44,7 @@ use adw::prelude::*;
 use correo_core::{Account, Address, Flags, Mailbox, MailboxRole, MessageBody, MessageHeader};
 use gtk::{gio, glib};
 
+use crate::notice::{Notice, Tone};
 use crate::services::{flatten, Services};
 use crate::setup::config::HtmlRenderer;
 use crate::ui_style;
@@ -53,6 +56,8 @@ use reader_html::{
 
 type ComposeFn = Box<dyn Fn(ComposeMode)>;
 
+/// Icono propio de «Archivar» (el del tema no es fiable: en Yaru claro apenas se ve).
+const ARCHIVE_ICON: &str = "correo-archive-symbolic";
 const BANNER_NORMAL: &str = "Imágenes bloqueadas para proteger tu privacidad";
 /// Cuerpos mayores que esto se truncan: la conversión corre en el hilo de GTK.
 const BODY_LIMIT: usize = 200 * 1024;
@@ -118,15 +123,31 @@ struct Inner {
     to: gtk::Label,
     cc: gtk::Label,
     date: gtk::Label,
-    reply: gtk::Button,
-    reply_all: gtk::Button,
-    forward: gtk::Button,
+    /// «Responder» con menú desplegable («Responder a todos» y «Reenviar»).
+    reply: adw::SplitButton,
+    /// Contenido del botón principal: en ventana estrecha pierde el texto.
+    reply_content: adw::ButtonContent,
+    reply_all: gio::SimpleAction,
+    forward: gio::SimpleAction,
     archive: gtk::Button,
     delete: gtk::Button,
+    /// Separador entre responder y archivar/borrar.
+    actions_sep: gtk::Separator,
+    /// Archivar y borrar dentro del menú «Más» (solo en ventana estrecha).
+    archive_item: gtk::Button,
+    delete_item: gtk::Button,
+    /// Contenedor de archivar/borrar (y su separador) dentro del menú «Más».
+    compact_items: gtk::Box,
     mark_unread: gtk::Button,
-    banner: adw::Banner,
+    /// Ventana estrecha: archivar y borrar pasan al menú «Más».
+    compact: Cell<bool>,
+    banner: Notice,
     attachments_scroll: gtk::ScrolledWindow,
     attachments: gtk::ListBox,
+    /// Filas de adjuntos del mensaje mostrado (las posee `Inner`; los cierres usan `Weak`).
+    attachment_rows: RefCell<Vec<Rc<reader_attach::RowUi>>>,
+    /// Descargas de adjuntos (en curso o terminadas) de esta sesión, por adjunto.
+    transfers: RefCell<HashMap<reader_attach::AttKey, Rc<reader_attach::Transfer>>>,
     stack: gtk::Stack,
     text_view: gtk::TextView,
     error_page: adw::StatusPage,
@@ -206,21 +227,60 @@ impl MessageView {
         header_box.append(&sender_row);
         root.append(&header_box);
 
-        let reply = action_button("Responder", "mail-reply-sender-symbolic", "Responder");
-        let reply_all = action_button(
-            "Responder a todos",
-            "mail-reply-all-symbolic",
-            "Responder a todos",
-        );
-        let forward = action_button("Reenviar", "mail-forward-symbolic", "Reenviar");
-        let archive = action_button("Archivar", "mail-archive-symbolic", "Archivar (Ctrl+E)");
+        // Responder: botón dividido (principal = responder; menú = a todos / reenviar).
+        let reply_content = adw::ButtonContent::builder()
+            .icon_name("mail-reply-sender-symbolic")
+            .label("Responder")
+            .can_shrink(true)
+            .build();
+        let reply = adw::SplitButton::new();
+        reply.set_child(Some(&reply_content));
+        reply.set_tooltip_text(Some("Responder"));
+        reply.set_dropdown_tooltip("Responder a todos o reenviar");
+        reply.add_css_class("correo-reply");
+        label_split_parts(&reply);
+        let reply_all = gio::SimpleAction::new("reply-all", None);
+        let forward = gio::SimpleAction::new("forward", None);
+        let reply_menu = gio::Menu::new();
+        for (label, action) in [
+            ("Responder a todos", "reader.reply-all"),
+            ("Reenviar", "reader.forward"),
+        ] {
+            reply_menu.append(Some(label), Some(action));
+        }
+        reply.set_menu_model(Some(&reply_menu));
+        let reply_actions = gio::SimpleActionGroup::new();
+        reply_actions.add_action(&reply_all);
+        reply_actions.add_action(&forward);
+
+        let archive = action_button("Archivar", ARCHIVE_ICON, "Archivar (Ctrl+E)");
         let delete = action_button("Borrar", "user-trash-symbolic", "Borrar (Ctrl+Supr)");
+        for b in [&archive, &delete] {
+            b.add_css_class("flat");
+        }
         delete.add_css_class("correo-danger");
+        let actions_sep = gtk::Separator::new(gtk::Orientation::Vertical);
+        actions_sep.add_css_class("correo-actions-sep");
+
         // Acciones secundarias dentro de un menú «Más».
         let mark_unread = menu_item("Marcar como no leído");
+        let archive_item = menu_item("Archivar");
+        let delete_item = menu_item("Borrar");
+        delete_item.add_css_class("correo-danger-item");
+        let compact_items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        compact_items.append(&archive_item);
+        compact_items.append(&delete_item);
+        compact_items.append(&{
+            let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+            sep.set_margin_top(4);
+            sep.set_margin_bottom(4);
+            sep
+        });
+        compact_items.set_visible(false);
         #[cfg(feature = "webkit")]
         let toggle = menu_item(reader_web_ui::LABEL_FULL);
         let more_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        more_box.append(&compact_items);
         more_box.append(&mark_unread);
         #[cfg(feature = "webkit")]
         {
@@ -233,13 +293,18 @@ impl MessageView {
         let more = gtk::MenuButton::new();
         more.set_icon_name("view-more-symbolic");
         more.set_popover(Some(&more_popover));
+        more.add_css_class("flat");
         more.set_tooltip_text(Some("Más acciones"));
         more.update_property(&[gtk::accessible::Property::Label("Más acciones")]);
         {
             let popover = more_popover.clone();
             let buttons: Vec<gtk::Button> = {
                 #[allow(unused_mut)]
-                let mut v = vec![mark_unread.clone()];
+                let mut v = vec![
+                    mark_unread.clone(),
+                    archive_item.clone(),
+                    delete_item.clone(),
+                ];
                 #[cfg(feature = "webkit")]
                 v.push(toggle.clone());
                 v
@@ -249,23 +314,19 @@ impl MessageView {
                 b.connect_clicked(move |_| popover.popdown());
             }
         }
-        let reply_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        reply_group.add_css_class("linked");
-        for b in [&reply, &reply_all, &forward] {
-            reply_group.append(b);
-        }
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         actions.add_css_class("correo-actions");
         actions.set_visible(false);
-        actions.append(&reply_group);
+        actions.insert_action_group("reader", Some(&reply_actions));
+        actions.append(&reply);
+        actions.append(&actions_sep);
         actions.append(&archive);
         actions.append(&delete);
         actions.append(&more);
 
-        let banner = adw::Banner::new(BANNER_NORMAL);
-        banner.set_revealed(false);
-        banner.add_css_class("correo-privacy");
-        root.append(&banner);
+        let banner = Notice::new("view-conceal-symbolic", Tone::Info, true);
+        banner.set_title(BANNER_NORMAL);
+        root.append(banner.widget());
 
         let attachments = gtk::ListBox::new();
         attachments.add_css_class("boxed-list");
@@ -273,7 +334,7 @@ impl MessageView {
         attachments.set_selection_mode(gtk::SelectionMode::None);
         let attachments_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .max_content_height(180)
+            .max_content_height(260)
             .propagate_natural_height(true)
             .visible(false)
             .child(&attachments)
@@ -323,16 +384,12 @@ impl MessageView {
         stack.set_visible_child_name("empty");
         root.append(&stack);
 
-        for b in [
-            &reply,
-            &reply_all,
-            &forward,
-            &archive,
-            &delete,
-            &mark_unread,
-        ] {
+        for b in [&archive, &delete, &mark_unread, &archive_item, &delete_item] {
             b.set_sensitive(false);
         }
+        reply.set_sensitive(false);
+        reply_all.set_enabled(false);
+        forward.set_enabled(false);
         let error_detail = gtk::Label::new(None);
 
         let inner = Rc::new(Inner {
@@ -352,14 +409,22 @@ impl MessageView {
             cc,
             date,
             reply: reply.clone(),
+            reply_content,
             reply_all: reply_all.clone(),
             forward: forward.clone(),
             archive: archive.clone(),
             delete: delete.clone(),
+            actions_sep,
+            archive_item: archive_item.clone(),
+            delete_item: delete_item.clone(),
+            compact_items,
             mark_unread: mark_unread.clone(),
+            compact: Cell::new(false),
             banner,
             attachments_scroll,
             attachments,
+            attachment_rows: RefCell::new(Vec::new()),
+            transfers: RefCell::new(HashMap::new()),
             stack,
             text_view,
             error_page,
@@ -390,18 +455,25 @@ impl MessageView {
                 }
             });
             let weak = Rc::downgrade(&inner);
-            inner.banner.connect_button_clicked(move |_| {
+            inner.banner.connect_button_clicked(move || {
                 if let Some(inner) = weak.upgrade() {
                     reader_web_ui::allow_remote_images(&inner);
                 }
             });
         }
 
-        connect_compose_button(&inner, &reply, ComposeMode::Reply);
-        connect_compose_button(&inner, &reply_all, ComposeMode::ReplyAll);
-        connect_compose_button(&inner, &forward, ComposeMode::Forward);
+        {
+            let make = compose_handler(&inner, ComposeMode::Reply);
+            reply.connect_clicked(move |_| make());
+            let make = compose_handler(&inner, ComposeMode::ReplyAll);
+            reply_all.connect_activate(move |_, _| make());
+            let make = compose_handler(&inner, ComposeMode::Forward);
+            forward.connect_activate(move |_, _| make());
+        }
         connect_action_button(&inner, &archive, Action::Archive);
         connect_action_button(&inner, &delete, Action::Delete);
+        connect_action_button(&inner, &archive_item, Action::Archive);
+        connect_action_button(&inner, &delete_item, Action::Delete);
         connect_action_button(&inner, &mark_unread, Action::MarkUnread);
         connect_link_clicks(&inner);
         connect_link_tooltips(&inner);
@@ -450,6 +522,12 @@ impl MessageView {
 
     pub fn widget(&self) -> &gtk::Widget {
         &self.widget
+    }
+
+    /// Ventana estrecha: «Responder» queda solo con el icono y archivar/borrar pasan al
+    /// menú «Más».
+    pub fn set_compact(&self, compact: bool) {
+        apply_compact(&self.inner, compact);
     }
 
     /// Botones de acción del mensaje, para colocarlos en la cabecera de la ventana.
@@ -501,6 +579,34 @@ fn action_button(label: &str, icon: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
+fn apply_compact(inner: &Inner, compact: bool) {
+    inner.compact.set(compact);
+    inner
+        .reply_content
+        .set_label(if compact { "" } else { "Responder" });
+    for w in [
+        inner.archive.upcast_ref::<gtk::Widget>(),
+        inner.delete.upcast_ref(),
+        inner.actions_sep.upcast_ref(),
+    ] {
+        w.set_visible(!compact);
+    }
+    inner.compact_items.set_visible(compact);
+}
+
+/// Etiquetas accesibles de las dos mitades del botón dividido (libadwaita no las deriva
+/// del contenido cuando el botón queda solo con icono).
+fn label_split_parts(split: &adw::SplitButton) {
+    if let Some(main) = split.first_child().and_downcast::<gtk::Button>() {
+        main.update_property(&[gtk::accessible::Property::Label("Responder")]);
+    }
+    if let Some(arrow) = split.last_child().and_downcast::<gtk::MenuButton>() {
+        arrow.update_property(&[gtk::accessible::Property::Label(
+            "Más opciones de respuesta",
+        )]);
+    }
+}
+
 /// Entrada de texto de un menú emergente.
 fn menu_item(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
@@ -515,29 +621,29 @@ fn menu_item(label: &str) -> gtk::Button {
 fn skeleton() -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
     column.set_margin_top(8);
+    column.set_margin_start(24);
+    column.set_margin_end(24);
     column.set_valign(gtk::Align::Start);
     column.set_accessible_role(gtk::AccessibleRole::Presentation);
-    for width in [-1, 520, -1, 440, 300] {
+    // Cada barra ocupa todo el ancho menos un margen a la derecha: sin anchos fijos, para no
+    // imponer un ancho mínimo a la ventana.
+    for trailing in [0, 90, 0, 170, 280] {
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         bar.add_css_class("correo-skeleton");
-        bar.set_size_request(width.max(0), 14);
-        bar.set_halign(if width < 0 {
-            gtk::Align::Fill
-        } else {
-            gtk::Align::Start
-        });
+        bar.set_size_request(-1, 14);
+        bar.set_margin_end(trailing);
         column.append(&bar);
     }
     column
 }
 
-fn connect_compose_button(
+/// Cierre que abre el redactor con el mensaje mostrado (si ya tiene cuerpo).
+fn compose_handler(
     inner: &Rc<Inner>,
-    button: &gtk::Button,
     make: fn(MessageHeader, MessageBody) -> ComposeMode,
-) {
+) -> impl Fn() + 'static {
     let weak = Rc::downgrade(inner);
-    button.connect_clicked(move |_| {
+    move || {
         let Some(inner) = weak.upgrade() else { return };
         let cur = inner.current.borrow().clone();
         let (Some(header), Some(body)) = (cur.header, cur.body) else {
@@ -547,7 +653,7 @@ fn connect_compose_button(
         if let Some(f) = compose.as_ref() {
             f(make(header, body));
         }
-    });
+    }
 }
 
 fn connect_action_button(inner: &Rc<Inner>, button: &gtk::Button, action: Action) {
@@ -907,12 +1013,18 @@ fn show_error(inner: &Rc<Inner>, detail: &str) {
 }
 
 fn set_actions_enabled(inner: &Inner, message: bool, body: bool) {
-    for b in [&inner.archive, &inner.delete, &inner.mark_unread] {
+    for b in [
+        &inner.archive,
+        &inner.delete,
+        &inner.mark_unread,
+        &inner.archive_item,
+        &inner.delete_item,
+    ] {
         b.set_sensitive(message);
     }
-    for b in [&inner.reply, &inner.reply_all, &inner.forward] {
-        b.set_sensitive(body);
-    }
+    inner.reply.set_sensitive(body);
+    inner.reply_all.set_enabled(body);
+    inner.forward.set_enabled(body);
 }
 
 fn set_header_labels(inner: &Inner, header: &MessageHeader) {
@@ -1030,9 +1142,11 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
         },
     };
     inner.banner.set_title(BANNER_NORMAL);
+    inner.banner.set_icon("view-conceal-symbolic");
     inner.banner.set_button_label(None);
     if truncated {
         inner.banner.set_title(TRUNCATED_NOTICE);
+        inner.banner.set_icon("dialog-information-symbolic");
         inner.banner.set_revealed(true);
     } else {
         inner.banner.set_revealed(remote_images > 0);
@@ -1068,73 +1182,6 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     populate_attachments(inner, body);
 }
 
-fn clear_attachments(inner: &Inner) {
-    while let Some(child) = inner.attachments.first_child() {
-        inner.attachments.remove(&child);
-    }
-    inner.attachments_scroll.set_visible(false);
-}
-
-fn populate_attachments(inner: &Rc<Inner>, body: &MessageBody) {
-    clear_attachments(inner);
-    if body.attachments.is_empty() {
-        return;
-    }
-    let cur = inner.current.borrow().clone();
-    let (Some(account), Some(mailbox), Some(header)) = (cur.account, cur.mailbox, cur.header)
-    else {
-        return;
-    };
-    for (index, att) in body.attachments.iter().enumerate() {
-        let row = adw::ActionRow::builder()
-            .title(glib::markup_escape_text(&att.filename).as_str())
-            .subtitle(glib::markup_escape_text(&format!(
-                "{} · {}",
-                att.mime_type,
-                human_size(att.size)
-            )))
-            .build();
-        row.add_prefix(&{
-            let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
-            icon.add_css_class("dim-label");
-            icon
-        });
-        let save = gtk::Button::from_icon_name("document-save-symbolic");
-        save.set_tooltip_text(Some("Guardar"));
-        save.update_property(&[gtk::accessible::Property::Label("Guardar adjunto")]);
-        save.set_valign(gtk::Align::Center);
-        save.add_css_class("flat");
-        let open = gtk::Button::from_icon_name("document-open-symbolic");
-        open.set_tooltip_text(Some("Abrir"));
-        open.update_property(&[gtk::accessible::Property::Label("Abrir adjunto")]);
-        open.set_valign(gtk::Align::Center);
-        open.add_css_class("flat");
-
-        let target = AttachmentRef {
-            account: account.clone(),
-            mailbox: mailbox.clone(),
-            uid: header.uid,
-            index,
-            filename: att.filename.clone(),
-        };
-        let weak = Rc::downgrade(inner);
-        let t = target.clone();
-        save.connect_clicked(move |btn| {
-            let Some(inner) = weak.upgrade() else { return };
-            save_attachment(&inner, btn, t.clone());
-        });
-        let weak = Rc::downgrade(inner);
-        open.connect_clicked(move |btn| {
-            let Some(inner) = weak.upgrade() else { return };
-            open_attachment(&inner, btn, target.clone());
-        });
-        row.add_suffix(&save);
-        row.add_suffix(&open);
-        inner.attachments.append(&row);
-    }
-    inner.attachments_scroll.set_visible(true);
-}
-
 #[derive(Clone)]
 struct AttachmentRef {
     account: Account,
@@ -1144,92 +1191,7 @@ struct AttachmentRef {
     filename: String,
 }
 
-fn save_attachment(inner: &Rc<Inner>, btn: &gtk::Button, att: AttachmentRef) {
-    let parent = btn.root().and_then(|r| r.downcast::<gtk::Window>().ok());
-    let dialog = gtk::FileDialog::new();
-    dialog.set_initial_name(Some(&safe_file_name(&att.filename)));
-    let weak = Rc::downgrade(inner);
-    dialog.save(parent.as_ref(), None::<&gio::Cancellable>, move |res| {
-        // Cancelar el diálogo devuelve error: no es un fallo.
-        let Ok(file) = res else { return };
-        let Some(path) = file.path() else {
-            if let Some(inner) = weak.upgrade() {
-                alert(
-                    &inner.root,
-                    "No se puede guardar",
-                    "La ruta elegida no es válida.",
-                );
-            }
-            return;
-        };
-        let Some(inner) = weak.upgrade() else { return };
-        download_to(&inner, att, path);
-    });
-}
-
-/// Abre el adjunto desde una carpeta privada por apertura. Los tipos que pueden ejecutar
-/// código o cargar contenido activo piden confirmación antes.
-fn open_attachment(inner: &Rc<Inner>, _btn: &gtk::Button, att: AttachmentRef) {
-    let name = safe_file_name(&att.filename);
-    let risky = is_risky_extension(&name);
-    let weak = Rc::downgrade(inner);
-    fetch_attachment_to(
-        inner,
-        att,
-        move |bytes| {
-            write_private_attachment(&attachments_dir(), &name, &bytes).map_err(|e| e.to_string())
-        },
-        move |result| {
-            let Some(inner) = weak.upgrade() else { return };
-            match result {
-                Ok(path) if risky => confirm_open(&inner.root, path),
-                Ok(path) => launch_file(&inner.root, &path),
-                Err(e) => alert(&inner.root, "No se pudo descargar el adjunto", &e),
-            }
-        },
-    );
-}
-
-/// Pregunta antes de abrir un adjunto de tipo activo o ejecutable.
-fn confirm_open(widget: &gtk::Box, path: PathBuf) {
-    let dialog = adw::AlertDialog::new(
-        Some("¿Abrir este archivo?"),
-        Some("Puede ejecutar código o cargar contenido activo. Ábrelo solo si confías en el remitente."),
-    );
-    dialog.add_response("cancel", "Cancelar");
-    dialog.add_response("open", "Abrir");
-    dialog.set_response_appearance("open", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-    let target = widget.clone();
-    dialog.connect_response(None, move |_, response| {
-        if response == "open" {
-            launch_file(&target, &path);
-        }
-    });
-    dialog.present(Some(widget));
-}
-
-fn launch_file(widget: &impl IsA<gtk::Widget>, path: &Path) {
-    let parent = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok());
-    gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
-        parent.as_ref(),
-        None::<&gio::Cancellable>,
-        {
-            let path = path.to_path_buf();
-            move |res| {
-                if let Err(e) = res {
-                    // Cerrar el diálogo del portal es una cancelación, no un fallo.
-                    if !launch_error_is_cancel(&e) {
-                        eprintln!("no se pudo abrir el adjunto: {e}");
-                    }
-                    // Nadie ha abierto el fichero: se borra la copia temporal.
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        },
-    );
-}
+use reader_attach::{clear as clear_attachments, populate as populate_attachments};
 
 /// `true` si el error de un lanzador/diálogo de GTK es que el usuario lo cerró o canceló.
 fn launch_error_is_cancel(e: &glib::Error) -> bool {
@@ -1238,56 +1200,16 @@ fn launch_error_is_cancel(e: &glib::Error) -> bool {
         || e.matches(gio::IOErrorEnum::Cancelled)
 }
 
-/// Descarga el adjunto en `dest` (solo guardar; errores en un diálogo).
-fn download_to(inner: &Rc<Inner>, att: AttachmentRef, dest: PathBuf) {
-    let weak = Rc::downgrade(inner);
-    fetch_attachment_to(
-        inner,
-        att,
-        move |bytes| std::fs::write(&dest, bytes).map_err(|e| e.to_string()),
-        move |result| {
-            if let (Err(e), Some(inner)) = (result, weak.upgrade()) {
-                alert(&inner.root, "No se pudo guardar el adjunto", &e);
-            }
-        },
-    );
-}
-
-/// Pide los bytes al backend y los entrega a `write` fuera del hilo de GTK; `on_done` se
-/// ejecuta en el hilo de GTK con el resultado.
-fn fetch_attachment_to<T: Send + 'static>(
-    inner: &Rc<Inner>,
-    att: AttachmentRef,
-    write: impl FnOnce(Vec<u8>) -> Result<T, String> + Send + 'static,
-    on_done: impl FnOnce(Result<T, String>) + 'static,
-) {
-    let backend = inner.services.backend(&att.account);
-    let handle = inner.services.spawn(async move {
-        let bytes = backend
-            .fetch_attachment(&att.mailbox, att.uid, att.index)
-            .await
-            .map_err(|e| e.to_string())?;
-        write(bytes)
-    });
-    glib::MainContext::default().spawn_local(async move {
-        on_done(match handle.await {
-            Ok(done) => done,
-            Err(e) => Err(e.to_string()),
-        });
-    });
-}
-
 /// Carpeta de los adjuntos abiertos: `$XDG_RUNTIME_DIR/correo-adjuntos` (o la equivalente de
 /// GLib). Es del usuario y de uso temporal.
 fn attachments_dir() -> PathBuf {
     glib::user_runtime_dir().join(ATTACHMENTS_DIR)
 }
 
-/// Escribe el adjunto en un subdirectorio nuevo y aleatorio de `base` (0700), con el fichero
-/// creado en exclusiva con modo 0600 y sin seguir enlaces simbólicos. Si el nombre ya existe
-/// en ese subdirectorio, añade un sufijo `(n)`.
-fn write_private_attachment(base: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    use std::io::Write;
+/// Crea un fichero vacío en un subdirectorio nuevo y aleatorio de `base` (0700), en
+/// exclusiva, con modo 0600 y sin seguir enlaces simbólicos. Si el nombre ya existe en ese
+/// subdirectorio, añade un sufijo `(n)`. Devuelve su ruta.
+fn create_private_file(base: &Path, name: &str) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
     std::fs::DirBuilder::new()
@@ -1308,14 +1230,19 @@ fn write_private_attachment(base: &Path, name: &str, bytes: &[u8]) -> std::io::R
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path);
         match opened {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                return Ok(path);
-            }
+            Ok(_) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Crea el fichero privado (ver `create_private_file`) y escribe `bytes` en él.
+#[cfg(test)]
+fn write_private_attachment(base: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = create_private_file(base, name)?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 /// Nombre para el intento `n` (1 = el original): `informe (2).pdf`, `archivo (2)`.
@@ -1336,6 +1263,9 @@ fn cleanup_attachments() {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        for t in self.transfers.borrow().values() {
+            t.cancel_all();
+        }
         cleanup_attachments();
     }
 }
@@ -1385,16 +1315,6 @@ fn safe_file_name(name: &str) -> String {
         "adjunto".into()
     } else {
         cleaned.to_string()
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    if bytes < 1_000 {
-        format!("{bytes} B")
-    } else if bytes < 1_000_000 {
-        format!("{:.1} KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
     }
 }
 
@@ -1629,12 +1549,5 @@ mod tests {
         assert!(cut.len() <= BODY_LIMIT);
         assert!(text.starts_with(cut));
         assert_eq!(limit_body("corto"), ("corto", false));
-    }
-
-    #[test]
-    fn human_size_units() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1_500), "1.5 KB");
-        assert_eq!(human_size(2_500_000), "2.5 MB");
     }
 }

@@ -37,6 +37,17 @@ struct Running {
     task: JoinHandle<()>,
 }
 
+/// Estado de sincronización de una carpeta, según los avisos del runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MailboxSync {
+    Syncing,
+    /// Terminada; `Some(motivo)` si no se pudo completar.
+    Done(Option<String>),
+}
+
+/// Callback con el estado de una carpeta (cuenta, carpeta, estado).
+pub type OnMailbox = Rc<dyn Fn(Account, MailboxId, MailboxSync)>;
+
 type Senders = Rc<RefCell<HashMap<AccountId, Running>>>;
 
 /// Control de la sincronización desde la interfaz. Mantenlo vivo mientras la app
@@ -45,6 +56,7 @@ pub struct SyncHandle {
     services: Rc<Services>,
     on_new: Rc<dyn Fn(Account, Vec<MessageId>)>,
     on_auth: Rc<dyn Fn(Account)>,
+    on_mailbox: OnMailbox,
     senders: Senders,
     power: Rc<PowerWatcher>,
     _resume: Option<ResumeWatch>,
@@ -57,8 +69,11 @@ impl SyncHandle {
     }
 
     /// Una carpeta se ha abierto: se sincroniza ya si no es la bandeja de entrada.
-    pub fn mailbox_opened(&self, account: AccountId, mailbox: MailboxId) {
+    /// Devuelve `false` si la cuenta aún no tiene runner (no habrá avisos de estado).
+    pub fn mailbox_opened(&self, account: AccountId, mailbox: MailboxId) -> bool {
+        let running = self.senders.borrow().contains_key(&account);
         self.send(account, Event::MailboxOpened(mailbox));
+        running
     }
 
     /// La cuenta se ha vuelto a autorizar: reanuda su runner, o lo arranca si nunca llegó
@@ -85,6 +100,7 @@ impl SyncHandle {
         let senders = Rc::clone(&self.senders);
         let on_new = Rc::clone(&self.on_new);
         let on_auth = Rc::clone(&self.on_auth);
+        let on_mailbox = Rc::clone(&self.on_mailbox);
         let power = Rc::clone(&self.power);
         let services = Rc::clone(&self.services);
         glib::MainContext::default().spawn_local(async move {
@@ -106,6 +122,7 @@ impl SyncHandle {
                         &senders,
                         &on_new,
                         &on_auth,
+                        &on_mailbox,
                         power.conditions(),
                     )
                 }
@@ -144,6 +161,7 @@ pub fn start_sync(
     app: &adw::Application,
     on_new: impl Fn(Account, Vec<MessageId>) + 'static,
     on_auth_required: impl Fn(Account) + 'static,
+    on_mailbox: impl Fn(Account, MailboxId, MailboxSync) + 'static,
 ) -> SyncHandle {
     if super::app_config().run_in_background {
         // Modo residente: el guard vive lo que la app. Se olvida a propósito para que
@@ -174,6 +192,7 @@ pub fn start_sync(
         services: Rc::clone(&services),
         on_new: Rc::new(on_new),
         on_auth: Rc::new(on_auth_required),
+        on_mailbox: Rc::new(on_mailbox),
         senders,
         power: Rc::new(power),
         _resume: resume,
@@ -195,6 +214,7 @@ fn attach(
     senders: &Senders,
     on_new: &Rc<dyn Fn(Account, Vec<MessageId>)>,
     on_auth: &Rc<dyn Fn(Account)>,
+    on_mailbox: &OnMailbox,
     conditions: correo_sync::Conditions,
 ) {
     let SyncChannels {
@@ -213,6 +233,7 @@ fn attach(
 
     let on_new = Rc::clone(on_new);
     let on_auth = Rc::clone(on_auth);
+    let on_mailbox = Rc::clone(on_mailbox);
     glib::MainContext::default().spawn_local(async move {
         while let Some(notice) = reports.recv().await {
             match notice {
@@ -220,6 +241,12 @@ fn attach(
                     on_new(account.clone(), new_messages)
                 }
                 SyncNotice::AuthRequired { .. } => on_auth(account.clone()),
+                SyncNotice::MailboxSyncing { mailbox, .. } => {
+                    on_mailbox(account.clone(), mailbox, MailboxSync::Syncing)
+                }
+                SyncNotice::MailboxSynced { mailbox, error, .. } => {
+                    on_mailbox(account.clone(), mailbox, MailboxSync::Done(error))
+                }
             }
         }
     });

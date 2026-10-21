@@ -13,7 +13,7 @@ pub mod config;
 pub mod power;
 
 pub use account_dialog::{add_account_dialog, AddOutcome};
-pub use background::{start_sync, SyncHandle};
+pub use background::{start_sync, MailboxSync, SyncHandle};
 
 use std::error::Error as StdError;
 use std::path::PathBuf;
