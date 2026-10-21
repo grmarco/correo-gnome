@@ -1,32 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Generado por scripts/recolor-logo.py (base #2b7a52). Licencia CC0-1.0. -->
   <defs>
     <linearGradient id="papel" x1="0" y1="16" x2="0" y2="84" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#ffffff"/>
       <stop offset="1" stop-color="#f6f5f4"/>
     </linearGradient>
     <linearGradient id="fondo-sobre" x1="0" y1="40" x2="0" y2="84" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#613583"/>
-      <stop offset="1" stop-color="#3d3846"/>
+      <stop offset="0" stop-color="#145538"/>
+      <stop offset="1" stop-color="#233229"/>
     </linearGradient>
     <linearGradient id="frente" x1="0" y1="44" x2="0" y2="104" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#c061cb"/>
-      <stop offset="1" stop-color="#9141ac"/>
+      <stop offset="0" stop-color="#4c996a"/>
+      <stop offset="1" stop-color="#2b7a52"/>
     </linearGradient>
     <clipPath id="silueta">
       <rect x="8" y="40" width="112" height="64" rx="12"/>
     </clipPath>
   </defs>
-  <rect id="grosor" x="8" y="44" width="112" height="68" rx="12" fill="#613583"/>
+  <rect id="grosor" x="8" y="44" width="112" height="68" rx="12" fill="#145538"/>
   <rect id="interior" x="8" y="40" width="112" height="64" rx="12" fill="url(#fondo-sobre)"/>
   <g id="carta" transform="rotate(-6 64 56)">
     <rect x="25" y="14" width="78" height="72" rx="6" fill="url(#papel)"/>
-    <rect x="35" y="26" width="34" height="6" rx="3" fill="#c061cb"/>
+    <rect x="35" y="26" width="34" height="6" rx="3" fill="#4c996a"/>
     <rect x="35" y="39" width="56" height="4" rx="2" fill="#deddda"/>
     <rect x="35" y="48" width="46" height="4" rx="2" fill="#deddda"/>
   </g>
   <g clip-path="url(#silueta)">
-    <path id="sombra-solapa" d="M8 42 C27 56 45 78 70 78 C94 78 109 60 120 40" fill="none" stroke="#241f31" stroke-width="6" opacity="0.08"/>
+    <path id="sombra-solapa" d="M8 42 C27 56 45 78 70 78 C94 78 109 60 120 40" fill="none" stroke="#131d17" stroke-width="6" opacity="0.1"/>
     <path id="bolsillo" d="M8 46 C27 60 45 82 70 82 C94 82 109 64 120 44 V112 H8 Z" fill="url(#frente)"/>
-    <path id="brillo" d="M8 46 C27 60 45 82 70 82 C94 82 109 64 120 44" fill="none" stroke="#dc8add" stroke-width="2"/>
+    <path id="brillo" d="M8 46 C27 60 45 82 70 82 C94 82 109 64 120 44" fill="none" stroke="#81bb91" stroke-width="2"/>
   </g>
 </svg>
