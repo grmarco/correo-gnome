@@ -361,7 +361,8 @@ Pendiente (marcados [B] o fuera del riesgo asumido), como TODO:
 - TODO: estado `checked` de la barra de formato sincronizado con el cursor.
 - TODO: selector De con avatar (factory de `DropDown`), diálogo de alta de cuenta con `NavigationView`, redactor como `adw::Dialog`.
 - TODO: toasts con «Deshacer» al archivar/borrar (requiere mover de vuelta en el servidor), banner de red, `adw::ShortcutsDialog`.
-- TODO: cuentas plegables en la barra lateral; entrada animada de filas nuevas de la lista (las filas se reciclan; se necesita marcar ids nuevos).
+- Hecho: cuentas plegables en la barra lateral (`Revealer` 200 ms, cabecera enfocable con Enter/Espacio/flechas, insignia de no leídos al plegar, «Plegar/Desplegar todas» en el menú, estado en `ui-state.json` vía `ui_state.rs`).
+- TODO: entrada animada de filas nuevas de la lista (las filas se reciclan; se necesita marcar ids nuevos).
 - TODO: modo compacto real de la lista (ocultar extracto a <= 560sp): GTK CSS no tiene `display: none`; requiere una propiedad en la fila o un `connect_apply` que recorra las filas.
 - Los iconos `mail-inbox-symbolic` y `mail-archive-symbolic` se piden con `ui_style::icon_or` y caen a `mail-unread-symbolic` / `folder-symbolic` si el tema no los trae.
 - Nota de avatares: el color de `adw::Avatar` vive en un nodo `avatar` hijo, por lo que las reglas son `.correo-avatar.correo-acct-N avatar`.

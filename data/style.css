@@ -77,9 +77,10 @@
 /* ---------------------------------------------------------------------------------------
  * Barra lateral
  * ------------------------------------------------------------------------------------- */
+.correo-sidebar-box { padding: 6px 6px 12px 6px; }
 list.correo-sidebar {
   background: transparent;
-  padding: 6px 6px 12px 6px;
+  padding: 0;
 }
 list.correo-sidebar > row {
   margin: 1px 0;
@@ -87,12 +88,6 @@ list.correo-sidebar > row {
   border-radius: 8px;
   transition: background-color 120ms ease-out;
 }
-list.correo-sidebar > row.correo-account-header {
-  min-height: 0;
-  margin-top: 10px;
-  background: none;
-}
-list.correo-sidebar > row.correo-account-header:hover { background: none; }
 list.correo-sidebar > row:selected {
   background: color-mix(in srgb, @accent_bg_color 16%, transparent);
   color: @window_fg_color;
@@ -102,13 +97,30 @@ list.correo-sidebar > row:selected:hover {
   background: color-mix(in srgb, @accent_bg_color 22%, transparent);
 }
 
+/* Cabecera de cuenta plegable: enfocable, con chevron animado e insignia al plegar. */
+.correo-account-section { margin-top: 10px; }
+.correo-account-section:first-child { margin-top: 0; }
+.correo-account-header {
+  margin: 1px 0;
+  padding: 4px 2px 4px 8px;
+  border-radius: 8px;
+  transition: background-color 120ms ease-out;
+}
+.correo-account-toggle { padding: 0 0 0 0; min-height: 0; border-radius: 8px; }
+.correo-account-header label.heading { font-size: 0.92rem; }
+.correo-account-header .correo-chevron {
+  margin: 0 6px 0 2px;
+  opacity: 0.65;
+  transition: transform 200ms ease-out;
+}
+.correo-account-header .correo-chevron.correo-collapsed { transform: rotate(-90deg); }
+.correo-account-header:hover .correo-chevron { opacity: 1; }
+
 /* Botón de opciones de la cuenta: aparece al pasar el ratón o al enfocar. */
 button.correo-account-more { opacity: 0; margin: 0; transition: opacity 120ms ease-out; min-width: 26px; min-height: 26px; }
-row.correo-account-header:hover button.correo-account-more,
+.correo-account-header:hover button.correo-account-more,
 button.correo-account-more:focus-visible,
 button.correo-account-more:checked { opacity: 1; }
-row.correo-account-header label.heading { font-size: 0.92rem; }
-row.correo-account-header { padding-top: 2px; padding-bottom: 2px; }
 
 /* Contador de no leídos: píldora discreta; solo la bandeja de entrada usa acento. */
 .correo-badge {

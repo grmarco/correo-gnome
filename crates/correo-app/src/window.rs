@@ -593,6 +593,12 @@ impl Shell {
     // ----- Listado ---------------------------------------------------------
 
     fn set_target(self: &Rc<Self>, target: Target) {
+        // Una carpeta de una cuenta plegada la despliega (notificaciones, bandejas).
+        if let Target::Mailbox(id) = target {
+            if let Some(mailbox) = self.mailbox(id) {
+                self.sidebar.expand_account(mailbox.account_id);
+            }
+        }
         if self.state.borrow().target == target {
             return;
         }

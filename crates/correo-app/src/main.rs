@@ -6,6 +6,7 @@ mod search;
 mod services;
 mod setup;
 mod sidebar;
+mod ui_state;
 mod ui_style;
 mod ui_types;
 mod window;
