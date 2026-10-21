@@ -2,6 +2,7 @@
 //! carpetas, sincronización de cabeceras por ventana de días y acciones
 //! (leído, mover, borrar), todo volcado a la caché de `correo-store`.
 
+pub mod attach;
 mod backend;
 mod conn;
 mod parse;

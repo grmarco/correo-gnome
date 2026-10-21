@@ -14,9 +14,46 @@ pub const ENV_GOOGLE_CLIENT_SECRET: &str = "CORREO_GOOGLE_CLIENT_SECRET";
 pub const ENV_MICROSOFT_CLIENT_SECRET: &str = "CORREO_MICROSOFT_CLIENT_SECRET";
 pub const ENV_MICROSOFT_TENANT: &str = "CORREO_MICROSOFT_TENANT";
 
+pub const ENV_HTML_RENDERER: &str = "CORREO_HTML_RENDERER";
+
+/// Renderizador de los mensajes con HTML. Sin la feature `webkit` siempre se usa el ligero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HtmlRenderer {
+    /// WebKit para todo mensaje con HTML (los de texto plano usan siempre el visor ligero).
+    #[default]
+    Webkit,
+    /// Visor ligero (ammonia + TextView).
+    Light,
+    /// WebKit solo si el HTML tiene tablas, imágenes, estilos u otros elementos de maquetación.
+    Auto,
+}
+
+impl HtmlRenderer {
+    /// Analiza `webkit`, `light` o `auto` (sin distinguir mayúsculas).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "webkit" => Some(Self::Webkit),
+            "light" => Some(Self::Light),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// Un valor desconocido en el fichero no invalida el resto de la configuración.
+impl<'de> Deserialize<'de> for HtmlRenderer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Ok(Self::parse(&text).unwrap_or_default())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
+    /// `"webkit"` (por defecto), `"light"` o `"auto"`. Ver `HtmlRenderer`.
+    #[cfg_attr(not(feature = "webkit"), allow(dead_code))]
+    pub html_renderer: HtmlRenderer,
     /// Días de cabeceras a sincronizar al crear una cuenta.
     pub sync_days: u32,
     /// Modo residente: la app sigue activa (con notificaciones) sin ventanas abiertas.
@@ -56,6 +93,7 @@ impl Default for Config {
         Self {
             sync_days: DEFAULT_SYNC_DAYS,
             run_in_background: false,
+            html_renderer: HtmlRenderer::default(),
             google: ProviderConfig::default(),
             microsoft: ProviderConfig::default(),
         }
@@ -71,6 +109,9 @@ impl Config {
     /// Aplica las variables de entorno sobre los valores del fichero. `var` es el
     /// lector de entorno (inyectable en tests). Un valor vacío se ignora.
     pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) {
+        if let Some(mode) = var(ENV_HTML_RENDERER).and_then(|v| HtmlRenderer::parse(&v)) {
+            self.html_renderer = mode;
+        }
         if let Some(id) = var(ENV_GOOGLE_CLIENT_ID).filter(|v| !v.trim().is_empty()) {
             self.google.client_id = Some(id.trim().to_owned());
         }
@@ -230,6 +271,32 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(!shown.contains("supersecreto"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn html_renderer_defaults_to_webkit_and_parses_values() {
+        assert_eq!(Config::default().html_renderer, HtmlRenderer::Webkit);
+        for (text, mode) in [
+            ("light", HtmlRenderer::Light),
+            ("auto", HtmlRenderer::Auto),
+            ("WebKit", HtmlRenderer::Webkit),
+        ] {
+            let config = Config::parse(&format!("html_renderer = \"{text}\"")).unwrap();
+            assert_eq!(config.html_renderer, mode);
+        }
+        // Un valor desconocido cae al valor por defecto sin romper el fichero.
+        let config = Config::parse("html_renderer = \"raro\"\nsync_days = 3").unwrap();
+        assert_eq!(config.html_renderer, HtmlRenderer::Webkit);
+        assert_eq!(config.sync_days, 3);
+    }
+
+    #[test]
+    fn env_overrides_html_renderer_and_ignores_garbage() {
+        let mut config = Config::parse("html_renderer = \"auto\"").unwrap();
+        config.apply_env(|n| (n == ENV_HTML_RENDERER).then(|| " Light ".to_owned()));
+        assert_eq!(config.html_renderer, HtmlRenderer::Light);
+        config.apply_env(|n| (n == ENV_HTML_RENDERER).then(|| "nada".to_owned()));
+        assert_eq!(config.html_renderer, HtmlRenderer::Light);
     }
 
     #[test]

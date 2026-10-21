@@ -10,6 +10,28 @@ mod reader_web;
 #[cfg(any(feature = "webkit", test))]
 #[path = "reader_web_policy.rs"]
 mod reader_web_policy;
+#[cfg(any(feature = "webkit", test))]
+#[path = "reader_web_sanitize.rs"]
+mod reader_web_sanitize;
+#[cfg(feature = "webkit")]
+#[path = "reader_web_ui.rs"]
+mod reader_web_ui;
+
+/// Sin la feature `webkit` el lector solo tiene el visor ligero: estas funciones no hacen nada.
+#[cfg(not(feature = "webkit"))]
+mod reader_web_ui {
+    use std::rc::Rc;
+
+    use super::Inner;
+
+    pub fn should_use(_inner: &Inner, _html: &str) -> bool {
+        false
+    }
+    pub fn show(_inner: &Rc<Inner>, _html: &str) -> Result<(), String> {
+        Err("compilado sin WebKit".into())
+    }
+    pub fn release(_inner: &Rc<Inner>) {}
+}
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -21,6 +43,7 @@ use correo_core::{Account, Address, Flags, Mailbox, MailboxRole, MessageBody, Me
 use gtk::{gio, glib};
 
 use crate::services::{flatten, Services};
+use crate::setup::config::HtmlRenderer;
 use crate::ui_style;
 use crate::ui_types::ComposeMode;
 use reader_html::{
@@ -34,7 +57,7 @@ const BANNER_NORMAL: &str = "Imágenes bloqueadas para proteger tu privacidad";
 /// Cuerpos mayores que esto se truncan: la conversión corre en el hilo de GTK.
 const BODY_LIMIT: usize = 200 * 1024;
 #[cfg(feature = "webkit")]
-const TRUNCATED_NOTICE: &str = "Mensaje truncado, usa Ver original";
+const TRUNCATED_NOTICE: &str = "Mensaje truncado, usa la vista completa";
 #[cfg(not(feature = "webkit"))]
 const TRUNCATED_NOTICE: &str = "Mensaje truncado: no se muestra el contenido completo";
 /// Longitud máxima (en caracteres) de un nombre de adjunto al guardarlo.
@@ -48,8 +71,6 @@ const RISKY_EXTENSIONS: &[&str] = &[
     "py", "pl", "rb", "php", "appimage", "run", "bin", "deb", "rpm", "flatpak", "dll", "so",
     "docm", "xlsm", "pptm", "dotm", "xltm", "ppsm",
 ];
-#[cfg(feature = "webkit")]
-const ORIGINAL_LABEL: &str = "Ver original";
 
 /// Mensaje mostrado actualmente.
 #[derive(Clone, Default)]
@@ -110,12 +131,30 @@ struct Inner {
     text_view: gtk::TextView,
     error_page: adw::StatusPage,
     error_detail: gtk::Label,
-    /// Alterna entre el texto y la vista original (solo con la feature `webkit`).
+    /// Renderizador configurado para los mensajes con HTML.
+    #[cfg_attr(not(feature = "webkit"), allow(dead_code))]
+    renderer: HtmlRenderer,
+    /// Alterna entre la vista ligera y la completa (solo con la feature `webkit`).
     #[cfg(feature = "webkit")]
-    original: gtk::Button,
-    /// Vista original existente; `None` salvo mientras está visible.
+    toggle: gtk::Button,
+    /// WebView compartido por los mensajes con HTML; `None` hasta el primero y tras el reposo.
     #[cfg(feature = "webkit")]
-    web: RefCell<Option<reader_web::OriginalView>>,
+    web: RefCell<Option<reader_web::HtmlView>>,
+    /// Temporizador de un solo disparo que destruye el WebView sin uso.
+    #[cfg(feature = "webkit")]
+    web_idle: RefCell<Option<glib::SourceId>>,
+    /// Última elección del usuario en la sesión: `Some(true)` = vista completa.
+    #[cfg(feature = "webkit")]
+    web_pref: Cell<Option<bool>>,
+    /// WebKit falló en esta sesión: solo vista ligera.
+    #[cfg(feature = "webkit")]
+    web_failed: Cell<bool>,
+    /// El mensaje actual se muestra en el WebView.
+    #[cfg(feature = "webkit")]
+    web_active: Cell<bool>,
+    /// Token de la última carga pedida al WebView.
+    #[cfg(feature = "webkit")]
+    web_token: Cell<u64>,
 }
 
 pub struct MessageView {
@@ -180,13 +219,13 @@ impl MessageView {
         // Acciones secundarias dentro de un menú «Más».
         let mark_unread = menu_item("Marcar como no leído");
         #[cfg(feature = "webkit")]
-        let original = menu_item(ORIGINAL_LABEL);
+        let toggle = menu_item(reader_web_ui::LABEL_FULL);
         let more_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         more_box.append(&mark_unread);
         #[cfg(feature = "webkit")]
         {
-            original.set_visible(false);
-            more_box.append(&original);
+            toggle.set_visible(false);
+            more_box.append(&toggle);
         }
         let more_popover = gtk::Popover::new();
         more_popover.add_css_class("menu");
@@ -202,7 +241,7 @@ impl MessageView {
                 #[allow(unused_mut)]
                 let mut v = vec![mark_unread.clone()];
                 #[cfg(feature = "webkit")]
-                v.push(original.clone());
+                v.push(toggle.clone());
                 v
             };
             for b in buttons {
@@ -325,24 +364,35 @@ impl MessageView {
             text_view,
             error_page,
             error_detail: error_detail.clone(),
+            renderer: crate::setup::app_config().html_renderer,
             #[cfg(feature = "webkit")]
-            original: original.clone(),
+            toggle: toggle.clone(),
             #[cfg(feature = "webkit")]
             web: RefCell::new(None),
+            #[cfg(feature = "webkit")]
+            web_idle: RefCell::new(None),
+            #[cfg(feature = "webkit")]
+            web_pref: Cell::new(None),
+            #[cfg(feature = "webkit")]
+            web_failed: Cell::new(false),
+            #[cfg(feature = "webkit")]
+            web_active: Cell::new(false),
+            #[cfg(feature = "webkit")]
+            web_token: Cell::new(0),
         });
 
         #[cfg(feature = "webkit")]
         {
             let weak = Rc::downgrade(&inner);
-            original.connect_clicked(move |_| {
+            toggle.connect_clicked(move |_| {
                 if let Some(inner) = weak.upgrade() {
-                    toggle_original(&inner);
+                    reader_web_ui::toggle(&inner);
                 }
             });
             let weak = Rc::downgrade(&inner);
             inner.banner.connect_button_clicked(move |_| {
                 if let Some(inner) = weak.upgrade() {
-                    allow_remote_images(&inner);
+                    reader_web_ui::allow_remote_images(&inner);
                 }
             });
         }
@@ -640,7 +690,9 @@ fn launch_url(widget: &impl IsA<gtk::Widget>, url: &str) {
     let parent = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok());
     gtk::UriLauncher::new(url).launch(parent.as_ref(), None::<&gio::Cancellable>, |res| {
         if let Err(e) = res {
-            eprintln!("no se pudo abrir el enlace: {e}");
+            if !launch_error_is_cancel(&e) {
+                eprintln!("no se pudo abrir el enlace: {e}");
+            }
         }
     });
 }
@@ -648,7 +700,6 @@ fn launch_url(widget: &impl IsA<gtk::Widget>, url: &str) {
 fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: MessageHeader) {
     let gen = inner.generation.get() + 1;
     inner.generation.set(gen);
-    destroy_original(inner);
 
     set_header_labels(inner, &header);
     set_actions_enabled(inner, true, false);
@@ -677,6 +728,8 @@ fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: Mes
         return;
     }
 
+    // Descarga en curso: no hay HTML visible, el WebView (si existe) pasa a reposo.
+    reader_web_ui::release(inner);
     inner.stack.set_visible_child_name("loading");
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
@@ -829,7 +882,7 @@ fn run_action(inner: &Rc<Inner>, action: Action) {
 
 fn clear_view(inner: &Rc<Inner>) {
     inner.generation.set(inner.generation.get() + 1);
-    destroy_original(inner);
+    reader_web_ui::release(inner);
     *inner.current.borrow_mut() = Current::default();
     inner.links.borrow_mut().clear();
     update_link_cursor(inner);
@@ -849,6 +902,7 @@ fn show_error(inner: &Rc<Inner>, detail: &str) {
         .error_page
         .set_description(Some("Comprueba la conexión e inténtalo de nuevo."));
     inner.error_detail.set_text(detail);
+    reader_web_ui::release(inner);
     inner.stack.set_visible_child_name("error");
 }
 
@@ -947,6 +1001,21 @@ fn limit_body(text: &str) -> (&str, bool) {
 
 fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     let html = body.html.as_deref().filter(|h| !h.trim().is_empty());
+    // Vista completa (WebKit) solo para mensajes con HTML; el texto plano nunca crea WebView.
+    let mut failed = false;
+    if let Some(html) = html.filter(|h| reader_web_ui::should_use(inner, h)) {
+        match reader_web_ui::show(inner, html) {
+            Ok(()) => {
+                populate_attachments(inner, body);
+                return;
+            }
+            Err(e) => {
+                eprintln!("vista completa no disponible: {e}");
+                failed = true;
+            }
+        }
+    }
+    reader_web_ui::release(inner);
     let (segments, remote_images, truncated) = match html {
         Some(html) => {
             let (html, truncated) = limit_body(html);
@@ -960,6 +1029,8 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
             None => (Vec::new(), 0, false),
         },
     };
+    inner.banner.set_title(BANNER_NORMAL);
+    inner.banner.set_button_label(None);
     if truncated {
         inner.banner.set_title(TRUNCATED_NOTICE);
         inner.banner.set_revealed(true);
@@ -980,84 +1051,22 @@ fn render_body(inner: &Rc<Inner>, body: &MessageBody) {
     update_link_cursor(inner);
     inner.stack.set_visible_child_name("content");
     #[cfg(feature = "webkit")]
-    inner.original.set_visible(html.is_some());
+    {
+        inner.toggle.set_label(reader_web_ui::LABEL_FULL);
+        inner
+            .toggle
+            .set_visible(html.is_some() && !inner.web_failed.get());
+        if failed {
+            inner.web_failed.set(true);
+            inner.toggle.set_visible(false);
+            reader_web_ui::show_fallback_notice(inner);
+        }
+    }
+    #[cfg(not(feature = "webkit"))]
+    let _ = failed;
 
     populate_attachments(inner, body);
 }
-
-/// Pulsa «Ver original»: crea la vista bajo demanda y carga el HTML sin sanear.
-/// Si ya existe, vuelve al texto y la destruye para liberar memoria.
-#[cfg(feature = "webkit")]
-fn toggle_original(inner: &Rc<Inner>) {
-    if inner.web.borrow().is_some() {
-        destroy_original(inner);
-        inner.stack.set_visible_child_name("content");
-        return;
-    }
-    let html = inner
-        .current
-        .borrow()
-        .body
-        .as_ref()
-        .and_then(|b| b.html.clone())
-        .filter(|h| !h.trim().is_empty());
-    let Some(html) = html else { return };
-    match reader_web::OriginalView::new(html.clone()) {
-        Ok(view) => {
-            inner.stack.add_named(view.widget(), Some("original"));
-            view.load();
-            inner.stack.set_visible_child_name("original");
-            inner.original.set_label("Volver al texto");
-            inner
-                .banner
-                .set_title("Imágenes remotas bloqueadas en la vista original");
-            inner
-                .banner
-                .set_button_label(Some("Cargar imágenes remotas"));
-            inner
-                .banner
-                .set_revealed(reader_html::count_images(&html) > 0);
-            *inner.web.borrow_mut() = Some(view);
-        }
-        Err(e) => alert(&inner.root, "No se pudo abrir la vista original", &e),
-    }
-}
-
-/// El usuario acepta imágenes remotas: solo se relaja la carga de imágenes https.
-#[cfg(feature = "webkit")]
-fn allow_remote_images(inner: &Inner) {
-    if let Some(view) = inner.web.borrow().as_ref() {
-        view.allow_images();
-    }
-    inner.banner.set_revealed(false);
-}
-
-/// Destruye la vista original (si existe) y restaura el banner del modo texto.
-#[cfg(feature = "webkit")]
-fn destroy_original(inner: &Inner) {
-    let Some(view) = inner.web.borrow_mut().take() else {
-        return;
-    };
-    if inner.stack.visible_child_name().as_deref() == Some("original") {
-        inner.stack.set_visible_child_name("content");
-    }
-    inner.stack.remove(view.widget());
-    drop(view);
-    inner.original.set_label(ORIGINAL_LABEL);
-    inner.banner.set_title(BANNER_NORMAL);
-    inner.banner.set_button_label(None);
-    let remote = inner
-        .current
-        .borrow()
-        .body
-        .as_ref()
-        .and_then(|b| b.html.as_deref())
-        .map_or(0, reader_html::count_images);
-    inner.banner.set_revealed(remote > 0);
-}
-
-#[cfg(not(feature = "webkit"))]
-fn destroy_original(_inner: &Inner) {}
 
 fn clear_attachments(inner: &Inner) {
     while let Some(child) = inner.attachments.first_child() {
@@ -1206,12 +1215,27 @@ fn launch_file(widget: &impl IsA<gtk::Widget>, path: &Path) {
     gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
         parent.as_ref(),
         None::<&gio::Cancellable>,
-        |res| {
-            if let Err(e) = res {
-                eprintln!("no se pudo abrir el adjunto: {e}");
+        {
+            let path = path.to_path_buf();
+            move |res| {
+                if let Err(e) = res {
+                    // Cerrar el diálogo del portal es una cancelación, no un fallo.
+                    if !launch_error_is_cancel(&e) {
+                        eprintln!("no se pudo abrir el adjunto: {e}");
+                    }
+                    // Nadie ha abierto el fichero: se borra la copia temporal.
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         },
     );
+}
+
+/// `true` si el error de un lanzador/diálogo de GTK es que el usuario lo cerró o canceló.
+fn launch_error_is_cancel(e: &glib::Error) -> bool {
+    e.matches(gtk::DialogError::Dismissed)
+        || e.matches(gtk::DialogError::Cancelled)
+        || e.matches(gio::IOErrorEnum::Cancelled)
 }
 
 /// Descarga el adjunto en `dest` (solo guardar; errores en un diálogo).
@@ -1506,6 +1530,20 @@ fn para_tag(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dismissed_dialogs_are_cancellations_not_failures() {
+        let dismissed = glib::Error::new(gtk::DialogError::Dismissed, "dismissed");
+        let cancelled = glib::Error::new(gtk::DialogError::Cancelled, "cancelled");
+        let io_cancel = glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled");
+        let failed = glib::Error::new(gtk::DialogError::Failed, "boom");
+        let other = glib::Error::new(gio::IOErrorEnum::NotFound, "missing");
+        assert!(launch_error_is_cancel(&dismissed));
+        assert!(launch_error_is_cancel(&cancelled));
+        assert!(launch_error_is_cancel(&io_cancel));
+        assert!(!launch_error_is_cancel(&failed));
+        assert!(!launch_error_is_cancel(&other));
+    }
+
     #[test]
     fn link_cursor_names() {
         assert_eq!(super::cursor_name(true), "pointer");

@@ -1027,11 +1027,13 @@ impl Shell {
             return;
         }
         self.reload_sidebar();
-        let shows_inbox = self
+        // Se relee la lista si muestra alguna carpeta de la cuenta: la bandeja (informe de
+        // mensajes nuevos) o una carpeta secundaria que acaba de sincronizarse al abrirla.
+        let shows_account = self
             .target_mailboxes()
             .iter()
-            .any(|m| m.account_id == account.id && m.role == MailboxRole::Inbox);
-        if shows_inbox {
+            .any(|m| m.account_id == account.id);
+        if shows_account {
             self.refresh_list();
         }
     }
@@ -2407,12 +2409,14 @@ pub fn seed_demo(store: &Store) {
                         mime_type: "application/pdf".into(),
                         size: 248_000,
                         content_id: None,
+                        ..Default::default()
                     },
                     correo_core::Attachment {
                         filename: "cifras.xlsx".into(),
                         mime_type: "application/vnd.ms-excel".into(),
                         size: 56_400,
                         content_id: None,
+                        ..Default::default()
                     },
                 ]
             } else {
@@ -2426,6 +2430,10 @@ pub fn seed_demo(store: &Store) {
                     attachments,
                 },
             );
+        }
+        if index == 0 {
+            // Correos HTML (boletín, factura, citas, tema oscuro, hostil) para la vista completa.
+            crate::demo_html::seed(store, inbox, email, now);
         }
         store
             .upsert_mailbox(&mailbox(inbox_path, MailboxRole::Inbox, unread))

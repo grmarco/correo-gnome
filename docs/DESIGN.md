@@ -127,7 +127,7 @@ Solo iconos simbólicos de Adwaita (`*-symbolic`), tamaño 16 (por defecto), 12 
 | Quitar chip | `window-close-symbolic` (12px) |
 | Formato | `format-text-bold-symbolic`, `format-text-italic-symbolic`, `format-text-underline-symbolic`, `view-list-bullet-symbolic`, `format-indent-more-symbolic`, `insert-link-symbolic` |
 | Estados vacíos | `mail-read-symbolic` (sin mensajes), `mail-unread-symbolic` (sin cuentas), `edit-find-symbolic` (sin resultados), `network-offline-symbolic` (offline), `dialog-error-symbolic` (error) |
-| Ver original | `web-browser-symbolic` |
+| Vista completa / ligera | entrada de texto en el menú «Más» (sin icono) |
 
 Cada botón de icono: `tooltip-text` y `accessible-label` (con `gtk::AccessibleExt`/`update_property`) explícitos.
 
@@ -187,12 +187,26 @@ Asunto del mensaje (correo-reader-subject, wrap)
 ```
 
 - Línea de remitente con `adw::Avatar` 48px + nombre (`correo-reader-from`) + email y «para ti / para n más» en `correo-reader-meta`. Los campos Para/Cc/Cco completos se muestran plegados detrás de un botón «Detalles» (`gtk::Revealer` con `SlideDown` 200ms) para quitar ruido.
-- **Acciones agrupadas** en la `HeaderBar` (no bajo el asunto): `box.linked` con `correo-actions`: Responder (`mail-reply-sender-symbolic`), Responder a todos (`mail-reply-all-symbolic`), Reenviar (`mail-forward-symbolic`); separado: Archivar (`mail-archive-symbolic`), Borrar (`user-trash-symbolic`, clase `correo-danger`), y un `MenuButton` «Más» con «Marcar como no leído» y «Ver original». Atajos en tooltips (`Responder (R)`, `Borrar (Supr)`). Con ventana estrecha solo se muestran Responder, Archivar y Borrar; el resto va al menú.
+- **Acciones agrupadas** en la `HeaderBar` (no bajo el asunto): `box.linked` con `correo-actions`: Responder (`mail-reply-sender-symbolic`), Responder a todos (`mail-reply-all-symbolic`), Reenviar (`mail-forward-symbolic`); separado: Archivar (`mail-archive-symbolic`), Borrar (`user-trash-symbolic`, clase `correo-danger`), y un `MenuButton` «Más» con «Marcar como no leído» y «Vista completa» / «Vista ligera». Atajos en tooltips (`Responder (R)`, `Borrar (Supr)`). Con ventana estrecha solo se muestran Responder, Archivar y Borrar; el resto va al menú.
 - Adjuntos: en lugar de `boxed-list`, `adw::WrapBox` (1.7) con tarjetas `correo-attachment` (icono de tipo en cuadro tintado 36px, nombre en `heading`, tamaño en `caption` tabular, botones «Guardar»/«Abrir» planos que aparecen con hover).
 - Cuerpo: `correo-reader-body`, 1.04rem, interlineado 1.55, selección de texto permitida. Enlaces con el acento del sistema (`link`).
 - **Citas plegables**: el texto citado (`>`) se agrupa en un bloque; por defecto plegado tras un botón-píldora «···» (`correo-quote-toggle`) y al pulsar se despliega con `gtk::Revealer` (`SlideDown`, 200ms, `ease-out`); la cita desplegada usa `correo-quote` (barra izquierda de acento tenue, opacidad 0.8). Con `gtk::TextView`, se implementa con una `gtk::TextChildAnchor` que aloja el botón y una etiqueta de texto oculta/visible mediante `gtk::TextTag` `invisible`; la animación es el fundido del `Revealer` en un `TextChildAnchor`; si resulta compleja, solo conmutar la etiqueta `invisible` (sin animación) en la primera iteración.
 - Banner de privacidad (imágenes remotas): `adw::Banner` actual, con botón «Cargar imágenes»; se muestra con la animación propia de `Banner` (revealer).
 - Estado «Selecciona un mensaje»: ver §6.7.
+
+#### Vista completa de mensajes HTML (WebKit, `reader_web*.rs`)
+
+Los mensajes con HTML se muestran por defecto con WebKitGTK (feature `webkit`, activa por defecto). Los de solo texto plano usan siempre el visor ligero: nunca se crea un `WebView` para ellos.
+
+- **Modo** (`html_renderer` en `config.toml` o `CORREO_HTML_RENDERER`): `"webkit"` (por defecto), `"light"` (visor ligero: ammonia + `TextView`) o `"auto"` (WebKit solo si `needs_rich_rendering(html)`: tablas, imágenes, `<style>`, estilos en línea de maquetación, `bgcolor`, etc.). La entrada «Vista ligera» / «Vista completa» del menú «Más» alterna el modo del mensaje y la elección se recuerda el resto de la sesión (no por mensaje).
+- **Tarjeta**: el `WebView` va dentro de `correo-mail-card`: fondo blanco, radio 12, anillo de 1px (`alpha(currentColor, .10)`) y sombra suave, también en tema oscuro, porque los correos asumen fondo blanco. Si el correo declara su propio fondo (`<body style>`, `bgcolor` o `<style>`), este cubre el lienzo entero y manda sobre el blanco. Márgenes 24px a los lados, como el cuerpo de texto.
+- **Tipografía y ancho**: 15px/1.5 en Cantarell, `adw::Clamp` del lector (780). El scroll es el propio del `WebView` (una sola barra, el resto del lector no se desplaza). Si una tabla fija un ancho mayor que el disponible (p. ej. boletines de 600px en una ventana estrecha) se reduce el zoom (hasta 0,55) en vez de forzar scroll horizontal.
+- **Carga**: el esqueleto existente (`loading`) se muestra hasta que el documento está listo y entonces se hace el fundido (`Stack` `Crossfade`, 160ms; 0 si `adw::is_animations_enabled` es falso).
+- **Banner**: «Imágenes bloqueadas para proteger tu privacidad» con botón «Cargar imágenes remotas» (solo `https` y solo imágenes).
+- **Fallo**: si no se puede crear el `WebView`, compilar el filtro de contenido o el proceso web muere, se vuelve al visor ligero para el resto de la sesión con un aviso discreto en el banner («La vista completa no está disponible; se muestra la vista ligera»).
+- **Ciclo de vida**: un único `WebView` creado al abrir el primer mensaje con HTML y reutilizado al navegar entre ellos. Al limpiar la vista, abrir un mensaje sin HTML, seleccionar varios o esperar una descarga, se descarta el documento (`about:blank`) y se arranca un temporizador de un solo disparo (30 s); si no vuelve a haber HTML visible, se destruye el `WebView` y se termina su proceso web.
+- **Seguridad** (ver `reader_web_policy.rs` y `reader_web_sanitize.rs`): JavaScript, WebGL, media, plugins, almacenamiento y caché desactivados; sesión efímera; filtro de contenido que bloquea toda la red; CSP en el propio documento (`default-src 'none'`, sin scripts, marcos, objetos, formularios ni `<base>`); saneado previo con ammonia y lista blanca de maquetación (sin `script`, `form`, `iframe`, `object`, `embed`, `meta`, `base`, `link`, `svg`; `href` solo http/https/mailto; imágenes solo http(s) o `data:` raster; CSS depurado de `url()`, `@import`, `expression()`…); navegación bloqueada dentro del `WebView`, sin ventanas emergentes ni menú contextual; los enlaces se abren fuera y, si el texto visible aparenta otro dominio, piden confirmación (`link_looks_deceptive`, igual que el visor ligero).
+- **Imágenes `cid:`**: se sustituyen por un marcador gris. `MessageBody.attachments` solo guarda metadatos (no los bytes) y resolverlas exigiría otra descarga IMAP. TODO documentado en `reader_web_sanitize.rs` (`CID_PLACEHOLDER`).
 
 ### 6.5 Redactor (`composer*.rs`)
 
@@ -306,7 +320,7 @@ Leyenda: **[A]** alto impacto visual y bajo riesgo (empezar por aquí); **[M]** 
 ### 9.4 `reader.rs`
 1. **[A]** Subject: sustituir `title-2` por `correo-reader-subject`; metas: de `caption` a `correo-reader-meta`; fecha `correo-reader-date`.
 2. **[A]** Cabecera con `adw::Avatar` 48px + remitente en dos líneas (`from` negrita, `para: …` secundaria) y fecha a la derecha; Para/Cc plegados en `Revealer` con botón «Detalles».
-3. **[A]** Acciones: pasar de seis botones con etiqueta/icono a iconos solo (`.flat`) en un `box.linked.correo-actions` con tooltips con atajo; Borrar con `correo-danger`; mover «Marcar no leído» y «Ver original» a `MenuButton`. Poner el grupo en la `HeaderBar` del lector (requiere exponer un `widget` desde `MessageView` o poner el grupo como `pack_end` del header en `window.rs`).
+3. **[A]** Acciones: pasar de seis botones con etiqueta/icono a iconos solo (`.flat`) en un `box.linked.correo-actions` con tooltips con atajo; Borrar con `correo-danger`; mover «Marcar no leído» y «Vista completa» a `MenuButton`. Poner el grupo en la `HeaderBar` del lector (requiere exponer un `widget` desde `MessageView` o poner el grupo como `pack_end` del header en `window.rs`).
 4. **[A]** `adw::Clamp` (760/560) alrededor del contenido, `correo-reader-body` en el `TextView` y márgenes 24.
 5. **[A]** Estado de error: título/descr humanas, detalle técnico en `Expander` con `monospace caption`; `correo-empty`/`correo-error`.
 6. **[M]** Esqueleto de lector tras 250ms de carga (sustituye el spinner); `Stack` con `Crossfade` 160ms.
@@ -349,7 +363,7 @@ Hecho (todos los [A] y los [M] de bajo riesgo):
 - Lista de hilos: avatar `adw::Avatar` de 40 px con color por remitente, punto de no leído, fila en 3 líneas, chip de etiqueta, contador con tooltip accesible, estado vacío («Todo al día» / «Sin resultados»), fundido de 160 ms.
 - Barra lateral: cabeceras de cuenta con avatar de su color y botón de opciones (teclado/táctil), badges `correo-badge`, menú principal (Acerca de, Salir), menú contextual de eliminar cuenta restilizado.
 - Ventana: buscador en `adw::Clamp`, `Redactar` con icono (solo icono a <= 560sp), `correo-syncing` en el botón de sincronizar solo mientras sincroniza, tres breakpoints (1000/720/560sp; libadwaita aplica solo el último que se cumple, así que cada uno repite los ajustes anteriores), anchos de panel, estados vacíos nuevos.
-- Lector: `adw::Clamp` 780, cabecera con avatar de 44 px, asunto, remitente (nombre y email), destinatarios abreviados con tooltip completo, acciones solo-icono en la cabecera de la ventana (`linked` para responder, archivar, borrar y menú «Más» con «Marcar como no leído» y «Ver original»), esqueleto de carga, error con detalle plegado.
+- Lector: `adw::Clamp` 780, cabecera con avatar de 44 px, asunto, remitente (nombre y email), destinatarios abreviados con tooltip completo, acciones solo-icono en la cabecera de la ventana (`linked` para responder, archivar, borrar y menú «Más» con «Marcar como no leído» y «Vista completa» / «Vista ligera»), esqueleto de carga, error con detalle plegado.
 - Redactor: filas planas con etiqueta, `adw::WrapBox` para destinatarios, chips con avatar y animación de entrada/salida, Cc/Cco en `Revealer`, barra de formato con separadores y etiquetas accesibles, `Enviar` con icono, `adw::Spinner`.
 - Datos de demostración variados (8 remitentes, adjuntos, etiquetas, no leídos, fechas dispersas); `CORREO_DEMO_EMPTY=1` arranca sin cuentas.
 

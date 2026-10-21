@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use async_imap::imap_proto::{self, BodyStructure, Envelope, NameAttribute};
 use async_imap::types::Flag;
 use correo_core::{Address, Attachment, Flags, MailboxId, MailboxRole, MessageBody, MessageHeader};
-use mail_parser::{Addr, HeaderValue, MessageParser, MessagePart, MimeHeaders};
+use mail_parser::{Addr, HeaderValue, Message, MessageParser, MessagePart, MimeHeaders, PartType};
 
 /// Tamaño de lote para UID FETCH / UID STORE.
 pub const BATCH_SIZE: usize = 200;
@@ -387,29 +387,31 @@ pub fn has_attachments(bs: &BodyStructure<'_>) -> bool {
         BodyStructure::Multipart { bodies, .. } => bodies.iter().any(has_attachments),
         BodyStructure::Basic { common, .. }
         | BodyStructure::Text { common, .. }
-        | BodyStructure::Message { common, .. } => {
-            let disposition = common.disposition.as_ref();
-            let disp_ty = disposition.map(|d| d.ty.to_ascii_lowercase());
-            if disp_ty.as_deref() == Some("attachment") {
-                return true;
-            }
-            if disp_ty.as_deref() == Some("inline") {
-                return false;
-            }
-            let ty = common.ty.ty.to_ascii_lowercase();
-            if ty == "text" || ty == "multipart" {
-                return false;
-            }
-            let named = |params: &imap_proto::BodyParams<'_>| {
-                params.as_ref().is_some_and(|ps| {
-                    ps.iter().any(|(k, _)| {
-                        k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("filename")
-                    })
-                })
-            };
-            named(&common.ty.params) || disposition.is_some_and(|d| named(&d.params))
-        }
+        | BodyStructure::Message { common, .. } => leaf_is_attachment(common),
     }
+}
+
+/// Regla de `has_attachments` para una hoja de la estructura MIME.
+pub(crate) fn leaf_is_attachment(common: &imap_proto::BodyContentCommon<'_>) -> bool {
+    let disposition = common.disposition.as_ref();
+    let disp_ty = disposition.map(|d| d.ty.to_ascii_lowercase());
+    if disp_ty.as_deref() == Some("attachment") {
+        return true;
+    }
+    if disp_ty.as_deref() == Some("inline") {
+        return false;
+    }
+    let ty = common.ty.ty.to_ascii_lowercase();
+    if ty == "text" || ty == "multipart" {
+        return false;
+    }
+    let named = |params: &imap_proto::BodyParams<'_>| {
+        params.as_ref().is_some_and(|ps| {
+            ps.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("filename"))
+        })
+    };
+    named(&common.ty.params) || disposition.is_some_and(|d| named(&d.params))
 }
 
 // ----- Cuerpos -----------------------------------------------------------
@@ -421,10 +423,15 @@ pub fn parse_body(raw: &[u8]) -> MessageBody {
     };
     let text = msg.body_text(0).map(|t| t.into_owned());
     let html = msg.body_html(0).map(|t| t.into_owned());
+    let paths = part_paths(&msg);
     let attachments = msg
         .attachments()
         .enumerate()
-        .map(|(i, part)| attachment_info(part, i))
+        .map(|(i, part)| {
+            let id = msg.attachments.get(i).copied();
+            let path = id.and_then(|id| paths.get(id as usize)).cloned().flatten();
+            attachment_info(part, i, path)
+        })
         .collect();
     MessageBody {
         text,
@@ -433,7 +440,38 @@ pub fn parse_body(raw: &[u8]) -> MessageBody {
     }
 }
 
-fn attachment_info(part: &MessagePart<'_>, index: usize) -> Attachment {
+/// Número de parte MIME estilo IMAP de cada parte de `msg` (índice = id de parte de
+/// mail-parser). Las partes multipart y las que no se encuentran valen `None`.
+fn part_paths(msg: &Message<'_>) -> Vec<Option<String>> {
+    fn walk(msg: &Message<'_>, id: usize, path: String, out: &mut Vec<Option<String>>) {
+        let Some(part) = msg.parts.get(id) else {
+            return;
+        };
+        match &part.body {
+            PartType::Multipart(children) => {
+                for (i, child) in children.iter().enumerate() {
+                    let child_path = if path.is_empty() {
+                        (i + 1).to_string()
+                    } else {
+                        format!("{path}.{}", i + 1)
+                    };
+                    walk(msg, *child as usize, child_path, out);
+                }
+            }
+            _ => out[id] = Some(path),
+        }
+    }
+    let mut out = vec![None; msg.parts.len()];
+    match msg.parts.first().map(|p| &p.body) {
+        None => {}
+        // Una raíz que no es multipart es la parte "1".
+        Some(PartType::Multipart(_)) => walk(msg, 0, String::new(), &mut out),
+        Some(_) => out[0] = Some("1".to_owned()),
+    }
+    out
+}
+
+fn attachment_info(part: &MessagePart<'_>, index: usize, path: Option<String>) -> Attachment {
     let mime_type = part
         .content_type()
         .map(|ct| match ct.c_subtype.as_deref() {
@@ -451,6 +489,16 @@ fn attachment_info(part: &MessagePart<'_>, index: usize) -> Attachment {
         content_id: part
             .content_id()
             .map(|c| c.trim_matches(['<', '>']).to_owned()),
+        encoding: path.is_some().then(|| {
+            part.content_transfer_encoding()
+                .map(|e| e.trim().to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| "7bit".to_owned())
+        }),
+        encoded_size: path
+            .is_some()
+            .then(|| u64::from(part.offset_end.saturating_sub(part.offset_body))),
+        part: path,
     }
 }
 
@@ -793,6 +841,82 @@ Message-ID: <m1@x>\r\nIn-Reply-To: <m0@x>\r\nReferences: <r@x> <m0@x>\r\n\r\n";
         assert_eq!(a.mime_type, "application/pdf");
         assert!(a.size > 0);
         assert!(a.content_id.is_none());
+    }
+
+    #[test]
+    fn parse_body_records_part_number_encoding_and_size() {
+        let body = parse_body(MAIL_WITH_PDF);
+        let a = &body.attachments[0];
+        // multipart/mixed: [0] alternative, [1] pdf.
+        assert_eq!(a.part.as_deref(), Some("2"));
+        assert_eq!(a.encoding.as_deref(), Some("base64"));
+        let size = a.encoded_size.unwrap();
+        assert!((12..=16).contains(&size), "tamaño codificado {size}");
+    }
+
+    const NESTED: &[u8] = b"Subject: x\r\n\
+Content-Type: multipart/mixed; boundary=\"A\"\r\n\
+\r\n\
+--A\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hola\r\n\
+--A\r\n\
+Content-Type: multipart/related; boundary=\"B\"\r\n\
+\r\n\
+--B\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p>x</p>\r\n\
+--B\r\n\
+Content-Type: image/png; name=\"a.png\"\r\n\
+Content-Disposition: attachment; filename=\"a.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+AAEC\r\n\
+--B--\r\n\
+--A\r\n\
+Content-Type: message/rfc822\r\n\
+Content-Disposition: attachment; filename=\"fwd.eml\"\r\n\
+\r\n\
+Subject: interno\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+dentro\r\n\
+--A\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename*=utf-8''caf%C3%A9.bin\r\n\
+Content-Transfer-Encoding: Quoted-Printable\r\n\
+\r\n\
+a=3Db\r\n\
+--A--\r\n";
+
+    #[test]
+    fn part_numbers_in_nested_multipart_and_rfc822() {
+        let body = parse_body(NESTED);
+        let got: Vec<_> = body
+            .attachments
+            .iter()
+            .map(|a| (a.filename.as_str(), a.part.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a.png", "2.2"), ("fwd.eml", "3"), ("café.bin", "4")]
+        );
+        assert_eq!(
+            body.attachments[2].encoding.as_deref(),
+            Some("quoted-printable")
+        );
+        assert_eq!(body.attachments[1].encoding.as_deref(), Some("7bit"));
+    }
+
+    #[test]
+    fn single_part_root_is_part_one() {
+        let raw = b"Content-Type: application/pdf; name=\"x.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"x.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n";
+        let body = parse_body(raw);
+        assert_eq!(body.attachments[0].part.as_deref(), Some("1"));
     }
 
     #[test]

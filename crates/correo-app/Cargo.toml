@@ -24,11 +24,11 @@ toml = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 ammonia = "4.2.4"
 libc = "0.2"
-# Vista «Ver original» (T10b). Opcional: sin la feature no se compila WebKit.
+# Vista completa de mensajes HTML con WebKitGTK. Opcional: sin la feature no se compila WebKit.
 webkit6 = { version = "0.6.1", optional = true }
 
 [features]
-default = []
+default = ["webkit"]
 webkit = ["dep:webkit6"]
 
 [dev-dependencies]

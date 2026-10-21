@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,13 +15,15 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::{Fetch, Name};
 use async_trait::async_trait;
 use correo_core::{
-    AccountId, BATCH_MAX_UIDS, BatchReport, Error, Flags, Mailbox, MailboxId, MailboxRole,
-    MessageBody, MessageHeader, MessageId, Result, TokenProvider,
+    AccountId, Attachment, BATCH_MAX_UIDS, BatchReport, CancelToken, Error, Flags, Mailbox,
+    MailboxId, MailboxRole, MessageBody, MessageHeader, MessageId, ProgressFn, Result,
+    TokenProvider,
 };
 use correo_store::Store;
 use futures::TryStreamExt;
 use tokio::sync::{MappedMutexGuard, Mutex as AsyncMutex, MutexGuard};
 
+use crate::attach::{self, CHUNK_SIZE, ChunkSource};
 use crate::conn::{self, Conn, OP_TIMEOUT, imap, is_network, map_imap_error, timeout_error};
 use crate::parse::{
     self, BATCH_SIZE, FetchMeta, attachment_contents, attribute_strings, flags_from, imap_date,
@@ -289,6 +293,29 @@ impl ImapBackend {
     }
 }
 
+/// Fuente de trozos sobre la sesión del backend. Ante un error de red descarta la sesión
+/// (el siguiente trozo abre una nueva).
+struct ImapChunkSource<'a> {
+    backend: &'a ImapBackend,
+    mailbox: &'a Mailbox,
+    uid: u32,
+    part: String,
+}
+
+#[async_trait]
+impl ChunkSource for ImapChunkSource<'_> {
+    async fn fetch(&mut self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        let r = self
+            .backend
+            .fetch_chunk_once(self.mailbox, self.uid, &self.part, offset, len)
+            .await;
+        if matches!(&r, Err(e) if is_network(e)) {
+            self.backend.reset().await;
+        }
+        r
+    }
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -327,6 +354,58 @@ impl correo_core::MailBackend for ImapBackend {
         let raw = self.retry(|| self.fetch_raw_once(mailbox, uid)).await?;
         attachment_contents(&raw, index)
             .ok_or_else(|| Error::NotFound(format!("adjunto {index} del mensaje uid {uid}")))
+    }
+
+    async fn fetch_attachment_to(
+        &self,
+        mailbox: &Mailbox,
+        uid: u32,
+        index: usize,
+        dest: &Path,
+        progress: ProgressFn,
+        cancel: CancelToken,
+    ) -> Result<u64> {
+        let meta = self.cached_attachment(mailbox, uid, index)?;
+        // Sin número de parte (cuerpo cacheado antes de existir) o sin cuerpo en caché:
+        // camino antiguo, mensaje completo.
+        let Some((att, part)) = attach::chunked_plan(meta) else {
+            return correo_core::fetch_attachment_to_via_whole(
+                self, mailbox, uid, index, dest, &progress, &cancel,
+            )
+            .await;
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let file = std::fs::File::create(dest)
+            .map_err(|e| Error::Store(format!("creando {}: {e}", dest.display())))?;
+        let mut sink = BufWriter::new(file);
+        let mut src = ImapChunkSource {
+            backend: self,
+            mailbox,
+            uid,
+            part,
+        };
+        let result = attach::download(
+            &mut src,
+            att.encoding.as_deref(),
+            att.encoded_size,
+            CHUNK_SIZE,
+            &mut sink,
+            &*progress,
+            &cancel,
+        )
+        .await;
+        let result = result.and_then(|n| {
+            sink.flush()
+                .map_err(|e| Error::Store(format!("escribiendo el adjunto: {e}")))
+                .map(|()| n)
+        });
+        drop(sink);
+        if result.is_err() {
+            let _ = std::fs::remove_file(dest);
+        }
+        result
     }
 
     async fn set_seen(&self, mailbox: &Mailbox, uid: u32, seen: bool) -> Result<()> {
@@ -575,6 +654,69 @@ impl ImapBackend {
             .iter()
             .find_map(|f| f.body().map(<[u8]>::to_vec))
             .ok_or_else(|| Error::NotFound(format!("mensaje uid {uid} en {}", mailbox.path)))
+    }
+
+    /// Metadatos del adjunto `index` según el cuerpo cacheado, si lo hay.
+    fn cached_attachment(
+        &self,
+        mailbox: &Mailbox,
+        uid: u32,
+        index: usize,
+    ) -> Result<Option<Attachment>> {
+        let Some(mid) = self.message_id(mailbox.id, uid)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .with_store(|s| s.get_body(mid))?
+            .and_then(|b| b.attachments.into_iter().nth(index)))
+    }
+
+    /// Un trozo de una parte: la sesión solo se retiene durante este FETCH, de modo que
+    /// otras operaciones se intercalan entre trozos. El límite de tiempo es por trozo.
+    async fn fetch_chunk_once(
+        &self,
+        mailbox: &Mailbox,
+        uid: u32,
+        part: &str,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>> {
+        let path = attach::parse_part_path(part)
+            .ok_or_else(|| Error::Protocol(format!("número de parte no válido: {part}")))?;
+        let query = attach::fetch_query(part, offset, len);
+        let mut guard = self.conn().await?;
+        let conn = &mut *guard;
+        let fut = async {
+            let selected = conn
+                .session
+                .select(&mailbox.path)
+                .await
+                .map_err(map_imap_error)?;
+            self.guard_uid_validity(mailbox, selected.uid_validity)?;
+            let stream = conn
+                .session
+                .uid_fetch(uid.to_string(), &query)
+                .await
+                .map_err(map_imap_error)?;
+            let fetches: Vec<Fetch> = stream.try_collect().await.map_err(map_imap_error)?;
+            let section = async_imap::imap_proto::SectionPath::Part(path, None);
+            let data = fetches
+                .iter()
+                .find_map(|f| f.section(&section).map(<[u8]>::to_vec));
+            match data {
+                Some(d) => Ok(d),
+                // Sin sección: fuera de rango (vacío) o mensaje inexistente.
+                None if fetches.iter().any(|f| f.uid == Some(uid)) => Ok(Vec::new()),
+                None => Err(Error::NotFound(format!(
+                    "mensaje uid {uid} en {}",
+                    mailbox.path
+                ))),
+            }
+        };
+        match tokio::time::timeout(OP_TIMEOUT, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(timeout_error(OP_TIMEOUT)),
+        }
     }
 
     async fn set_seen_once(&self, mailbox: &Mailbox, uid: u32, seen: bool) -> Result<()> {

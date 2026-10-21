@@ -66,6 +66,20 @@ Requisitos: `flatpak`, `flatpak-builder`, y los runtimes `org.gnome.Platform` / 
 
 No hay acceso al home. Si se quiere eliminar `xdg-download`, guardar adjuntos con el portal `FileChooser` sería la vía adecuada.
 
+## WebKitGTK (vista completa de mensajes HTML)
+
+`correo-app` se compila por defecto con la feature `webkit` (crate `webkit6` 0.6) y muestra los mensajes con HTML con WebKitGTK 6 (ver `docs/DESIGN.md`, §6.4). Sin esa feature (`cargo build --release --no-default-features -p correo-app`) no se enlaza WebKit y el lector usa solo el visor ligero.
+
+| Entorno | Dependencia |
+|---|---|
+| Compilar (Debian/Ubuntu) | `libwebkitgtk-6.0-dev` (pkg-config `webkitgtk-6.0`; probado con 2.52.6) |
+| Ejecutar (Debian/Ubuntu) | `libwebkitgtk-6.0-4` |
+| Flatpak | Nada que añadir: `org.gnome.Platform` 50 trae WebKitGTK 6 (`org.gnome.Sdk` los ficheros de desarrollo) |
+
+Permisos Flatpak: ninguno nuevo. `--share=network` (ya concedido) solo se usa para las imágenes https que el usuario pida cargar; el filtro de contenido bloquea el resto de la red. No hace falta `--device=dri` extra: el `WebView` desactiva la aceleración por hardware (`HardwareAccelerationPolicy::Never`). El filtro de contenido compilado se guarda en `$XDG_RUNTIME_DIR/correo-webkit-filtros` (disponible en el sandbox). Los procesos auxiliares de WebKit (`WebKitWebProcess`, `WebKitNetworkProcess`) se lanzan dentro del sandbox de la aplicación; el sandbox propio de WebKit usa el portal de Flatpak y no requiere permisos adicionales. **No verificado**: `flatpak` no está instalado en la máquina de desarrollo, así que no se ha construido ni ejecutado la vista completa dentro de Flatpak.
+
+Variables y ajustes: `html_renderer = "webkit" | "light" | "auto"` en `config.toml` y `CORREO_HTML_RENDERER` (ver `docs/DEVELOPMENT.md`).
+
 ## Validación
 
 | Comprobación | Resultado |

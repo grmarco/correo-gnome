@@ -1,5 +1,9 @@
 //! Tipos y contratos compartidos por todos los crates.
 
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -16,6 +20,8 @@ pub enum Error {
     Store(String),
     #[error("no encontrado: {0}")]
     NotFound(String),
+    #[error("operación cancelada")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,12 +107,96 @@ pub struct MessageHeader {
     pub labels: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Attachment {
     pub filename: String,
     pub mime_type: String,
+    /// Tamaño decodificado (el del contenido real del adjunto).
     pub size: u64,
     pub content_id: Option<String>,
+    /// Número de parte MIME según IMAP (p. ej. `"2"`, `"1.2"`). `None` en cuerpos
+    /// cacheados antes de existir este campo: se descarga el mensaje entero.
+    #[serde(default)]
+    pub part: Option<String>,
+    /// Content-Transfer-Encoding en minúsculas (`base64`, `quoted-printable`, `7bit`...).
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// Tamaño en el cable (codificado), base del cálculo del progreso.
+    #[serde(default)]
+    pub encoded_size: Option<u64>,
+}
+
+/// Progreso de una descarga. `received` y `total` van en bytes codificados (los que
+/// viajan por la red); `total` es `None` si no se conoce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub received: u64,
+    pub total: Option<u64>,
+}
+
+impl Progress {
+    /// Fracción 0.0..=1.0 si se conoce el total.
+    pub fn fraction(&self) -> Option<f64> {
+        self.total
+            .filter(|t| *t > 0)
+            .map(|t| (self.received as f64 / t as f64).clamp(0.0, 1.0))
+    }
+}
+
+/// Callback de progreso. Se invoca desde la tarea que descarga (no desde el hilo de GTK).
+pub type ProgressFn = Arc<dyn Fn(Progress) + Send + Sync>;
+
+/// Señal de cancelación compartida y barata de clonar.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Respaldo: descarga el adjunto con `fetch_attachment` (mensaje completo), lo escribe en
+/// `dest` y notifica 0 % y 100 %. Es lo que hace la implementación por defecto de
+/// [`MailBackend::fetch_attachment_to`].
+pub async fn fetch_attachment_to_via_whole<B: MailBackend + ?Sized>(
+    backend: &B,
+    mailbox: &Mailbox,
+    uid: u32,
+    index: usize,
+    dest: &Path,
+    progress: &ProgressFn,
+    cancel: &CancelToken,
+) -> Result<u64> {
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    progress(Progress {
+        received: 0,
+        total: None,
+    });
+    let data = backend.fetch_attachment(mailbox, uid, index).await?;
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if let Err(e) = std::fs::write(dest, &data) {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::Store(format!("escribiendo el adjunto: {e}")));
+    }
+    let n = data.len() as u64;
+    progress(Progress {
+        received: n,
+        total: Some(n),
+    });
+    Ok(n)
 }
 
 /// Cuerpo descargado bajo demanda.
@@ -181,6 +271,26 @@ pub trait MailBackend: Send + Sync {
     async fn sync_mailbox(&self, mailbox: &Mailbox, days: u32) -> Result<usize>;
     async fn fetch_body(&self, mailbox: &Mailbox, uid: u32) -> Result<MessageBody>;
     async fn fetch_attachment(&self, mailbox: &Mailbox, uid: u32, index: usize) -> Result<Vec<u8>>;
+
+    /// Descarga el adjunto `index` directamente al fichero `dest` (que crea o trunca el
+    /// llamador/implementación) y devuelve los bytes decodificados escritos.
+    ///
+    /// `progress` se invoca tras cada trozo con bytes codificados recibidos y total
+    /// (y una última vez con `received == total`). Al cancelar con `cancel` devuelve
+    /// `Error::Cancelled`; si falla o se cancela, `dest` no se deja a medias (se borra).
+    /// La implementación por defecto usa `fetch_attachment` y notifica solo 0 % y 100 %.
+    async fn fetch_attachment_to(
+        &self,
+        mailbox: &Mailbox,
+        uid: u32,
+        index: usize,
+        dest: &Path,
+        progress: ProgressFn,
+        cancel: CancelToken,
+    ) -> Result<u64> {
+        fetch_attachment_to_via_whole(self, mailbox, uid, index, dest, &progress, &cancel).await
+    }
+
     async fn set_seen(&self, mailbox: &Mailbox, uid: u32, seen: bool) -> Result<()>;
     async fn move_to(&self, mailbox: &Mailbox, uid: u32, target: &Mailbox) -> Result<()>;
     async fn delete(&self, mailbox: &Mailbox, uid: u32) -> Result<()>;
@@ -313,6 +423,121 @@ mod tests {
         b.merge(BatchReport::all_failed(&[9], &Error::Auth("x".into())));
         assert_eq!(b.failed, vec![3, 4, 9]);
         assert_eq!(b.error.as_deref(), Some("red: corte"));
+    }
+
+    struct Whole(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl crate::MailBackend for Whole {
+        async fn list_mailboxes(&self) -> crate::Result<Vec<crate::Mailbox>> {
+            Ok(vec![])
+        }
+        async fn sync_mailbox(&self, _: &crate::Mailbox, _: u32) -> crate::Result<usize> {
+            Ok(0)
+        }
+        async fn fetch_body(
+            &self,
+            _: &crate::Mailbox,
+            _: u32,
+        ) -> crate::Result<crate::MessageBody> {
+            Ok(Default::default())
+        }
+        async fn fetch_attachment(
+            &self,
+            _: &crate::Mailbox,
+            _: u32,
+            _: usize,
+        ) -> crate::Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+        async fn set_seen(&self, _: &crate::Mailbox, _: u32, _: bool) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn move_to(
+            &self,
+            _: &crate::Mailbox,
+            _: u32,
+            _: &crate::Mailbox,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &crate::Mailbox, _: u32) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mailbox() -> crate::Mailbox {
+        crate::Mailbox {
+            id: 1,
+            account_id: 1,
+            path: "INBOX".into(),
+            role: crate::MailboxRole::Inbox,
+            uid_validity: None,
+            unread: 0,
+            delimiter: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_fetch_attachment_to_writes_file_and_reports_0_and_100() {
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("correo-core-att-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("a.bin");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l2 = log.clone();
+        let progress: crate::ProgressFn = Arc::new(move |p| l2.lock().unwrap().push(p));
+        let b = Whole(vec![1, 2, 3]);
+        use crate::MailBackend;
+        let n = b
+            .fetch_attachment_to(
+                &mailbox(),
+                1,
+                0,
+                &dest,
+                progress.clone(),
+                crate::CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![1, 2, 3]);
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.first().unwrap().received, 0);
+        assert_eq!(log.last().unwrap().total, Some(3));
+
+        let cancel = crate::CancelToken::new();
+        cancel.cancel();
+        let other = dir.join("b.bin");
+        let r = b
+            .fetch_attachment_to(&mailbox(), 1, 0, &other, progress, cancel)
+            .await;
+        assert!(matches!(r, Err(crate::Error::Cancelled)));
+        assert!(!other.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_token_is_shared_between_clones() {
+        let a = crate::CancelToken::new();
+        let b = a.clone();
+        assert!(!b.is_cancelled());
+        a.cancel();
+        assert!(b.is_cancelled());
+    }
+
+    #[test]
+    fn progress_fraction() {
+        let p = crate::Progress {
+            received: 5,
+            total: Some(10),
+        };
+        assert_eq!(p.fraction(), Some(0.5));
+        let q = crate::Progress {
+            received: 5,
+            total: None,
+        };
+        assert_eq!(q.fraction(), None);
     }
 
     #[test]

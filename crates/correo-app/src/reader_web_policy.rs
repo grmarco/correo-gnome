@@ -7,7 +7,7 @@ use serde_json::json;
 /// Qué hacer con una navegación de nivel superior (enlace, formulario, `window.open`…).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavDecision {
-    /// Cargar en el propio WebView (solo `about:` y `data:`, el HTML inicial).
+    /// Cargar en el propio WebView (`about:` y `data:` no iniciados por un clic, el HTML inicial).
     Allow,
     /// Cancelar y abrir con el lanzador de GTK (navegador o cliente de correo).
     OpenExternal,
@@ -41,7 +41,9 @@ pub fn scheme_of(uri: &str) -> String {
 /// pulsar un enlace: solo esas navegaciones a web o correo se entregan al sistema.
 pub fn navigation_decision(uri: &str, link_clicked: bool) -> NavDecision {
     match scheme_of(uri).as_str() {
-        "about" | "data" => NavDecision::Allow,
+        // Un enlace `data:` pulsado no se carga nunca: solo el documento inicial.
+        "about" => NavDecision::Allow,
+        "data" if !link_clicked => NavDecision::Allow,
         "http" | "https" | "mailto" if link_clicked => NavDecision::OpenExternal,
         _ => NavDecision::Block,
     }
@@ -96,6 +98,15 @@ mod tests {
             navigation_decision("data:text/html,hola", false),
             NavDecision::Allow
         );
+    }
+
+    #[test]
+    fn clicked_data_links_are_blocked() {
+        assert_eq!(
+            navigation_decision("data:text/html,<b>x</b>", true),
+            NavDecision::Block
+        );
+        assert_eq!(navigation_decision("about:blank", true), NavDecision::Allow);
     }
 
     #[test]

@@ -7,3 +7,6 @@ edition = "2024"
 thiserror.workspace = true
 serde.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

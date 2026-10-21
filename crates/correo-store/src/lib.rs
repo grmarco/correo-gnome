@@ -1313,10 +1313,16 @@ mod tests {
                 mime_type: "application/pdf".into(),
                 size: 1234,
                 content_id: None,
+                part: Some("2".into()),
+                encoding: Some("base64".into()),
+                encoded_size: Some(1700),
             }],
         };
         s.save_body(id, &body).unwrap();
         let got = s.get_body(id).unwrap().unwrap();
+        assert_eq!(got.attachments[0].part.as_deref(), Some("2"));
+        assert_eq!(got.attachments[0].encoding.as_deref(), Some("base64"));
+        assert_eq!(got.attachments[0].encoded_size, Some(1700));
         assert_eq!(got.text, body.text);
         assert_eq!(got.html, body.html);
         assert_eq!(got.attachments.len(), 1);
@@ -1333,6 +1339,26 @@ mod tests {
         assert!(s.search_messages("trimestral", 10).unwrap().is_empty());
         assert_eq!(s.search_messages("nuevo", 10).unwrap().len(), 1);
         assert!(s.get_body(id).unwrap().unwrap().text.is_none());
+    }
+
+    #[test]
+    fn legacy_cached_body_without_part_fields_loads() {
+        let s = store();
+        let acc = new_account(&s, "legacy@example.com");
+        let mb = new_mailbox(&s, acc, "INBOX");
+        s.upsert_headers(mb, &[header(mb, 1, "viejo", 1)]).unwrap();
+        let id = s.list_headers(mb, 1, 0).unwrap()[0].id;
+        let old = r#"{"text":"hola","html":null,"attachments":[{"filename":"a.pdf","mime_type":"application/pdf","size":3,"content_id":null}]}"#;
+        s.conn
+            .execute(
+                "INSERT INTO bodies (message_id, body_json, search_text) VALUES (?1, ?2, 'hola')",
+                params![id, old],
+            )
+            .unwrap();
+        let got = s.get_body(id).unwrap().unwrap();
+        let a = &got.attachments[0];
+        assert_eq!(a.filename, "a.pdf");
+        assert!(a.part.is_none() && a.encoding.is_none() && a.encoded_size.is_none());
     }
 
     #[test]

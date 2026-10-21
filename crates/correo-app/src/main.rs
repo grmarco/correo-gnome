@@ -1,6 +1,8 @@
 mod batch;
 mod batch_bar;
 mod composer;
+#[cfg(debug_assertions)]
+mod demo_html;
 mod folder_tree;
 mod message_list;
 mod notify;

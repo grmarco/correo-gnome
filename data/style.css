@@ -309,6 +309,15 @@ button.correo-danger:focus-visible { color: @destructive_color; }
 textview.correo-reader-body, textview.correo-reader-body text { background: transparent; }
 .correo-attachments-scroll { margin: 0 24px 12px 24px; }
 
+/* Vista completa (WebKit): los correos suelen asumir fondo blanco, así que el WebView va
+ * sobre una tarjeta blanca con esquinas redondeadas también en el tema oscuro. */
+.correo-mail-card {
+  margin: 4px 24px 24px 24px;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px alpha(currentColor, 0.10), 0 2px 8px alpha(black, 0.10);
+}
+
 /* Citas plegables: botón «···» que revela la cita (gtk::Revealer) */
 .correo-quote-toggle {
   min-height: 20px;
