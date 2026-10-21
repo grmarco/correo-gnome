@@ -146,6 +146,26 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX messages_by_date ON messages (mailbox_id, date DESC);
     CREATE INDEX messages_by_message_id ON messages (message_id);
 "#,
+    r#"
+    -- v3: contactos por cuenta. Un mismo email puede existir en varias cuentas (cada una
+    -- con su libreta). `account_id` es nullable por compatibilidad: las filas previas quedan
+    -- sin cuenta. La clave es (account_id, email); al borrar la cuenta, sus contactos se van.
+    DROP INDEX contacts_by_name;
+    CREATE TABLE contacts_v3 (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+        email      TEXT NOT NULL COLLATE NOCASE,
+        name       TEXT,
+        source     TEXT NOT NULL,
+        UNIQUE (account_id, email)
+    );
+    INSERT INTO contacts_v3 (account_id, email, name, source)
+        SELECT NULL, email, name, source FROM contacts;
+    DROP TABLE contacts;
+    ALTER TABLE contacts_v3 RENAME TO contacts;
+    CREATE INDEX contacts_by_name ON contacts (name COLLATE NOCASE);
+    CREATE INDEX contacts_by_email ON contacts (email COLLATE NOCASE);
+"#,
 ];
 
 /// Columnas de `messages` en el orden que espera `header_from_row`.
@@ -545,26 +565,36 @@ impl Store {
 
     // ----- Contactos -----------------------------------------------------
 
-    /// Inserta o actualiza contactos por email. Si el nuevo nombre es `None`,
-    /// se conserva el anterior. Las entradas con email vacío se ignoran.
-    pub fn upsert_contacts(&self, contacts: &[Contact]) -> Result<()> {
+    /// Inserta o actualiza los contactos de la libreta de `account_id` (clave: cuenta y
+    /// email). Si el nuevo nombre es `None`, se conserva el anterior. Las entradas con
+    /// email vacío se ignoran.
+    pub fn upsert_contacts(&self, account_id: AccountId, contacts: &[Contact]) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(se)?;
         for c in contacts.iter().filter(|c| !c.email.trim().is_empty()) {
             tx.execute(
-                "INSERT INTO contacts (email, name, source) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (email) DO UPDATE SET \
+                "INSERT INTO contacts (account_id, email, name, source) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (account_id, email) DO UPDATE SET \
                      name = COALESCE(excluded.name, contacts.name), \
                      source = excluded.source",
-                params![c.email.trim(), c.name, c.source],
+                params![account_id, c.email.trim(), c.name, c.source],
             )
             .map_err(se)?;
         }
         tx.commit().map_err(se)
     }
 
-    /// Contactos cuyo email o nombre empieza por `prefix` (o alguna palabra del
-    /// nombre empieza por él). Sin distinguir mayúsculas.
-    pub fn search_contacts(&self, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
+    /// Contactos cuyo email o nombre empieza por `prefix` (o alguna palabra del nombre
+    /// empieza por él). Sin distinguir mayúsculas.
+    ///
+    /// Un mismo email aparece una sola vez: si está en varias cuentas, se devuelve la fila
+    /// de `preferred_account` (la cuenta remitente) cuando existe. Los de la cuenta
+    /// preferida van primero; después el resto, por nombre.
+    pub fn search_contacts(
+        &self,
+        prefix: &str,
+        limit: usize,
+        preferred_account: Option<AccountId>,
+    ) -> Result<Vec<Contact>> {
         let prefix = prefix.trim();
         let escaped = escape_like(prefix);
         let starts = format!("{escaped}%");
@@ -572,21 +602,39 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, email, source FROM contacts \
-                 WHERE email LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
-                    OR name LIKE ?2 ESCAPE '\\' \
-                 ORDER BY name IS NULL, name COLLATE NOCASE, email \
-                 LIMIT ?3",
+                "WITH hits AS ( \
+                     SELECT name, email, source, account_id FROM contacts \
+                     WHERE LOWER(email) IN ( \
+                         SELECT LOWER(email) FROM contacts \
+                         WHERE email LIKE ?2 ESCAPE '\\' OR name LIKE ?2 ESCAPE '\\' \
+                            OR name LIKE ?3 ESCAPE '\\') \
+                 ), \
+                 ranked AS ( \
+                     SELECT name, email, source, \
+                         (?1 IS NOT NULL AND account_id = ?1) AS preferred, \
+                         ROW_NUMBER() OVER ( \
+                             PARTITION BY LOWER(email) \
+                             ORDER BY (?1 IS NOT NULL AND account_id = ?1) DESC, \
+                                 name IS NULL, name COLLATE NOCASE \
+                         ) AS rn \
+                     FROM hits \
+                 ) \
+                 SELECT name, email, source FROM ranked WHERE rn = 1 \
+                 ORDER BY preferred DESC, name IS NULL, name COLLATE NOCASE, email \
+                 LIMIT ?4",
             )
             .map_err(se)?;
         let rows = stmt
-            .query_map(params![starts, word_starts, to_i64(limit)], |row| {
-                Ok(Contact {
-                    name: row.get(0)?,
-                    email: row.get(1)?,
-                    source: row.get(2)?,
-                })
-            })
+            .query_map(
+                params![preferred_account, starts, word_starts, to_i64(limit)],
+                |row| {
+                    Ok(Contact {
+                        name: row.get(0)?,
+                        email: row.get(1)?,
+                        source: row.get(2)?,
+                    })
+                },
+            )
             .map_err(se)?;
         rows.collect::<rusqlite::Result<_>>().map_err(se)
     }
@@ -1306,26 +1354,33 @@ mod tests {
     #[test]
     fn contacts_upsert_and_keep_name_when_missing() {
         let s = store();
-        s.upsert_contacts(&[
-            Contact {
-                name: Some("Ana Pérez".into()),
-                email: "ana@example.com".into(),
-                source: "google".into(),
-            },
-            Contact {
+        let acc = new_account(&s, "owner@example.com");
+        s.upsert_contacts(
+            acc,
+            &[
+                Contact {
+                    name: Some("Ana Pérez".into()),
+                    email: "ana@example.com".into(),
+                    source: "google".into(),
+                },
+                Contact {
+                    name: None,
+                    email: "  ".into(),
+                    source: "google".into(),
+                },
+            ],
+        )
+        .unwrap();
+        s.upsert_contacts(
+            acc,
+            &[Contact {
                 name: None,
-                email: "  ".into(),
-                source: "google".into(),
-            },
-        ])
+                email: "ANA@example.com".into(),
+                source: "graph".into(),
+            }],
+        )
         .unwrap();
-        s.upsert_contacts(&[Contact {
-            name: None,
-            email: "ANA@example.com".into(),
-            source: "graph".into(),
-        }])
-        .unwrap();
-        let found = s.search_contacts("ana", 10).unwrap();
+        let found = s.search_contacts("ana", 10, None).unwrap();
         assert_eq!(found.len(), 1, "email único sin distinguir mayúsculas");
         assert_eq!(found[0].name.as_deref(), Some("Ana Pérez"));
         assert_eq!(found[0].source, "graph");
@@ -1334,23 +1389,27 @@ mod tests {
     #[test]
     fn contacts_search_by_email_name_word_and_limit() {
         let s = store();
+        let acc = new_account(&s, "owner@example.com");
         let c = |name: Option<&str>, email: &str| Contact {
             name: name.map(String::from),
             email: email.into(),
             source: "test".into(),
         };
-        s.upsert_contacts(&[
-            c(Some("Juan Pérez"), "juan@example.com"),
-            c(Some("María Juana"), "maria@example.com"),
-            c(None, "juanita@example.com"),
-            c(Some("100% Real"), "real@example.com"),
-            c(Some("Under_score"), "under@example.com"),
-        ])
+        s.upsert_contacts(
+            acc,
+            &[
+                c(Some("Juan Pérez"), "juan@example.com"),
+                c(Some("María Juana"), "maria@example.com"),
+                c(None, "juanita@example.com"),
+                c(Some("100% Real"), "real@example.com"),
+                c(Some("Under_score"), "under@example.com"),
+            ],
+        )
         .unwrap();
 
         // Prefijo de email.
         let emails: Vec<_> = s
-            .search_contacts("juan", 10)
+            .search_contacts("juan", 10, None)
             .unwrap()
             .into_iter()
             .map(|c| c.email)
@@ -1359,28 +1418,176 @@ mod tests {
         assert!(emails.contains(&"juanita@example.com".to_string()));
         // Prefijo de nombre y de palabra dentro del nombre.
         let names: Vec<_> = s
-            .search_contacts("pér", 10)
+            .search_contacts("pér", 10, None)
             .unwrap()
             .into_iter()
             .map(|c| c.name)
             .collect();
         assert_eq!(names, vec![Some("Juan Pérez".to_string())]);
-        assert_eq!(s.search_contacts("perez", 10).unwrap().len(), 0);
+        assert_eq!(s.search_contacts("perez", 10, None).unwrap().len(), 0);
         let word: Vec<_> = s
-            .search_contacts("juana", 10)
+            .search_contacts("juana", 10, None)
             .unwrap()
             .into_iter()
             .map(|c| c.email)
             .collect();
         assert!(word.contains(&"maria@example.com".to_string()));
         // Los comodines se tratan literalmente.
-        assert_eq!(s.search_contacts("100%", 10).unwrap().len(), 1);
-        assert!(s.search_contacts("%", 10).unwrap().is_empty());
-        assert_eq!(s.search_contacts("under_", 10).unwrap().len(), 1);
-        assert_eq!(s.search_contacts("under", 10).unwrap().len(), 1);
-        assert_eq!(s.search_contacts("_", 10).unwrap().len(), 0);
+        assert_eq!(s.search_contacts("100%", 10, None).unwrap().len(), 1);
+        assert!(s.search_contacts("%", 10, None).unwrap().is_empty());
+        assert_eq!(s.search_contacts("under_", 10, None).unwrap().len(), 1);
+        assert_eq!(s.search_contacts("under", 10, None).unwrap().len(), 1);
+        assert_eq!(s.search_contacts("_", 10, None).unwrap().len(), 0);
         // Límite.
-        assert_eq!(s.search_contacts("", 2).unwrap().len(), 2);
+        assert_eq!(s.search_contacts("", 2, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contacts_are_per_account_and_deduplicated_by_preference() {
+        let s = store();
+        let gmail1 = new_account(&s, "uno@gmail.com");
+        let gmail2 = new_account(&s, "dos@gmail.com");
+        let c = |name: Option<&str>, email: &str| Contact {
+            name: name.map(String::from),
+            email: email.into(),
+            source: "test".into(),
+        };
+        s.upsert_contacts(gmail1, &[c(Some("Ana Uno"), "ana@example.com")])
+            .unwrap();
+        s.upsert_contacts(
+            gmail2,
+            &[
+                c(Some("Ana Dos"), "ana@example.com"),
+                c(Some("Bruno"), "bruno@example.com"),
+            ],
+        )
+        .unwrap();
+
+        // Mismo email en dos cuentas: una sola sugerencia, la de la cuenta preferida.
+        let found = s.search_contacts("ana", 10, Some(gmail2)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("Ana Dos"));
+        let found = s.search_contacts("ana", 10, Some(gmail1)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("Ana Uno"));
+        // Sin preferencia: también una sola.
+        assert_eq!(s.search_contacts("ana", 10, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn preferred_account_contacts_come_first() {
+        let s = store();
+        let a = new_account(&s, "a@gmail.com");
+        let b = new_account(&s, "b@outlook.com");
+        let c = |name: &str, email: &str| Contact {
+            name: Some(name.into()),
+            email: email.into(),
+            source: "test".into(),
+        };
+        s.upsert_contacts(a, &[c("Zoe", "zoe@example.com")])
+            .unwrap();
+        s.upsert_contacts(b, &[c("Adrián", "adrian@example.com")])
+            .unwrap();
+
+        let emails =
+            |found: Vec<Contact>| -> Vec<String> { found.into_iter().map(|c| c.email).collect() };
+        // Sin preferencia: orden alfabético normal.
+        assert_eq!(
+            emails(s.search_contacts("", 10, None).unwrap()),
+            vec!["adrian@example.com", "zoe@example.com"]
+        );
+        // La cuenta A primero aunque su nombre vaya después.
+        assert_eq!(
+            emails(s.search_contacts("", 10, Some(a)).unwrap()),
+            vec!["zoe@example.com", "adrian@example.com"]
+        );
+        assert_eq!(
+            emails(s.search_contacts("", 10, Some(b)).unwrap()),
+            vec!["adrian@example.com", "zoe@example.com"]
+        );
+    }
+
+    #[test]
+    fn contacts_upsert_keys_by_account_and_email() {
+        let s = store();
+        let a = new_account(&s, "a@gmail.com");
+        let b = new_account(&s, "b@gmail.com");
+        let c = Contact {
+            name: Some("Pepe".into()),
+            email: "pepe@example.com".into(),
+            source: "google".into(),
+        };
+        s.upsert_contacts(a, std::slice::from_ref(&c)).unwrap();
+        s.upsert_contacts(a, std::slice::from_ref(&c)).unwrap();
+        s.upsert_contacts(b, std::slice::from_ref(&c)).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "una fila por (cuenta, email)");
+    }
+
+    #[test]
+    fn deleting_account_removes_its_contacts_only() {
+        let s = store();
+        let a = new_account(&s, "a@gmail.com");
+        let b = new_account(&s, "b@gmail.com");
+        let c = Contact {
+            name: None,
+            email: "shared@example.com".into(),
+            source: "google".into(),
+        };
+        s.upsert_contacts(a, std::slice::from_ref(&c)).unwrap();
+        s.upsert_contacts(b, std::slice::from_ref(&c)).unwrap();
+        s.delete_account(a).unwrap();
+        let found = s.search_contacts("shared", 10, None).unwrap();
+        assert_eq!(found.len(), 1, "la otra cuenta conserva su libreta");
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM contacts WHERE account_id = ?1",
+                [a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn migration_3_keeps_legacy_contacts_without_account() {
+        let mut store = Store::open_in_memory().unwrap();
+        // Simula la BD v2: se deshace la migración 3 y se inserta una fila heredada.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE contacts;
+                 CREATE TABLE contacts (
+                     email TEXT PRIMARY KEY COLLATE NOCASE, name TEXT, source TEXT NOT NULL);
+                 CREATE INDEX contacts_by_name ON contacts (name COLLATE NOCASE);
+                 INSERT INTO contacts VALUES ('old@example.com', 'Viejo', 'google');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        migrate(&mut store.conn).unwrap();
+        let found = store.search_contacts("old", 10, None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("Viejo"));
+        let acc = new_account(&store, "nueva@gmail.com");
+        store
+            .upsert_contacts(
+                acc,
+                &[Contact {
+                    name: None,
+                    email: "old@example.com".into(),
+                    source: "google".into(),
+                }],
+            )
+            .unwrap();
+        // La fila heredada (sin cuenta) y la nueva conviven; la búsqueda da una sola.
+        assert_eq!(
+            store.search_contacts("old", 10, Some(acc)).unwrap().len(),
+            1
+        );
     }
 
     #[test]

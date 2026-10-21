@@ -117,12 +117,13 @@ impl Attachments {
             let me = self.clone();
             glib::MainContext::default().spawn_local(async move {
                 match read.await {
-                    Ok(item) => {
+                    Ok(Ok(item)) => {
                         if let Err(msg) = me.add(item) {
                             (me.inner.notify)(msg);
                         }
                     }
-                    Err(msg) => (me.inner.notify)(msg),
+                    Ok(Err(msg)) => (me.inner.notify)(msg),
+                    Err(e) => (me.inner.notify)(e.to_string()),
                 }
             });
         }

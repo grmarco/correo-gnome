@@ -1,4 +1,5 @@
-//! Servidor HTTP falso (tokio) para probar intercambio y refresco sin red.
+//! Servidor HTTP falso (tokio) para probar intercambio y refresco sin red. Disponible en
+//! los tests de este crate y, con la feature `test-support`, en los de otros crates.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -6,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-pub(crate) struct FakeServer {
+pub struct FakeServer {
     pub url: String,
     requests: Arc<Mutex<Vec<String>>>,
 }
@@ -14,11 +15,34 @@ pub(crate) struct FakeServer {
 impl FakeServer {
     /// Responde a cada petición con la siguiente entrada de `responses` (status, cuerpo JSON).
     /// Si se agotan, responde 500 para que el test falle de forma visible.
-    pub(crate) async fn start(responses: Vec<(u16, String)>) -> Self {
+    pub async fn start(responses: Vec<(u16, String)>) -> Self {
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        Self::serve(move |_request| {
+            queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((500, "{\"error\":\"sin respuesta preparada\"}".into()))
+        })
+        .await
+    }
+
+    /// Calcula la respuesta a partir de la petición completa (línea de inicio, cabeceras y
+    /// cuerpo). Sirve para simular un proveedor que responde distinto según el refresh token.
+    pub async fn start_with<F>(handler: F) -> Self
+    where
+        F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::serve(handler).await
+    }
+
+    async fn serve<F>(handler: F) -> Self
+    where
+        F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/token", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
         let log = Arc::clone(&requests);
         tokio::spawn(async move {
             loop {
@@ -26,12 +50,8 @@ impl FakeServer {
                     return;
                 };
                 let request = read_request(&mut stream).await;
+                let (status, body) = handler(&request);
                 log.lock().unwrap().push(request);
-                let (status, body) = queue
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or((500, "{\"error\":\"sin respuesta preparada\"}".into()));
                 let response = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -44,7 +64,7 @@ impl FakeServer {
     }
 
     /// Peticiones recibidas: línea de inicio, cabeceras y cuerpo.
-    pub(crate) fn requests(&self) -> Vec<String> {
+    pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -82,7 +102,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
 }
 
 /// Cuerpo JSON de una respuesta de token.
-pub(crate) fn token_json(access: &str, refresh: Option<&str>, expires_in: u64) -> String {
+pub fn token_json(access: &str, refresh: Option<&str>, expires_in: u64) -> String {
     match refresh {
         Some(r) => format!(
             "{{\"access_token\":\"{access}\",\"token_type\":\"Bearer\",\"expires_in\":{expires_in},\"refresh_token\":\"{r}\"}}"

@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
-use correo_core::{Address, Contact};
+use correo_core::{AccountId, Address, Contact};
 use correo_store::Store;
 use gtk::{gdk, glib};
 
@@ -32,6 +32,8 @@ struct Inner {
     list: gtk::ListBox,
     suggestions: RefCell<Vec<Contact>>,
     store: Arc<Mutex<Store>>,
+    /// Cuenta remitente: sus contactos aparecen primero en las sugerencias.
+    preferred: Cell<Option<AccountId>>,
     on_change: Rc<dyn Fn()>,
 }
 
@@ -85,6 +87,7 @@ impl RecipientField {
                 list: list.clone(),
                 suggestions: RefCell::new(Vec::new()),
                 store,
+                preferred: Cell::new(None),
                 on_change,
             }),
         };
@@ -130,6 +133,18 @@ impl RecipientField {
         });
 
         field
+    }
+
+    /// Cuenta remitente seleccionada. Sus contactos se muestran primero; si hay sugerencias
+    /// abiertas, se reordenan en el acto.
+    pub fn set_preferred_account(&self, account: Option<AccountId>) {
+        if self.inner.preferred.get() == account {
+            return;
+        }
+        self.inner.preferred.set(account);
+        if !self.inner.entry.text().trim().is_empty() {
+            self.update_suggestions();
+        }
     }
 
     pub fn widget(&self) -> gtk::FlowBox {
@@ -283,7 +298,7 @@ impl RecipientField {
         }
         let found = match inner.store.lock() {
             Ok(store) => store
-                .search_contacts(query, SUGGESTIONS)
+                .search_contacts(query, SUGGESTIONS, inner.preferred.get())
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         };

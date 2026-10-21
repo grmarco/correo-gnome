@@ -67,6 +67,10 @@ impl OAuthTokenProvider {
             )
         })?;
         self.store.save_refresh_token(account, refresh).await?;
+        // Una reautorización invalida lo cacheado de la cuenta (de la sesión anterior).
+        for audience in [TokenAudience::Mail, TokenAudience::Directory] {
+            *self.slot(account, audience).lock().await = None;
+        }
         // El token inicial solo vale para el primer recurso de los scopes (el del correo).
         let slot = self.slot(account, TokenAudience::Mail);
         *slot.lock().await = Some(CachedToken::from_tokens(tokens));

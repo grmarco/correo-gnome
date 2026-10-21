@@ -6,7 +6,10 @@ use std::future::Future;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use correo_core::{Account, Mailbox, MailboxId, MailboxRole, MessageHeader, Result as CoreResult};
+use correo_core::{
+    Account, AccountId, Address, Mailbox, MailboxId, MailboxRole, MessageHeader,
+    Result as CoreResult,
+};
 use correo_store::Store;
 use gtk::{gio, glib};
 
@@ -15,8 +18,8 @@ use crate::message_list::{thread_rows, MessageList};
 use crate::notify;
 use crate::reader::MessageView;
 use crate::search;
-use crate::services::Services;
-use crate::setup::{self, SyncHandle};
+use crate::services::{flatten, Services};
+use crate::setup::{self, AddOutcome, SyncHandle};
 use crate::sidebar::{Sidebar, Target};
 use crate::ui_types::ComposeMode;
 
@@ -134,11 +137,19 @@ impl Shell {
         Rc::new_cyclic(|weak: &Weak<Shell>| {
             let sidebar = {
                 let w = weak.clone();
-                Sidebar::new(move |t| {
-                    if let Some(s) = w.upgrade() {
-                        s.set_target(t);
-                    }
-                })
+                let w_remove = weak.clone();
+                Sidebar::new(
+                    move |t| {
+                        if let Some(s) = w.upgrade() {
+                            s.set_target(t);
+                        }
+                    },
+                    move |id| {
+                        if let Some(s) = w_remove.upgrade() {
+                            s.confirm_remove_account(id);
+                        }
+                    },
+                )
             };
             {
                 let w = weak.clone();
@@ -678,14 +689,16 @@ impl Shell {
         *self.reader.borrow_mut() = Some(view);
     }
 
-    /// Abre el compositor. Para respuestas y reenvíos usa la cuenta del mensaje.
+    /// Abre el compositor. Un mensaje nuevo sale de la cuenta de la carpeta que se ve (o del
+    /// mensaje seleccionado en la bandeja unificada); respuestas y reenvíos, de la cuenta que
+    /// recibió el mensaje original.
     fn compose(self: &Rc<Self>, mode: ComposeMode) {
         let account = match &mode {
-            ComposeMode::New => self.state.borrow().accounts.first().cloned(),
-            ComposeMode::Reply(h, _) | ComposeMode::ReplyAll(h, _) | ComposeMode::Forward(h, _) => {
-                self.mailbox(h.mailbox_id)
-                    .and_then(|m| self.account(m.account_id))
-            }
+            ComposeMode::New => self.default_sender(),
+            ComposeMode::Reply(h, _) | ComposeMode::ReplyAll(h, _) => self.reply_account(h),
+            ComposeMode::Forward(h, _) => self
+                .mailbox(h.mailbox_id)
+                .and_then(|m| self.account(m.account_id)),
         };
         match account {
             Some(account) => composer::open(&self.app, self.services.clone(), account, mode),
@@ -693,31 +706,92 @@ impl Shell {
         }
     }
 
+    /// Cuenta remitente por defecto de un mensaje nuevo.
+    fn default_sender(&self) -> Option<Account> {
+        let account_of = |mailbox_id: MailboxId| self.mailbox(mailbox_id).map(|m| m.account_id);
+        let from_view = match self.state.borrow().target {
+            Target::Mailbox(id) => account_of(id),
+            Target::Unified => None,
+        };
+        let from_selection = self
+            .state
+            .borrow()
+            .selected
+            .as_ref()
+            .and_then(|h| account_of(h.mailbox_id));
+        from_view
+            .or(from_selection)
+            .and_then(|id| self.account(id))
+            .or_else(|| self.state.borrow().accounts.first().cloned())
+    }
+
+    /// Cuenta desde la que responder: la que recibió el mensaje. Si esa cuenta no aparece en
+    /// De/Para/Cc y otra cuenta sí (p. ej. un mensaje guardado en una carpeta compartida),
+    /// se usa esa otra.
+    fn reply_account(&self, h: &MessageHeader) -> Option<Account> {
+        let owner = self
+            .mailbox(h.mailbox_id)
+            .and_then(|m| self.account(m.account_id));
+        let st = self.state.borrow();
+        let addressed = |account: &Account, list: &[Address]| {
+            list.iter()
+                .any(|a| a.email.eq_ignore_ascii_case(&account.email))
+        };
+        if let Some(owner) = &owner {
+            let mentioned = [&h.from, &h.to, &h.cc]
+                .iter()
+                .any(|list| addressed(owner, list));
+            if mentioned {
+                return Some(owner.clone());
+            }
+        }
+        st.accounts
+            .iter()
+            .find(|a| addressed(a, &h.to) || addressed(a, &h.cc))
+            .cloned()
+            .or(owner)
+    }
+
     // ----- Cuentas y avisos del sincronizador -------------------------------
 
     /// Abre el alta de cuenta; al terminar, la añade a la barra y la sincroniza.
     fn add_account(self: &Rc<Self>) {
         let w = self.weak.clone();
-        setup::add_account_dialog(&self.window, self.services.clone(), move |account| {
-            if let Some(s) = w.upgrade() {
-                s.on_account_added(account);
-            }
-        });
+        setup::add_account_dialog(
+            &self.window,
+            self.services.clone(),
+            move |account, outcome| {
+                if let Some(s) = w.upgrade() {
+                    s.on_account_added(account, outcome);
+                }
+            },
+        );
     }
 
-    fn on_account_added(self: &Rc<Self>, account: Account) {
+    fn on_account_added(self: &Rc<Self>, account: Account, outcome: AddOutcome) {
         if let Err(e) = self.reload_model() {
             self.toast(format!("No se pudo leer la base de datos: {e}"));
         }
         self.root.set_visible_child_name("main");
         self.apply_target();
 
-        self.fresh_accounts.borrow_mut().push(account.id);
+        let message = match outcome {
+            AddOutcome::Added => {
+                self.fresh_accounts.borrow_mut().push(account.id);
+                format!("Cuenta añadida: {}", account.email)
+            }
+            AddOutcome::Reauthorized => {
+                // La conexión IMAP pudo abrirse con el token anterior: se descarta para que
+                // la siguiente operación use el nuevo.
+                self.services.forget_backend(account.id);
+                format!("Cuenta reautorizada: {}", account.email)
+            }
+        };
         if let Some(sync) = self.sync.borrow().as_ref() {
             sync.account_reauthorized(account.clone());
         }
         self.sync_contacts(&account);
-        self.toast(format!("Cuenta añadida: {}", account.email));
+        self.toast(message);
     }
 
     /// El proveedor rechazó las credenciales (token revocado o caducado): la
@@ -743,11 +817,10 @@ impl Shell {
     fn sync_contacts(self: &Rc<Self>, account: &Account) {
         let source = self.services.contacts(account);
         let store = self.services.store.clone();
-        let job = self.services.spawn(async move {
-            correo_contacts::sync_into_store(source.as_ref(), &store)
-                .await
-                .map_err(|e| e.to_string())
-        });
+        let account_id = account.id;
+        let job = flatten(self.services.spawn(async move {
+            correo_contacts::sync_into_store(account_id, source.as_ref(), &store).await
+        }));
         let email = account.email.clone();
         glib::MainContext::default().spawn_local(async move {
             if let Err(e) = job.await {
@@ -764,7 +837,8 @@ impl Shell {
             .iter()
             .filter_map(|id| self.with_store(|s| s.get_header(*id)).ok().flatten())
             .collect();
-        notify::notify_new_if_inactive(&self.app, &account, &headers, self.is_in_front());
+        let several = self.state.borrow().accounts.len() > 1;
+        notify::notify_new_if_inactive(&self.app, &account, &headers, self.is_in_front(), several);
 
         // La primera sincronización de una cuenta recién añadida no trae ids nuevos
         // (la caché estaba vacía), pero sí debe verse en la lista.
@@ -825,6 +899,95 @@ impl Shell {
         }
     }
 
+    // ----- Eliminar cuenta -------------------------------------------------
+
+    /// Pide confirmación antes de eliminar una cuenta.
+    fn confirm_remove_account(self: &Rc<Self>, account_id: AccountId) {
+        let Some(account) = self.account(account_id) else {
+            return;
+        };
+        let body = format!(
+            "Se borrarán de este equipo los mensajes guardados, los contactos y las credenciales \
+             de {}. El correo que está en el servidor no se modifica.",
+            account.email
+        );
+        let dialog = adw::AlertDialog::new(Some("¿Eliminar la cuenta?"), Some(&body));
+        dialog.add_response("cancel", "Cancelar");
+        dialog.add_response("delete", "Eliminar");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let w = self.weak.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            if let Some(s) = w.upgrade() {
+                s.remove_account(account_id);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Elimina una cuenta: para su sincronización, borra la caché, los contactos y los
+    /// tokens, y recarga la barra y la lista.
+    fn remove_account(self: &Rc<Self>, account_id: AccountId) {
+        let Some(account) = self.account(account_id) else {
+            return;
+        };
+        if let Some(sync) = self.sync.borrow().as_ref() {
+            sync.stop_account(account_id);
+        }
+        if let Err(e) = self.services.remove_account(account_id) {
+            self.toast(format!("No se pudo eliminar la cuenta: {e}"));
+            return;
+        }
+        self.fresh_accounts
+            .borrow_mut()
+            .retain(|id| *id != account_id);
+
+        // ¿La vista o el mensaje abierto pertenecían a la cuenta? Se comprueba con el modelo
+        // anterior, que aún contiene sus carpetas.
+        let (view_in_account, selected_in_account) = {
+            let st = self.state.borrow();
+            let in_account = |mailbox_id: MailboxId| {
+                st.mailboxes
+                    .iter()
+                    .any(|m| m.id == mailbox_id && m.account_id == account_id)
+            };
+            let view = match st.target {
+                Target::Mailbox(id) => in_account(id),
+                Target::Unified => false,
+            };
+            let selected = st
+                .selected
+                .as_ref()
+                .is_some_and(|h| in_account(h.mailbox_id));
+            (view, selected)
+        };
+        if selected_in_account {
+            self.state.borrow_mut().selected = None;
+            if let Some(reader) = self.reader.borrow().as_ref() {
+                reader.clear();
+            }
+            self.reader_stack.set_visible_child_name("empty");
+        }
+        if let Err(e) = self.reload_model() {
+            self.toast(format!("Error al leer la caché: {e}"));
+        }
+        if self.state.borrow().accounts.is_empty() {
+            self.root.set_visible_child_name("empty");
+        } else if view_in_account {
+            // La carpeta que se veía ya no existe: se vuelve a la bandeja unificada.
+            self.state.borrow_mut().target = Target::Unified;
+            self.apply_target();
+        } else {
+            self.reload_sidebar();
+            self.refresh_list();
+        }
+        self.toast(format!("Cuenta eliminada: {}", account.email));
+    }
+
     // ----- Sincronización --------------------------------------------------
 
     fn sync(self: &Rc<Self>) {
@@ -844,8 +1007,10 @@ impl Shell {
             .map(|(account, mailbox)| {
                 let backend = self.services.backend(&account);
                 let days = account.sync_days;
-                self.services
-                    .spawn(async move { backend.sync_mailbox(&mailbox, days).await })
+                flatten(
+                    self.services
+                        .spawn(async move { backend.sync_mailbox(&mailbox, days).await }),
+                )
             })
             .collect();
 
@@ -942,9 +1107,10 @@ impl Shell {
     ) {
         let backend = self.services.backend(account);
         let uid = h.uid;
-        let fut = self
-            .services
-            .spawn(async move { backend.set_seen(&mailbox, uid, seen).await });
+        let fut = flatten(
+            self.services
+                .spawn(async move { backend.set_seen(&mailbox, uid, seen).await }),
+        );
         self.run(fut, move |s, ()| s.apply_seen(&h, seen));
     }
 
@@ -971,9 +1137,10 @@ impl Shell {
         }
         let backend = self.services.backend(account);
         let uid = h.uid;
-        let fut = self
-            .services
-            .spawn(async move { backend.move_to(&mailbox, uid, &target).await });
+        let fut = flatten(
+            self.services
+                .spawn(async move { backend.move_to(&mailbox, uid, &target).await }),
+        );
         self.run(fut, move |s, ()| s.drop_local(&h));
     }
 
@@ -983,9 +1150,10 @@ impl Shell {
         };
         let backend = self.services.backend(&account);
         let uid = h.uid;
-        let fut = self
-            .services
-            .spawn(async move { backend.delete(&mailbox, uid).await });
+        let fut = flatten(
+            self.services
+                .spawn(async move { backend.delete(&mailbox, uid).await }),
+        );
         self.run(fut, move |s, ()| s.drop_local(&h));
     }
 
@@ -1108,37 +1276,45 @@ pub fn demo_services() -> Result<Services, Box<dyn std::error::Error>> {
     Ok(Services::new(store, Arc::new(NoTokens))?)
 }
 
-/// Inserta una cuenta ficticia con dos carpetas y 30 mensajes en hilos de 3.
+/// Inserta cuatro cuentas ficticias (dos Gmail y dos Outlook / Microsoft 365), cada una con
+/// Entrada y Enviados y 12 mensajes en hilos de 3. Dos cuentas comparten nombre visible para
+/// comprobar que la barra lateral, el selector «De» y las notificaciones distinguen por email.
 #[cfg(debug_assertions)]
 pub fn seed_demo(store: &Store) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use correo_core::{Account, Address, Flags, Mailbox, MailboxRole, MessageHeader, Provider};
 
-    let account_id = store
-        .create_account(&Account {
-            id: 0,
-            provider: Provider::Gmail,
-            email: "demo@ejemplo.com".into(),
-            display_name: "Demo".into(),
-            sync_days: 30,
-        })
-        .expect("cuenta demo");
-    let mailbox = |path: &str, role, unread| Mailbox {
-        id: 0,
-        account_id,
-        path: path.into(),
-        role,
-        uid_validity: Some(1),
-        unread,
-    };
-    let inbox = store
-        .upsert_mailbox(&mailbox("INBOX", MailboxRole::Inbox, 0))
-        .expect("carpeta demo");
-    store
-        .upsert_mailbox(&mailbox("[Gmail]/Enviados", MailboxRole::Sent, 0))
-        .expect("carpeta demo");
-
+    let accounts = [
+        (
+            Provider::Gmail,
+            "demo.uno@gmail.com",
+            "Demo",
+            "INBOX",
+            "[Gmail]/Enviados",
+        ),
+        (
+            Provider::Gmail,
+            "demo.dos@gmail.com",
+            "Demo",
+            "INBOX",
+            "[Gmail]/Enviados",
+        ),
+        (
+            Provider::Outlook,
+            "demo.outlook@outlook.com",
+            "Demo Outlook",
+            "INBOX",
+            "Elementos enviados",
+        ),
+        (
+            Provider::Microsoft365,
+            "demo.trabajo@empresa.example",
+            "Demo Trabajo",
+            "INBOX",
+            "Elementos enviados",
+        ),
+    ];
     let people = [
         ("Ana Ruiz", "ana@ejemplo.com"),
         ("Luis Gómez", "luis@ejemplo.org"),
@@ -1149,64 +1325,92 @@ pub fn seed_demo(store: &Store) {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
 
-    let mut headers = Vec::new();
-    let mut unread = 0;
-    for i in 0..30u32 {
-        let thread = i / 3;
-        let root_id = format!("<demo-{}@ejemplo.com>", thread * 3);
-        let mid = format!("<demo-{i}@ejemplo.com>");
-        let (in_reply_to, references, subject) = if i % 3 == 0 {
-            (
-                None,
-                Vec::new(),
-                format!("Tema {}: presupuesto del trimestre", thread + 1),
-            )
-        } else {
-            let prev = format!("<demo-{}@ejemplo.com>", i - 1);
-            (
-                Some(prev.clone()),
-                vec![root_id.clone(), prev],
-                format!("Re: Tema {}: presupuesto del trimestre", thread + 1),
-            )
-        };
-        let (name, email) = people[(thread as usize) % people.len()];
-        let seen = i % 4 != 0;
-        if !seen {
-            unread += 1;
-        }
-        headers.push(MessageHeader {
-            id: 0,
-            mailbox_id: inbox,
-            uid: i + 1,
-            message_id: Some(mid),
-            in_reply_to,
-            references,
-            subject,
-            from: vec![Address {
-                name: Some(name.into()),
+    for (index, (provider, email, display_name, inbox_path, sent_path)) in
+        accounts.into_iter().enumerate()
+    {
+        let account_id = store
+            .create_account(&Account {
+                id: 0,
+                provider,
                 email: email.into(),
-            }],
-            to: vec![Address {
-                name: None,
-                email: "demo@ejemplo.com".into(),
-            }],
-            cc: Vec::new(),
-            date: now - i64::from(30 - i) * 7_200,
-            flags: Flags {
-                seen,
-                ..Flags::default()
-            },
-            has_attachments: i % 5 == 0,
-            snippet: Some(format!(
-                "Hola, te envío la revisión número {i} del documento."
-            )),
-            labels: Vec::new(),
-        });
+                display_name: display_name.into(),
+                sync_days: 30,
+            })
+            .expect("cuenta demo");
+        let mailbox = |path: &str, role, unread| Mailbox {
+            id: 0,
+            account_id,
+            path: path.into(),
+            role,
+            uid_validity: Some(1),
+            unread,
+        };
+        let inbox = store
+            .upsert_mailbox(&mailbox(inbox_path, MailboxRole::Inbox, 0))
+            .expect("carpeta demo");
+        store
+            .upsert_mailbox(&mailbox(sent_path, MailboxRole::Sent, 0))
+            .expect("carpeta demo");
+
+        let mut headers = Vec::new();
+        let mut unread = 0;
+        for i in 0..12u32 {
+            let thread = i / 3;
+            let root_id = format!("<demo{index}-{}@ejemplo.com>", thread * 3);
+            let mid = format!("<demo{index}-{i}@ejemplo.com>");
+            let (in_reply_to, references, subject) = if i % 3 == 0 {
+                (
+                    None,
+                    Vec::new(),
+                    format!("Tema {}: presupuesto del trimestre", thread + 1),
+                )
+            } else {
+                let prev = format!("<demo{index}-{}@ejemplo.com>", i - 1);
+                (
+                    Some(prev.clone()),
+                    vec![root_id.clone(), prev],
+                    format!("Re: Tema {}: presupuesto del trimestre", thread + 1),
+                )
+            };
+            let (name, sender) = people[(thread as usize + index) % people.len()];
+            let seen = i % 4 != 0;
+            if !seen {
+                unread += 1;
+            }
+            headers.push(MessageHeader {
+                id: 0,
+                mailbox_id: inbox,
+                uid: i + 1,
+                message_id: Some(mid),
+                in_reply_to,
+                references,
+                subject,
+                from: vec![Address {
+                    name: Some(name.into()),
+                    email: sender.into(),
+                }],
+                to: vec![Address {
+                    name: None,
+                    email: email.into(),
+                }],
+                cc: Vec::new(),
+                date: now - i64::from(12 - i) * 7_200 - index as i64 * 600,
+                flags: Flags {
+                    seen,
+                    ..Flags::default()
+                },
+                has_attachments: i % 5 == 0,
+                snippet: Some(format!(
+                    "Hola, te envío la revisión número {i} del documento."
+                )),
+                labels: Vec::new(),
+            });
+        }
+        store
+            .upsert_headers(inbox, &headers)
+            .expect("cabeceras demo");
+        store
+            .upsert_mailbox(&mailbox(inbox_path, MailboxRole::Inbox, unread))
+            .expect("contador demo");
     }
-    store
-        .upsert_headers(inbox, &headers)
-        .expect("cabeceras demo");
-    store
-        .upsert_mailbox(&mailbox("INBOX", MailboxRole::Inbox, unread))
-        .expect("contador demo");
 }

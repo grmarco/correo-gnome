@@ -30,3 +30,7 @@ webkit6 = { version = "0.6.1", optional = true }
 [features]
 default = []
 webkit = ["dep:webkit6"]
+
+[dev-dependencies]
+# Servidor OAuth falso para los tests del enrutador de tokens.
+correo-auth = { path = "../correo-auth", features = ["test-support"] }

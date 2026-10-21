@@ -40,9 +40,11 @@ impl OAuthProvider {
             directory_scopes: Vec::new(),
             client_id: client_id.into(),
             client_secret: None,
+            // `select_account`: el navegador pregunta qué cuenta usar en vez de reutilizar la
+            // última sesión; así la segunda cuenta de Google no sustituye a la primera.
             extra_authorization_params: vec![
                 ("access_type".into(), "offline".into()),
-                ("prompt".into(), "consent".into()),
+                ("prompt".into(), "select_account consent".into()),
             ],
             callback_timeout: Duration::from_secs(300),
         }
@@ -72,7 +74,9 @@ impl OAuthProvider {
             ],
             client_id: client_id.into(),
             client_secret: None,
-            extra_authorization_params: Vec::new(),
+            // Igual que en Google: elegir cuenta explícitamente para poder añadir varias
+            // cuentas de Microsoft sin que el navegador reutilice la primera.
+            extra_authorization_params: vec![("prompt".into(), "select_account".into())],
             callback_timeout: Duration::from_secs(300),
         }
     }

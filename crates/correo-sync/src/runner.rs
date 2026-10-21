@@ -58,6 +58,19 @@ pub struct SyncChannels {
     pub task: JoinHandle<()>,
 }
 
+impl Drop for SyncRunner {
+    /// Al terminar el runner (se cierra su canal o se aborta su tarea), la sincronización o el
+    /// IDLE en curso tampoco siguen en segundo plano con su conexión abierta.
+    fn drop(&mut self) {
+        if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.idle_task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Estado compartido con las tareas de sincronización.
 struct Shared {
     backend: Arc<dyn MailBackend>,

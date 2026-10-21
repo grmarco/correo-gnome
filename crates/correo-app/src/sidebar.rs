@@ -1,11 +1,13 @@
 //! T9: barra lateral con la bandeja unificada y las carpetas de cada cuenta,
 //! ordenadas por rol (Entrada, Borradores, Enviados, Archivo, Spam, Papelera, resto).
+//! Cada cuenta se identifica por su email (varias cuentas del mismo proveedor pueden
+//! tener el mismo nombre). Con el botón derecho sobre la cuenta se ofrece «Eliminar cuenta».
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use correo_core::{Account, Mailbox, MailboxId, MailboxRole};
+use correo_core::{Account, AccountId, Mailbox, MailboxId, MailboxRole};
 
 /// Destino seleccionable en la barra lateral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,15 +24,25 @@ pub struct Sidebar {
     list: gtk::ListBox,
     /// Destino de cada fila, por posición (las cabeceras de cuenta no tienen destino).
     targets: Rc<RefCell<Vec<Option<Target>>>>,
+    /// Cuenta de cada cabecera, por posición (`None` en el resto de filas).
+    owners: Rc<RefCell<Vec<Option<AccountId>>>>,
+    /// Menú «Eliminar cuenta», con un único popover reutilizado para todas las cuentas.
+    menu: gtk::Popover,
 }
 
 impl Sidebar {
-    pub fn new(on_select: impl Fn(Target) + 'static) -> Self {
+    /// `on_select` recibe el destino elegido; `on_remove` la cuenta que el usuario quiere
+    /// eliminar desde el menú contextual (la confirmación la hace quien recibe el aviso).
+    pub fn new(
+        on_select: impl Fn(Target) + 'static,
+        on_remove: impl Fn(AccountId) + 'static,
+    ) -> Self {
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
         list.set_selection_mode(gtk::SelectionMode::Single);
 
         let targets: Rc<RefCell<Vec<Option<Target>>>> = Rc::new(RefCell::new(Vec::new()));
+        let owners: Rc<RefCell<Vec<Option<AccountId>>>> = Rc::new(RefCell::new(Vec::new()));
         let on_select = Rc::new(on_select);
         {
             let targets = targets.clone();
@@ -49,6 +61,55 @@ impl Sidebar {
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
         scroller.set_child(Some(&list));
 
+        // Menú contextual de la cabecera de una cuenta. Su padre es el desplazador, no la
+        // lista: `ListBox` no admite hijos que no sean filas.
+        let menu_account: Rc<Cell<Option<AccountId>>> = Rc::new(Cell::new(None));
+        let menu = gtk::Popover::new();
+        menu.set_has_arrow(false);
+        menu.set_parent(&scroller);
+        let remove = gtk::Button::with_label("Eliminar cuenta");
+        remove.add_css_class("flat");
+        remove.add_css_class("destructive-action");
+        menu.set_child(Some(&remove));
+        {
+            let menu = menu.clone();
+            let menu_account = Rc::clone(&menu_account);
+            remove.connect_clicked(move |_| {
+                menu.popdown();
+                if let Some(id) = menu_account.take() {
+                    on_remove(id);
+                }
+            });
+        }
+        {
+            let click = gtk::GestureClick::new();
+            // Botón secundario (menú contextual).
+            click.set_button(3);
+            let owners = Rc::clone(&owners);
+            let menu = menu.clone();
+            let menu_account = Rc::clone(&menu_account);
+            let list_for_rows = list.clone();
+            let scroller = scroller.clone();
+            click.connect_pressed(move |_, _, x, y| {
+                let Some(row) = list_for_rows.row_at_y(y as i32) else {
+                    return;
+                };
+                let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
+                let Some(Some(id)) = owners.borrow().get(index).copied() else {
+                    return;
+                };
+                let point = gtk::graphene::Point::new(x as f32, y as f32);
+                let Some(point) = list_for_rows.compute_point(&scroller, &point) else {
+                    return;
+                };
+                let (x, y) = (point.x() as f64, point.y() as f64);
+                menu_account.set(Some(id));
+                menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                menu.popup();
+            });
+            list.add_controller(click);
+        }
+
         let add_button = gtk::Button::from_icon_name("list-add-symbolic");
         add_button.set_tooltip_text(Some("Añadir cuenta"));
         let header = adw::HeaderBar::new();
@@ -63,6 +124,8 @@ impl Sidebar {
             add_button,
             list,
             targets,
+            owners,
+            menu,
         }
     }
 
@@ -78,11 +141,12 @@ impl Sidebar {
     /// Reconstruye la barra con las cuentas y sus carpetas, y selecciona `current`
     /// sin que ello cambie de destino (el llamador comprueba si ya estaba activo).
     pub fn reload(&self, accounts: &[(Account, Vec<Mailbox>)], current: Target) {
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        while let Some(row) = self.list.row_at_index(0) {
+            self.list.remove(&row);
         }
 
         let mut targets: Vec<Option<Target>> = Vec::new();
+        let mut owners: Vec<Option<AccountId>> = Vec::new();
         let mut rows: Vec<gtk::ListBoxRow> = Vec::new();
 
         let unified_unread: u32 = accounts
@@ -97,15 +161,13 @@ impl Sidebar {
             unified_unread,
         ));
         targets.push(Some(Target::Unified));
+        owners.push(None);
 
         for (account, boxes) in accounts {
-            let title = if account.display_name.trim().is_empty() {
-                account.email.clone()
-            } else {
-                format!("{} · {}", account.display_name, account.email)
-            };
-            rows.push(header_row(&title));
+            // El email es el título: dos cuentas pueden tener el mismo nombre visible.
+            rows.push(header_row(&account.email));
             targets.push(None);
+            owners.push(Some(account.id));
 
             let mut sorted: Vec<&Mailbox> = boxes.iter().collect();
             sorted.sort_by(|a, b| {
@@ -116,6 +178,7 @@ impl Sidebar {
             for m in sorted {
                 rows.push(target_row(role_icon(m.role), &mailbox_label(m), m.unread));
                 targets.push(Some(Target::Mailbox(m.id)));
+                owners.push(None);
             }
         }
 
@@ -127,6 +190,9 @@ impl Sidebar {
             }
         }
         *self.targets.borrow_mut() = targets;
+        *self.owners.borrow_mut() = owners;
+        // Si el menú sigue abierto sobre una cuenta que ya no existe, se cierra.
+        self.menu.popdown();
 
         if let Some(row) = selected_row {
             self.list.select_row(Some(&row));

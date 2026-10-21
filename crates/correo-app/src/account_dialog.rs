@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
-use correo_auth::{OAuthClient, OAuthProvider, OAuthTokenProvider, TokenSet};
+use correo_auth::{OAuthClient, TokenSet};
 use correo_core::{Account, Error, Provider, Result};
 use correo_store::Store;
 use gtk::glib;
 use serde::Deserialize;
 
-use super::{app_config, oauth_config, token_store};
-use crate::services::Services;
+use super::{app_config, oauth_config, save_account_tokens};
+use crate::services::{flatten, Services};
 
 const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const GRAPH_ME_URL: &str =
@@ -55,6 +55,15 @@ impl Choice {
     }
 }
 
+/// Resultado de una autorización completada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// Cuenta nueva, guardada en la BD.
+    Added,
+    /// El perfil devuelto coincide con una cuenta existente: se han renovado sus tokens.
+    Reauthorized,
+}
+
 /// Estado compartido por los callbacks del diálogo.
 struct Flow {
     services: Rc<Services>,
@@ -62,14 +71,15 @@ struct Flow {
     parent: gtk::Window,
     list: gtk::ListBox,
     status: gtk::Label,
-    on_done: Rc<dyn Fn(Account)>,
+    on_done: Rc<dyn Fn(Account, AddOutcome)>,
 }
 
-/// Muestra el diálogo de alta. `on_done` recibe la cuenta ya guardada en la BD.
+/// Muestra el diálogo de alta. `on_done` recibe la cuenta ya guardada en la BD y si era
+/// una cuenta nueva o una reautorización.
 pub fn add_account_dialog(
     parent: &impl IsA<gtk::Window>,
     services: Rc<Services>,
-    on_done: impl Fn(Account) + 'static,
+    on_done: impl Fn(Account, AddOutcome) + 'static,
 ) {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -179,13 +189,12 @@ fn start(flow: Rc<Flow>, choice: Choice) {
     glib::MainContext::default().spawn_local(async move {
         let services = Rc::clone(&flow.services);
         let oauth_for_begin = oauth.clone();
-        let begun = services
-            .spawn(async move {
-                OAuthClient::new(oauth_for_begin)?
-                    .begin_authorization()
-                    .await
-            })
-            .await;
+        let begun = flatten(services.spawn(async move {
+            OAuthClient::new(oauth_for_begin)?
+                .begin_authorization()
+                .await
+        }))
+        .await;
         let request = match begun {
             Ok(request) => request,
             Err(e) => return flow.fail(e),
@@ -204,49 +213,46 @@ fn start(flow: Rc<Flow>, choice: Choice) {
             "Esperando a que completes el inicio de sesión en el navegador…",
         );
 
-        let authorized = services
-            .spawn(async move {
-                let tokens = request.finish().await?;
-                // En Microsoft el token inicial es del recurso de correo; el perfil (Graph)
-                // necesita un token propio obtenido con el refresh token.
-                let profile_token = match (provider, tokens.refresh_token.as_deref()) {
-                    (Provider::Gmail, _) => tokens.access_token.clone(),
-                    (_, Some(refresh)) => {
-                        let config = crate::setup::oauth_config(provider)
-                            .ok_or_else(|| Error::Auth("falta el client_id de Microsoft".into()))?;
-                        let scopes = config.directory_scopes.clone();
-                        OAuthClient::new(config)?
-                            .refresh_scoped(refresh, &scopes)
-                            .await?
-                            .access_token
-                    }
-                    (_, None) => {
-                        return Err(Error::Auth("Microsoft no devolvió refresh token".into()));
-                    }
-                };
-                let profile = fetch_profile(provider, &profile_token).await?;
-                Ok::<_, Error>((tokens, profile))
-            })
-            .await;
+        let authorized = flatten(services.spawn(async move {
+            let tokens = request.finish().await?;
+            // En Microsoft el token inicial es del recurso de correo; el perfil (Graph)
+            // necesita un token propio obtenido con el refresh token.
+            let profile_token = match (provider, tokens.refresh_token.as_deref()) {
+                (Provider::Gmail, _) => tokens.access_token.clone(),
+                (_, Some(refresh)) => {
+                    let config = crate::setup::oauth_config(provider)
+                        .ok_or_else(|| Error::Auth("falta el client_id de Microsoft".into()))?;
+                    let scopes = config.directory_scopes.clone();
+                    OAuthClient::new(config)?
+                        .refresh_scoped(refresh, &scopes)
+                        .await?
+                        .access_token
+                }
+                (_, None) => {
+                    return Err(Error::Auth("Microsoft no devolvió refresh token".into()));
+                }
+            };
+            let profile = fetch_profile(provider, &profile_token).await?;
+            Ok::<_, Error>((tokens, profile))
+        }))
+        .await;
         let (tokens, profile) = match authorized {
             Ok(v) => v,
             Err(e) => return flow.fail(e),
         };
 
         flow.set_busy(true, "Guardando la cuenta…");
-        let persisted = services
-            .spawn(persist_account(
-                Arc::clone(&services.store),
-                provider,
-                profile,
-                tokens,
-                oauth,
-            ))
-            .await;
+        let persisted = flatten(services.spawn(persist_account(
+            Arc::clone(&services.store),
+            provider,
+            profile,
+            tokens,
+        )))
+        .await;
         match persisted {
-            Ok(account) => {
+            Ok((account, outcome)) => {
                 flow.dialog.close();
-                (flow.on_done)(account);
+                (flow.on_done)(account, outcome);
             }
             Err(e) => flow.fail(e),
         }
@@ -366,14 +372,14 @@ async fn fetch_profile(provider: Provider, access_token: &str) -> Result<Profile
 }
 
 /// Crea la cuenta en la BD y guarda su refresh token. Si el guardado de tokens falla,
-/// la cuenta se borra para no dejar una cuenta sin credenciales.
+/// la cuenta se borra para no dejar una cuenta sin credenciales. Si ya existe una cuenta
+/// con ese email, es una reautorización: se conservan su id, su caché y su libreta.
 async fn persist_account(
     store: Arc<Mutex<Store>>,
     provider: Provider,
     profile: Profile,
     tokens: TokenSet,
-    oauth: OAuthProvider,
-) -> Result<Account> {
+) -> Result<(Account, AddOutcome)> {
     let existing = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         guard
@@ -384,9 +390,8 @@ async fn persist_account(
     match existing {
         // Misma cuenta: es una reautorización; se conserva su id y su caché.
         Some(a) if a.provider == provider => {
-            let tokens_store = OAuthTokenProvider::new(OAuthClient::new(oauth)?, token_store()?);
-            tokens_store.save_tokens(a.id, &tokens).await?;
-            return Ok(a);
+            save_account_tokens(provider, a.id, &tokens).await?;
+            return Ok((a, AddOutcome::Reauthorized));
         }
         Some(_) => {
             return Err(Error::Store(format!(
@@ -410,13 +415,12 @@ async fn persist_account(
         })?
     };
 
-    let tokens_store = OAuthTokenProvider::new(OAuthClient::new(oauth)?, token_store()?);
-    if let Err(e) = tokens_store.save_tokens(account_id, &tokens).await {
+    if let Err(e) = save_account_tokens(provider, account_id, &tokens).await {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let _ = guard.delete_account(account_id);
         return Err(e);
     }
 
     let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-    guard.get_account(account_id)
+    Ok((guard.get_account(account_id)?, AddOutcome::Added))
 }

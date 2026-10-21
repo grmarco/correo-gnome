@@ -21,16 +21,23 @@ use correo_sync::{
 };
 use gtk::glib;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::power::{watch_resume, PowerWatcher, ResumeWatch};
-use crate::services::Services;
+use crate::services::{flatten, Services};
 
 /// Cabeceras de la bandeja que se consultan para detectar mensajes nuevos.
 const NEW_SCAN_LIMIT: usize = 10_000;
 /// Reintentos al arrancar una cuenta sin conexión: backoff estándar de correo-sync.
 const START_RETRY_LIMIT: u32 = 10_000;
 
-type Senders = Rc<RefCell<HashMap<AccountId, mpsc::Sender<Event>>>>;
+/// Runner de una cuenta: su canal de eventos y la tarea que lo ejecuta.
+struct Running {
+    events: mpsc::Sender<Event>,
+    task: JoinHandle<()>,
+}
+
+type Senders = Rc<RefCell<HashMap<AccountId, Running>>>;
 
 /// Control de la sincronización desde la interfaz. Mantenlo vivo mientras la app
 /// necesite sincronizar: al soltarlo, los `Rc` de los callbacks se liberan.
@@ -66,28 +73,42 @@ impl SyncHandle {
     }
 
     /// Empieza a sincronizar una cuenta (las cuentas existentes al arrancar y las nuevas
-    /// tras `add_account_dialog`).
+    /// tras `add_account_dialog`). Cada cuenta tiene su propio runner, con su conexión IMAP
+    /// y su IDLE: nunca se comparten entre cuentas.
     pub fn start_account(&self, account: Account) {
         let backend = Arc::new(self.services.imap(&account));
         let store = Arc::clone(&self.services.store);
-        let job = self.services.spawn({
+        let job = flatten(self.services.spawn({
             let account = account.clone();
             async move { start_runner(account, backend, store).await }
-        });
+        }));
         let senders = Rc::clone(&self.senders);
         let on_new = Rc::clone(&self.on_new);
         let on_auth = Rc::clone(&self.on_auth);
         let power = Rc::clone(&self.power);
+        let services = Rc::clone(&self.services);
         glib::MainContext::default().spawn_local(async move {
             match job.await {
-                Ok(channels) => attach(
-                    account,
-                    channels,
-                    &senders,
-                    &on_new,
-                    &on_auth,
-                    power.conditions(),
-                ),
+                Ok(channels) => {
+                    // La cuenta pudo eliminarse mientras arrancaba su runner: en ese caso no
+                    // se registra y el runner se detiene.
+                    let still_exists = services
+                        .accounts()
+                        .map(|list| list.iter().any(|a| a.id == account.id))
+                        .unwrap_or(false);
+                    if !still_exists {
+                        channels.task.abort();
+                        return;
+                    }
+                    attach(
+                        account,
+                        channels,
+                        &senders,
+                        &on_new,
+                        &on_auth,
+                        power.conditions(),
+                    )
+                }
                 Err(Error::Auth(e)) => {
                     eprintln!("correo: {}: requiere reautorización ({e})", account.email);
                     on_auth(account);
@@ -97,9 +118,18 @@ impl SyncHandle {
         });
     }
 
+    /// Detiene la sincronización de una cuenta (p. ej. al eliminarla): cierra su canal y
+    /// aborta su runner, con su conexión IDLE. No hace nada si la cuenta no estaba activa.
+    pub fn stop_account(&self, account: AccountId) {
+        if let Some(running) = self.senders.borrow_mut().remove(&account) {
+            drop(running.events);
+            running.task.abort();
+        }
+    }
+
     fn send(&self, account: AccountId, event: Event) {
-        if let Some(tx) = self.senders.borrow().get(&account) {
-            if let Err(e) = tx.try_send(event) {
+        if let Some(running) = self.senders.borrow().get(&account) {
+            if let Err(e) = running.events.try_send(event) {
                 eprintln!("correo: evento de sincronización descartado: {e}");
             }
         }
@@ -124,14 +154,16 @@ pub fn start_sync(
     let senders: Senders = Rc::default();
     let power_senders = Rc::clone(&senders);
     let power = PowerWatcher::new(move |conditions| {
-        for tx in power_senders.borrow().values() {
-            let _ = tx.try_send(Event::ConditionsChanged(conditions));
+        for running in power_senders.borrow().values() {
+            let _ = running
+                .events
+                .try_send(Event::ConditionsChanged(conditions));
         }
     });
     let resume_senders = Rc::clone(&senders);
     let resume = watch_resume(move || {
-        for tx in resume_senders.borrow().values() {
-            let _ = tx.try_send(Event::Resumed);
+        for running in resume_senders.borrow().values() {
+            let _ = running.events.try_send(Event::Resumed);
         }
     });
     if resume.is_none() {
@@ -168,10 +200,16 @@ fn attach(
     let SyncChannels {
         events,
         mut reports,
-        task: _task,
+        task,
     } = channels;
     let _ = events.try_send(Event::ConditionsChanged(conditions));
-    senders.borrow_mut().insert(account.id, events);
+    if let Some(previous) = senders
+        .borrow_mut()
+        .insert(account.id, Running { events, task })
+    {
+        // No debería haber dos runners por cuenta; si lo hubiera, el anterior se detiene.
+        previous.task.abort();
+    }
 
     let on_new = Rc::clone(on_new);
     let on_auth = Rc::clone(on_auth);

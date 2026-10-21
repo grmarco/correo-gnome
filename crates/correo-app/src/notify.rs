@@ -12,15 +12,30 @@ const MAX_INDIVIDUAL: usize = 3;
 
 /// Muestra las notificaciones de un lote de mensajes nuevos de una cuenta.
 /// Con más de `MAX_INDIVIDUAL` mensajes muestra las primeras individualmente y un
-/// resumen «N mensajes nuevos».
-pub fn notify_new(app: &adw::Application, account: &Account, msgs: &[MessageHeader]) {
+/// resumen «N mensajes nuevos». Con `show_account` (varias cuentas), el email de la cuenta
+/// va en el título para distinguirlas.
+pub fn notify_new(
+    app: &adw::Application,
+    account: &Account,
+    msgs: &[MessageHeader],
+    show_account: bool,
+) {
     for (index, msg) in msgs.iter().take(MAX_INDIVIDUAL).enumerate() {
         let id = format!("correo-new-{}-{index}", account.id);
-        app.send_notification(Some(&id), &message_notification(msg));
+        app.send_notification(
+            Some(&id),
+            &message_notification(msg, show_account.then_some(account.email.as_str())),
+        );
     }
     if msgs.len() > MAX_INDIVIDUAL {
         let id = format!("correo-new-{}-summary", account.id);
-        let notification = gtk::gio::Notification::new(&format!("{} mensajes nuevos", msgs.len()));
+        let title = format!("{} mensajes nuevos", msgs.len());
+        let heading = if show_account {
+            format!("{title} · {}", account.email)
+        } else {
+            title
+        };
+        let notification = gtk::gio::Notification::new(&heading);
         notification.set_body(Some(&account.email));
         app.send_notification(Some(&id), &notification);
     }
@@ -33,16 +48,18 @@ pub fn notify_new_if_inactive(
     account: &Account,
     msgs: &[MessageHeader],
     window_active: bool,
+    show_account: bool,
 ) {
     if window_active || msgs.is_empty() {
         return;
     }
-    notify_new(app, account, msgs);
+    notify_new(app, account, msgs, show_account);
 }
 
-/// Notificación de un mensaje: título con el remitente, cuerpo con el asunto y los
-/// botones de acción. El destino `(xu)` es (mailbox_id, uid).
-fn message_notification(msg: &MessageHeader) -> gtk::gio::Notification {
+/// Notificación de un mensaje: título con el remitente (y la cuenta, si `account` es
+/// `Some`), cuerpo con el asunto y los botones de acción. El destino `(xu)` es
+/// (mailbox_id, uid).
+fn message_notification(msg: &MessageHeader, account: Option<&str>) -> gtk::gio::Notification {
     let sender = msg
         .from
         .first()
@@ -59,7 +76,11 @@ fn message_notification(msg: &MessageHeader) -> gtk::gio::Notification {
         msg.subject.as_str()
     };
 
-    let notification = gtk::gio::Notification::new(&sender);
+    let title = match account {
+        Some(email) => format!("{sender} · {email}"),
+        None => sender,
+    };
+    let notification = gtk::gio::Notification::new(&title);
     notification.set_body(Some(subject));
     let target = (msg.mailbox_id, msg.uid).to_variant();
     notification.set_default_action_and_target_value("app.open-message", Some(&target));

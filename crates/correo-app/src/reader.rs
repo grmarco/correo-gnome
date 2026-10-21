@@ -20,7 +20,7 @@ use adw::prelude::*;
 use correo_core::{Account, Address, Flags, Mailbox, MailboxRole, MessageBody, MessageHeader};
 use gtk::{gio, glib};
 
-use crate::services::Services;
+use crate::services::{flatten, Services};
 use crate::ui_types::ComposeMode;
 use reader_html::{
     count_images, html_to_segments, link_looks_deceptive, plain_to_segments, Segment, Style,
@@ -526,9 +526,11 @@ fn show_inner(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: Mes
     inner.stack.set_visible_child_name("loading");
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
-    let handle = inner
-        .services
-        .spawn(async move { backend.fetch_body(&m, uid).await });
+    let handle = flatten(
+        inner
+            .services
+            .spawn(async move { backend.fetch_body(&m, uid).await }),
+    );
     let weak = Rc::downgrade(inner);
     glib::MainContext::default().spawn_local(async move {
         let result = handle.await;
@@ -560,9 +562,11 @@ fn finish_body(inner: &Rc<Inner>, body: MessageBody) {
 fn mark_seen(inner: &Rc<Inner>, account: Account, mailbox: Mailbox, header: MessageHeader) {
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
-    let handle = inner
-        .services
-        .spawn(async move { backend.set_seen(&m, uid, true).await });
+    let handle = flatten(
+        inner
+            .services
+            .spawn(async move { backend.set_seen(&m, uid, true).await }),
+    );
     let weak = Rc::downgrade(inner);
     glib::MainContext::default().spawn_local(async move {
         if handle.await.is_err() {
@@ -632,14 +636,14 @@ fn run_action(inner: &Rc<Inner>, action: Action) {
 
     let backend = inner.services.backend(&account);
     let (m, uid) = (mailbox.clone(), header.uid);
-    let handle = inner.services.spawn(async move {
+    let handle = flatten(inner.services.spawn(async move {
         match (action, target) {
             (Action::Archive, Some(target)) => backend.move_to(&m, uid, &target).await,
             (Action::Delete, _) => backend.delete(&m, uid).await,
             (Action::MarkUnread, _) => backend.set_seen(&m, uid, false).await,
             _ => Ok(()),
         }
-    });
+    }));
     let weak = Rc::downgrade(inner);
     glib::MainContext::default().spawn_local(async move {
         let result = handle.await;
@@ -1046,7 +1050,10 @@ fn fetch_attachment_to<T: Send + 'static>(
         write(bytes)
     });
     glib::MainContext::default().spawn_local(async move {
-        on_done(handle.await);
+        on_done(match handle.await {
+            Ok(done) => done,
+            Err(e) => Err(e.to_string()),
+        });
     });
 }
 

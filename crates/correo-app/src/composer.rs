@@ -23,7 +23,7 @@ use adw::prelude::*;
 use correo_core::{Account, Address, Draft, Provider};
 use gtk::{gdk, glib};
 
-use crate::services::Services;
+use crate::services::{flatten, Services};
 use crate::ui_types::ComposeMode;
 use composer_attach::Attachments;
 use composer_editor::Editor;
@@ -118,6 +118,21 @@ pub fn open(app: &adw::Application, services: Rc<Services>, account: Account, mo
     let to = RecipientField::new(store.clone(), on_change.clone());
     let cc = RecipientField::new(store.clone(), on_change.clone());
     let bcc = RecipientField::new(store, on_change.clone());
+    // Las sugerencias priorizan los contactos de la cuenta remitente; al cambiar De, se
+    // reordenan.
+    let sender_ids: Vec<correo_core::AccountId> = accounts.iter().map(|a| a.id).collect();
+    for field in [&to, &cc, &bcc] {
+        field.set_preferred_account(sender_ids.get(initial_account).copied());
+    }
+    if let Some(dropdown) = &from {
+        let fields = [to.clone(), cc.clone(), bcc.clone()];
+        dropdown.connect_selected_notify(move |d| {
+            let id = sender_ids.get(d.selected() as usize).copied();
+            for field in &fields {
+                field.set_preferred_account(id);
+            }
+        });
+    }
 
     let cc_button = gtk::Button::with_label("Cc");
     let bcc_button = gtk::Button::with_label("Cco");
@@ -429,9 +444,7 @@ fn send(ctx: &Rc<Ctx>) {
         correo_smtp::raw_message(&draft).map_err(|e| format!("no se pudo preparar la copia: {e}"))
     });
     let sender = ctx.services.sender(&account);
-    let sent = ctx
-        .services
-        .spawn(async move { sender.send(&draft).await.map_err(|e| e.to_string()) });
+    let sent = flatten(ctx.services.spawn(async move { sender.send(&draft).await }));
     let ctx = ctx.clone();
     glib::MainContext::default().spawn_local(async move {
         let result = sent.await;
@@ -463,14 +476,12 @@ async fn save_sent_copy(ctx: &Ctx, account: &Account, raw: Result<Vec<u8>, Strin
     let saved = match raw {
         Ok(raw) => {
             let backend = ctx.services.imap(account);
-            ctx.services
-                .spawn(async move {
-                    backend
-                        .append_to_sent(&raw)
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-                .await
+            flatten(
+                ctx.services
+                    .spawn(async move { backend.append_to_sent(&raw).await }),
+            )
+            .await
+            .map_err(|e| e.to_string())
         }
         Err(e) => Err(e),
     };

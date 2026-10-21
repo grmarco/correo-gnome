@@ -8,8 +8,10 @@ mod pkce;
 mod store;
 mod token_provider;
 
-#[cfg(test)]
-mod test_support;
+/// Servidor OAuth falso para tests de este crate y de los que lo usan con la feature
+/// `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use config::OAuthProvider;
 pub use oauth::{AuthorizationRequest, OAuthClient, TokenSet};

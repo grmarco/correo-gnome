@@ -140,14 +140,19 @@ impl ContactSource for MicrosoftContacts {
     }
 }
 
-/// Sincroniza una fuente y guarda los contactos en la caché. Devuelve cuántos se guardaron.
-pub async fn sync_into_store(source: &dyn ContactSource, store: &Mutex<Store>) -> Result<usize> {
+/// Sincroniza la libreta de `account_id` y la guarda en la caché (una libreta por cuenta).
+/// Devuelve cuántos contactos se guardaron.
+pub async fn sync_into_store(
+    account_id: AccountId,
+    source: &dyn ContactSource,
+    store: &Mutex<Store>,
+) -> Result<usize> {
     let contacts = source.sync().await?;
     let count = contacts.len();
     let guard = store
         .lock()
         .map_err(|_| Error::Store("bloqueo de la base de datos envenenado".into()))?;
-    guard.upsert_contacts(&contacts)?;
+    guard.upsert_contacts(account_id, &contacts)?;
     Ok(count)
 }
 
@@ -779,6 +784,17 @@ mod tests {
     #[tokio::test]
     async fn sync_into_store_upserts_contacts() {
         let store = Mutex::new(Store::open_in_memory().unwrap());
+        let account = store
+            .lock()
+            .unwrap()
+            .create_account(&correo_core::Account {
+                id: 0,
+                provider: correo_core::Provider::Gmail,
+                email: "yo@example.com".into(),
+                display_name: String::new(),
+                sync_days: 30,
+            })
+            .unwrap();
         let source = Fixed(vec![
             Contact {
                 name: Some("Ana Pérez".into()),
@@ -791,9 +807,13 @@ mod tests {
                 source: "microsoft".into(),
             },
         ]);
-        assert_eq!(sync_into_store(&source, &store).await.unwrap(), 2);
+        assert_eq!(sync_into_store(account, &source, &store).await.unwrap(), 2);
 
-        let found = store.lock().unwrap().search_contacts("ana", 10).unwrap();
+        let found = store
+            .lock()
+            .unwrap()
+            .search_contacts("ana", 10, Some(account))
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name.as_deref(), Some("Ana Pérez"));
     }

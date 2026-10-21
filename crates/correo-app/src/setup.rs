@@ -12,7 +12,7 @@ pub mod config;
 #[path = "power.rs"]
 pub mod power;
 
-pub use account_dialog::add_account_dialog;
+pub use account_dialog::{add_account_dialog, AddOutcome};
 pub use background::{start_sync, SyncHandle};
 
 use std::error::Error as StdError;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use correo_auth::{
-    MemoryTokenStore, OAuthClient, OAuthProvider, OAuthTokenProvider, SecretServiceStore,
+    MemoryTokenStore, OAuthClient, OAuthProvider, OAuthTokenProvider, SecretServiceStore, TokenSet,
     TokenStore,
 };
 use correo_core::{AccessToken, AccountId, Error, Provider, Result, TokenAudience, TokenProvider};
@@ -35,19 +35,13 @@ use config::Config;
 const KEYRING_APP: &str = "io.github.gmarco.Correo";
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
-static TOKEN_STORE: OnceLock<Arc<dyn TokenStore>> = OnceLock::new();
+/// Enrutador de tokens compartido: la misma instancia (y por tanto la misma caché de access
+/// tokens) la usan los servicios y el alta/reautorización de cuentas.
+static ROUTER: OnceLock<Arc<TokenRouter>> = OnceLock::new();
 
 /// Configuración cargada en `init_services`. Si no se ha inicializado, carga la de disco.
 pub fn app_config() -> &'static Config {
     CONFIG.get_or_init(|| config::load(&config::config_path()).unwrap_or_default())
-}
-
-/// Almacén de refresh tokens compartido (keyring, o memoria si el keyring no responde).
-pub fn token_store() -> Result<Arc<dyn TokenStore>> {
-    TOKEN_STORE
-        .get()
-        .cloned()
-        .ok_or_else(|| Error::Store("los servicios no están iniciados".into()))
 }
 
 /// Configuración OAuth del proveedor, o `None` si falta su client ID. Si hay client secret
@@ -89,20 +83,36 @@ pub fn init_services() -> std::result::Result<Services, Box<dyn StdError>> {
     }
 
     let token_store = choose_token_store();
-    let _ = TOKEN_STORE.set(Arc::clone(&token_store));
 
     // Segunda conexión a la misma BD: el enrutador de tokens necesita el proveedor de
     // cada cuenta y `Services` toma la suya por valor.
     let google = oauth_provider_for(oauth_config(Provider::Gmail), &token_store)?;
     let microsoft = oauth_provider_for(oauth_config(Provider::Microsoft365), &token_store)?;
     let forget = forget_tokens_hook(Arc::clone(&token_store), google.clone(), microsoft.clone());
-    let router = TokenRouter {
+    let router = Arc::new(TokenRouter {
         accounts: Mutex::new(Store::open(&db_path)?),
         google,
         microsoft,
-    };
+    });
+    let _ = ROUTER.set(Arc::clone(&router));
 
-    Ok(Services::new(store, Arc::new(router))?.with_forget_tokens(forget))
+    Ok(Services::new(store, router)?.with_forget_tokens(forget))
+}
+
+/// Guarda los tokens de una cuenta (alta o reautorización) en el almacén y en la caché del
+/// enrutador que usan los servicios, para que el siguiente access token sea el nuevo.
+pub async fn save_account_tokens(
+    provider: Provider,
+    account: AccountId,
+    tokens: &TokenSet,
+) -> Result<()> {
+    let router = ROUTER
+        .get()
+        .ok_or_else(|| Error::Store("los servicios no están iniciados".into()))?;
+    router
+        .for_provider(provider)?
+        .save_tokens(account, tokens)
+        .await
 }
 
 /// Borra el refresh token de la cuenta en el almacén y su caché en memoria (si hay proveedor
@@ -184,6 +194,12 @@ impl TokenRouter {
             let store = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
             store.get_account(account)?.provider
         };
+        self.for_provider(provider)
+    }
+
+    /// Proveedor OAuth de un tipo de cuenta (todas las cuentas de un mismo proveedor
+    /// comparten instancia; la caché interna está indexada por cuenta).
+    fn for_provider(&self, provider: Provider) -> Result<&OAuthTokenProvider> {
         let (slot, name) = match provider {
             Provider::Gmail => (&self.google, "Google"),
             Provider::Outlook | Provider::Microsoft365 => (&self.microsoft, "Microsoft"),
@@ -218,6 +234,101 @@ impl TokenProvider for TokenRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cuatro cuentas (dos Gmail, dos Outlook/M365) con refresh tokens distintos contra un
+    /// servidor OAuth falso que responde con un access token derivado de cada refresh token.
+    /// Cada cuenta debe recibir SU token, también en el recurso de contactos de Microsoft.
+    #[tokio::test]
+    async fn accounts_of_the_same_provider_get_their_own_tokens() {
+        use correo_auth::test_support::{token_json, FakeServer};
+        use correo_core::{Account, TokenAudience};
+
+        let server = FakeServer::start_with(|request| {
+            let rt: String = request
+                .split("refresh_token=")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            (200, token_json(&format!("access-{rt}"), None, 3600))
+        })
+        .await;
+
+        let accounts = Store::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for (provider, email) in [
+            (Provider::Gmail, "uno@gmail.com"),
+            (Provider::Gmail, "dos@gmail.com"),
+            (Provider::Outlook, "tres@outlook.com"),
+            (Provider::Microsoft365, "cuatro@empresa.example"),
+        ] {
+            ids.push(
+                accounts
+                    .create_account(&Account {
+                        id: 0,
+                        provider,
+                        email: email.into(),
+                        display_name: String::new(),
+                        sync_days: 30,
+                    })
+                    .unwrap(),
+            );
+        }
+
+        let store: Arc<dyn TokenStore> = Arc::new(MemoryTokenStore::new());
+        for id in &ids {
+            store
+                .save_refresh_token(*id, &format!("rt-{id}"))
+                .await
+                .unwrap();
+        }
+        let mut google_cfg = OAuthProvider::google("cid-google");
+        google_cfg.token_url = server.url.clone();
+        let mut ms_cfg = OAuthProvider::microsoft("cid-ms");
+        ms_cfg.token_url = server.url.clone();
+        let router = TokenRouter {
+            accounts: Mutex::new(accounts),
+            google: Some(Arc::new(OAuthTokenProvider::new(
+                OAuthClient::new(google_cfg).unwrap(),
+                Arc::clone(&store),
+            ))),
+            microsoft: Some(Arc::new(OAuthTokenProvider::new(
+                OAuthClient::new(ms_cfg).unwrap(),
+                store,
+            ))),
+        };
+
+        for id in &ids {
+            let mail = router.access_token(*id).await.unwrap();
+            assert_eq!(
+                mail.0,
+                format!("access-rt-{id}"),
+                "correo de la cuenta {id}"
+            );
+        }
+        for id in &ids[2..] {
+            let graph = router
+                .access_token_for(*id, TokenAudience::Directory)
+                .await
+                .unwrap();
+            assert_eq!(
+                graph.0,
+                format!("access-rt-{id}"),
+                "contactos de la cuenta {id}"
+            );
+        }
+        // Cada cuenta se refrescó con su propio refresh token: cuatro peticiones de correo y
+        // dos de contactos, cada una con el refresh token de su cuenta.
+        let requests = server.requests();
+        assert_eq!(requests.len(), 6);
+        for id in &ids {
+            assert!(requests
+                .iter()
+                .any(|r| r.contains(&format!("refresh_token=rt-{id}&"))
+                    || r.ends_with(&format!("refresh_token=rt-{id}"))));
+        }
+    }
 
     #[test]
     fn router_rejects_unknown_account() {

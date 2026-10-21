@@ -7,6 +7,8 @@ edition = "2024"
 default = []
 # Almacenamiento de tokens en el Secret Service (GNOME Keyring / KWallet) vía oo7 (sin libs del sistema).
 libsecret = ["dep:oo7"]
+# Servidor HTTP falso (`test_support`) para los tests de otros crates.
+test-support = []
 
 [dependencies]
 correo-core.workspace = true

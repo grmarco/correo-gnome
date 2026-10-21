@@ -26,6 +26,22 @@ pub struct Services {
     forget_tokens: Option<ForgetTokens>,
 }
 
+/// Aplana el resultado de un future de `Services::spawn` cuyo valor ya era un `Result`.
+pub async fn flatten<T>(fut: impl Future<Output = Result<Result<T>>>) -> Result<T> {
+    fut.await.and_then(|r| r)
+}
+
+/// Convierte el `JoinHandle` de una tarea en un `Result`: un pánico o una cancelación se
+/// registran en stderr y se devuelven como error, sin propagar el pánico.
+async fn join_result<T>(handle: tokio::task::JoinHandle<T>) -> Result<T> {
+    handle.await.map_err(|e| {
+        if e.is_panic() {
+            eprintln!("correo: tarea interna en pánico: {e}");
+        }
+        correo_core::Error::Network(format!("tarea interna fallida: {e}"))
+    })
+}
+
 impl Services {
     /// Abre la BD en `~/.local/share/correo/correo.db`. `tokens` lo construye la app
     /// (OAuth con los client IDs de la configuración).
@@ -49,15 +65,15 @@ impl Services {
         self
     }
 
-    /// Ejecuta un future en el runtime de tokio y devuelve su resultado.
+    /// Ejecuta un future en el runtime de tokio y devuelve su resultado. Si la tarea entra
+    /// en pánico o se cancela, el resultado es `Err` (el pánico no se propaga a la UI).
     /// Es awaitable desde `glib::MainContext::spawn_local`.
-    pub fn spawn<F, T>(&self, fut: F) -> impl Future<Output = T> + 'static
+    pub fn spawn<F, T>(&self, fut: F) -> impl Future<Output = Result<T>> + 'static
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let handle = self.runtime.spawn(fut);
-        async move { handle.await.expect("tarea de tokio cancelada") }
+        join_result(self.runtime.spawn(fut))
     }
 
     /// Backend de correo de la cuenta, reutilizado entre llamadas. Tras cambiar el proveedor
@@ -71,7 +87,6 @@ impl Services {
     }
 
     /// Descarta el backend cacheado de la cuenta (cierra su conexión al liberarse).
-    #[allow(dead_code)] // lo usa `remove_account`, aún sin llamador en la UI.
     pub fn forget_backend(&self, account: AccountId) {
         self.backends
             .lock()
@@ -113,7 +128,6 @@ impl Services {
     /// Elimina la cuenta de la caché y sus tokens. La BD se borra primero (si la cuenta no
     /// existe, no se toca ningún token). El borrado de tokens va en segundo plano y sus
     /// errores se registran en stderr.
-    #[allow(dead_code)] // pendiente de que la UI de eliminar cuenta lo llame.
     pub fn remove_account(&self, account: AccountId) -> Result<()> {
         self.store
             .lock()
@@ -130,5 +144,93 @@ impl Services {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn un_panico_devuelve_error_sin_propagarse() {
+        let handle = tokio::spawn(async { panic!("fallo a propósito") });
+        let r: Result<()> = join_result(handle).await;
+        assert!(
+            matches!(r, Err(correo_core::Error::Network(ref m)) if m.contains("tarea interna"))
+        );
+    }
+
+    #[tokio::test]
+    async fn una_tarea_correcta_devuelve_su_valor() {
+        let r = join_result(tokio::spawn(async { 7 })).await;
+        assert_eq!(r.unwrap(), 7);
+    }
+
+    #[test]
+    fn backends_are_cached_per_account_and_never_shared() {
+        let services = Services::new(Store::open_in_memory().unwrap(), Arc::new(NoTokens)).unwrap();
+        let gmail_1 = account(1, Provider::Gmail, "uno@gmail.com");
+        let gmail_2 = account(2, Provider::Gmail, "dos@gmail.com");
+        let outlook_3 = account(3, Provider::Outlook, "tres@outlook.com");
+
+        let first = services.backend(&gmail_1);
+        assert!(
+            Arc::ptr_eq(&first, &services.backend(&gmail_1)),
+            "misma cuenta, misma sesión"
+        );
+        assert!(!Arc::ptr_eq(&first, &services.backend(&gmail_2)));
+        assert!(!Arc::ptr_eq(&first, &services.backend(&outlook_3)));
+        assert!(!Arc::ptr_eq(
+            &services.backend(&gmail_2),
+            &services.backend(&outlook_3)
+        ));
+
+        services.forget_backend(1);
+        assert!(
+            !Arc::ptr_eq(&first, &services.backend(&gmail_1)),
+            "tras olvidarla, una nueva"
+        );
+    }
+
+    #[test]
+    fn remove_account_deletes_cache_and_keeps_the_others() {
+        let services = Services::new(Store::open_in_memory().unwrap(), Arc::new(NoTokens)).unwrap();
+        let a = services
+            .store
+            .lock()
+            .unwrap()
+            .create_account(&account(0, Provider::Gmail, "a@gmail.com"))
+            .unwrap();
+        let b = services
+            .store
+            .lock()
+            .unwrap()
+            .create_account(&account(0, Provider::Gmail, "b@gmail.com"))
+            .unwrap();
+        services.remove_account(a).unwrap();
+        let left = services.accounts().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, b);
+        assert!(services.remove_account(a).is_err(), "ya no existe");
+    }
+
+    fn account(id: AccountId, provider: Provider, email: &str) -> Account {
+        Account {
+            id,
+            provider,
+            email: email.into(),
+            display_name: String::new(),
+            sync_days: 30,
+        }
+    }
+
+    /// Sin tokens: los backends se crean pero no se usan en estos tests.
+    struct NoTokens;
+
+    #[async_trait::async_trait]
+    impl TokenProvider for NoTokens {
+        async fn access_token(&self, _account: AccountId) -> Result<correo_core::AccessToken> {
+            Err(correo_core::Error::Auth("sin tokens en este test".into()))
+        }
     }
 }
